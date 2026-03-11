@@ -2,6 +2,26 @@
 // 终极修复：彻底解决 POST 导致 WAF/Emby 报错，拔除所有视频节流冗余代码，无损 URL 穿透
 // 补丁集成：Emby 授权头双向兼容、登录 API 补头、轻量 403 重试、协议 Fallback
 // 数据面板升级：支持 Cloudflare Analytics 聚合、时间锥、以及全场景“资源类别”徽章解析
+//
+// 单文件导航图（保持单文件部署，不做物理解耦）：
+// 0. 全局状态与通用工具
+// 1. Auth：管理员认证与 JWT
+// 2. CacheManager / Database：配置、节点、状态、管理 API
+// 3. Proxy：代理主链路、重试、响应整形
+// 4. Logger：日志写入与运行状态回写
+// 5. UI_HTML：控制台界面与前端逻辑
+// 6. Runtime Entry：fetch / scheduled 入口
+//
+// 单文件内部边界词典（阅读前先统一术语）：
+// - source of truth：当前语义下的唯一真相源；配置以 KV/runtime config 为准，节点以 KV + nodes index 为准。
+// - cache：为减轻读取成本设置的内存或 KV 快照，不应反向定义业务真相。
+// - fallback：主口径/主路径失败后的兜底路径；允许降级，但要显式标出来源变化。
+// - direct：请求不再由 Worker 中继数据体，而是直接下发目标地址给客户端。
+// - proxy：请求继续由 Worker 拉取上游并转发响应，是默认的透明中继路径。
+// - retry：同一请求语义下的再次尝试；这里只允许在明确安全的条件下发生，避免破坏非幂等请求。
+// - runtime status：写入 `sys:ops_status:v1` 的运行状态面板数据，用于“可解释观测”，不是强审计日志。
+// - smoke：高频快速验收回归，只覆盖核心链路；full：包含 smoke + 扩展运维状态验证。
+// - thin dispatcher：只做解析、归一、派发，不承载业务复杂度的入口层，例如 `handleApi`。
 
 // ============================================================================
 // 0. 全局配置与状态 (GLOBAL CONFIG & STATE)
@@ -16,6 +36,9 @@ const Config = {
     CryptoKeyCacheMax: 100,         
     NodeCacheMax: 5000,             
     NodesReadConcurrency: 12,       
+    LogFlushDelayMinutes: 20,
+    LogFlushCountThreshold: 50,
+    LogBatchChunkSize: 50,
     CleanupBudgetMs: 1,             
     CleanupChunkSize: 64,           
     AssetHash: "v18.0",           
@@ -452,6 +475,10 @@ function sanitizeRuntimeConfig(input = {}) {
     config[key] = String(config[key]).trim();
   }
   if (Array.isArray(config.sourceDirectNodes)) config.sourceDirectNodes = normalizeNodeNameList(config.sourceDirectNodes);
+  const logDelayMinutes = Number(config.logWriteDelayMinutes);
+  config.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : Config.Defaults.LogFlushDelayMinutes;
+  const logFlushCountThreshold = Number(config.logFlushCountThreshold);
+  config.logFlushCountThreshold = Number.isFinite(logFlushCountThreshold) ? Math.max(1, Math.floor(logFlushCountThreshold)) : Config.Defaults.LogFlushCountThreshold;
   return config;
 }
 
@@ -514,10 +541,19 @@ async function getRuntimeConfig(env) {
   const kv = Auth.getKV(env);
   if (!kv) return {};
   const now = nowMs();
-  if (GLOBALS.ConfigCache && GLOBALS.ConfigCache.exp > now && GLOBALS.ConfigCache.data) return GLOBALS.ConfigCache.data;
+  const cacheNamespace = String(
+    env?.__CONFIG_CACHE_NAMESPACE
+    || env?.__WORKER_CACHE_SCOPE
+    || (env?.ENI_KV ? "ENI_KV" : "")
+    || (env?.KV ? "KV" : "")
+    || (env?.EMBY_KV ? "EMBY_KV" : "")
+    || (env?.EMBY_PROXY ? "EMBY_PROXY" : "")
+    || "default"
+  );
+  if (GLOBALS.ConfigCache && GLOBALS.ConfigCache.exp > now && GLOBALS.ConfigCache.data && GLOBALS.ConfigCache.namespace === cacheNamespace) return GLOBALS.ConfigCache.data;
   let config = {};
   try { config = sanitizeRuntimeConfig(await kv.get(Database.CONFIG_KEY, { type: "json" }) || {}); } catch {}
-  GLOBALS.ConfigCache = { data: config, exp: now + 60000 };
+  GLOBALS.ConfigCache = { data: config, exp: now + 60000, namespace: cacheNamespace };
   return config;
 }
 
@@ -571,6 +607,23 @@ function jsonError(code, message, status = 400, details = null, extraHeaders = {
   const body = { ok: false, error: { code, message } };
   if (details !== null && details !== undefined) body.error.details = details;
   return jsonResponse(body, status, extraHeaders);
+}
+
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeStatusPatch(base, patch) {
+  const source = isPlainObject(base) ? base : {};
+  const delta = isPlainObject(patch) ? patch : {};
+  const merged = { ...source };
+  for (const [key, value] of Object.entries(delta)) {
+    if (value === undefined) continue;
+    if (isPlainObject(value) && isPlainObject(source[key])) merged[key] = mergeStatusPatch(source[key], value);
+    else if (isPlainObject(value)) merged[key] = mergeStatusPatch({}, value);
+    else merged[key] = value;
+  }
+  return merged;
 }
 
 async function normalizeJsonApiResponse(response) {
@@ -730,11 +783,22 @@ const CacheManager = {
     const now = nowMs();
     const start = now;
     const cleanMap = (map, shouldDelete) => {
-      let count = 0;
+      const scannedEntries = [];
       for (const [k, v] of map) {
         if (nowMs() - start >= budget) break;
-        if (shouldDelete(v, now)) map.delete(k);
-        if (++count >= chunkSize) break;
+        scannedEntries.push([k, v]);
+        if (scannedEntries.length >= chunkSize) break;
+      }
+      for (const [k, v] of scannedEntries) {
+        if (nowMs() - start >= budget) break;
+        if (!map.has(k)) continue;
+        if (shouldDelete(v, now)) {
+          map.delete(k);
+          continue;
+        }
+        // 把已检查但未过期的热点项滚到尾部，避免每次清理都卡在 Map 前缀。
+        map.delete(k);
+        map.set(k, v);
       }
     };
     if (state.phase === 0) {
@@ -754,9 +818,82 @@ const CacheManager = {
 };
 
 const Database = {
-  PREFIX: "node:", CONFIG_KEY: "sys:theme", NODES_INDEX_KEY: "sys:nodes_index:v1",
+  PREFIX: "node:", CONFIG_KEY: "sys:theme", NODES_INDEX_KEY: "sys:nodes_index:v1", OPS_STATUS_KEY: "sys:ops_status:v1",
   getKV(env) { return Auth.getKV(env); },
   getDB(env) { return env.DB || env.D1 || env.PROXY_LOGS; },
+  async getOpsStatus(kv) {
+    if (!kv) return {};
+    try { return await kv.get(this.OPS_STATUS_KEY, { type: "json" }) || {}; } catch { return {}; }
+  },
+  async patchOpsStatus(envOrKv, patch, ctx = null) {
+    const kv = envOrKv && typeof envOrKv.get === "function" ? envOrKv : this.getKV(envOrKv);
+    if (!kv) return {};
+    const current = await this.getOpsStatus(kv);
+    const next = mergeStatusPatch(current, patch);
+    next.updatedAt = new Date().toISOString();
+    const task = kv.put(this.OPS_STATUS_KEY, JSON.stringify(next));
+    if (ctx) ctx.waitUntil(task);
+    else await task;
+    return next;
+  },
+  normalizeNodeIndex(index = []) {
+    return [...new Set((Array.isArray(index) ? index : []).map(name => String(name || "").toLowerCase().trim()).filter(Boolean))];
+  },
+  async getNodesIndex(kv) {
+    if (GLOBALS.NodesIndexCache?.exp > nowMs() && Array.isArray(GLOBALS.NodesIndexCache.data)) {
+      return [...GLOBALS.NodesIndexCache.data];
+    }
+    if (!kv) return [];
+    const index = this.normalizeNodeIndex(await kv.get(this.NODES_INDEX_KEY, { type: "json" }) || []);
+    GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
+    return [...index];
+  },
+  invalidateNodeCaches(nodeNames = [], options = {}) {
+    for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
+      const name = String(rawName || "").toLowerCase().trim();
+      if (!name) continue;
+      GLOBALS.NodeCache.delete(name);
+    }
+    if (options.invalidateList) GLOBALS.NodesListCache = null;
+  },
+  async persistNodesIndex(index, { kv, ctx, invalidateList = false } = {}) {
+    const normalizedIndex = this.normalizeNodeIndex(index);
+    GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
+    if (invalidateList) GLOBALS.NodesListCache = null;
+    if (!kv) return normalizedIndex;
+    const task = kv.put(this.NODES_INDEX_KEY, JSON.stringify(normalizedIndex));
+    if (ctx) ctx.waitUntil(task);
+    else await task;
+    return normalizedIndex;
+  },
+  getCurrentDateKey(now = new Date()) {
+    const utc8Now = new Date(now.getTime() + 8 * 3600 * 1000);
+    return `${utc8Now.getUTCFullYear()}-${String(utc8Now.getUTCMonth() + 1).padStart(2, "0")}-${String(utc8Now.getUTCDate()).padStart(2, "0")}`;
+  },
+  buildConfigCacheKeys(...configs) {
+    const dateKey = this.getCurrentDateKey();
+    const staleKeys = new Set(["sys:cf_dash_cache"]);
+    for (const config of configs) {
+      staleKeys.add(makeCfDashCacheKey(config?.cfZoneId));
+      staleKeys.add(makeCfDashCacheKey(config?.cfZoneId, dateKey));
+    }
+    return [...staleKeys].filter(Boolean);
+  },
+  async persistRuntimeConfig(rawConfig, { env, kv, ctx } = {}) {
+    if (!kv) return sanitizeRuntimeConfig(rawConfig);
+    const prevConfig = env
+      ? await getRuntimeConfig(env)
+      : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
+    const nextConfig = sanitizeRuntimeConfig(rawConfig);
+    await kv.put(this.CONFIG_KEY, JSON.stringify(nextConfig));
+    GLOBALS.ConfigCache = null;
+    const deleteTasks = this.buildConfigCacheKeys(prevConfig, nextConfig).map(key => kv.delete(key));
+    if (deleteTasks.length) {
+      if (ctx) ctx.waitUntil(Promise.all(deleteTasks));
+      else await Promise.all(deleteTasks);
+    }
+    return nextConfig;
+  },
   
   async sendDailyTelegramReport(env) {
       const db = this.getDB(env);
@@ -790,7 +927,14 @@ const Database = {
 
       try {
           const cacheKey = makeCfDashCacheKey(cfZoneId, dateString);
-          const cached = await kv.get(cacheKey, { type: "json" });
+          let cached = await kv.get(cacheKey, { type: "json" });
+          
+          // 👇 加回这三行：如果缓存不存在，让定时任务主动假装前端请求一次，生成最新数据
+          if (!cached || cached.ver !== CF_DASH_CACHE_VERSION) {
+              await this.ApiHandlers.getDashboardStats({}, { env, ctx: null, kv, db }).catch(() => null);
+              cached = await kv.get(cacheKey, { type: "json" });
+          }
+
           if (cached && cached.ver === CF_DASH_CACHE_VERSION) {
               reqTotal = Number(cached.todayRequests) || 0;
               cfTrafficStatus = cached.todayTraffic || "0 B";
@@ -868,6 +1012,24 @@ const Database = {
     if (!n.updatedAt) { n.updatedAt = n.createdAt; changed = true; }
     return { data: n, changed };
   },
+  buildNodeRecord(name, rawNode, existingNode = {}) {
+    let parsedHeaders = rawNode?.headers !== undefined ? rawNode.headers : existingNode.headers;
+    if (typeof parsedHeaders === "string") {
+      try { parsedHeaders = JSON.parse(parsedHeaders); } catch { parsedHeaders = {}; }
+    }
+    const normalizedTargets = this.normalizeTargets(rawNode?.target || existingNode.target);
+    if (!normalizedTargets) return null;
+    return this.normalizeNode(name, {
+      target: normalizedTargets,
+      secret: rawNode?.secret !== undefined ? rawNode.secret : (existingNode.secret || ""),
+      tag: rawNode?.tag !== undefined ? rawNode.tag : (existingNode.tag || ""),
+      remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
+      headers: this.sanitizeHeaders(parsedHeaders),
+      schemaVersion: 2,
+      createdAt: existingNode.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }).data;
+  },
   async getNode(nodeName, env, ctx) {
     nodeName = String(nodeName).toLowerCase();
     const kv = this.getKV(env); if (!kv) return null;
@@ -882,476 +1044,484 @@ const Database = {
       return normalized;
     } catch { return null; }
   },
-  async handleApi(request, env, ctx) {
-    const kv = this.getKV(env);
-    if (!kv) return new Response(JSON.stringify({ error: "kv_missing" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-    let data; try { data = await request.json(); } catch { return new Response(JSON.stringify({ error: "invalid_json" }), { status: 400, headers: { ...corsHeaders } }); }
-    // 🌟 性能防御：仅清除单体缓存，严禁主动销毁 NodesListCache 导致全站并发重读
-    const invalidate = (name) => { GLOBALS.NodeCache.delete(name); };
-    
-    switch (data.action) {
-      case "getDashboardStats": {
-        const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
-        let todayRequests = 0, todayTraffic = "未配置", nodeCount = 0;
-        let cfAnalyticsLoaded = false, requestsLoaded = false;
-        let cfAnalyticsStatus = "", cfAnalyticsError = "", cfAnalyticsDetail = "";
-        let requestSource = "pending", requestSourceText = "等待数据加载", trafficSourceText = "视频流量口径：CF Zone 总流量";
-        let hourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
-        let playCount = 0, infoCount = 0, totalAccMs = 0;
+  normalizeAdminActionRequest(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+    const payload = input.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
+      ? { ...input.payload }
+      : null;
+    const action = String(input.action ?? payload?.action ?? "").trim();
+    const meta = input.meta && typeof input.meta === "object" && !Array.isArray(input.meta) ? { ...input.meta } : {};
+    const data = payload
+      ? { ...payload, action, meta }
+      : { ...input, action, meta };
+    return { action, data, meta };
+  },
+  // ============================================================================
+  // 管理 API 动作表 (ADMIN ACTION MAP)
+  // 读取导航：
+  // - 面板统计 / 运行状态：getDashboardStats / getRuntimeStatus
+  // - 配置与备份：loadConfig / saveConfig / exportConfig / importFull
+  // - 节点治理：list / saveOrImport / delete / pingNode
+  // - 运维动作：getLogs / clearLogs / initLogsDb / purgeCache / testTelegram / sendDailyReport
+  // 设计意图：
+  // - 维持单文件部署，但把“动作分发”和“动作实现”拆成两个认知层次。
+  // - 新增 action 时，优先在这里挂处理器，再在 handleApi 做最小派发。
+  //
+  // [新增] API 路由处理器 (Action Handlers)
+  // 通过分离业务逻辑，消除 switch-case 带来的上下文污染
+  // ============================================================================
+  ApiHandlers: {
+    async getDashboardStats(data, { env, ctx, kv, db }) {
+      const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
+      let todayRequests = 0, todayTraffic = "未配置", nodeCount = 0;
+      let cfAnalyticsLoaded = false, requestsLoaded = false;
+      let cfAnalyticsStatus = "", cfAnalyticsError = "", cfAnalyticsDetail = "";
+      let requestSource = "pending", requestSourceText = "等待数据加载", trafficSourceText = "视频流量口径：CF Zone 总流量";
+      let generatedAt = new Date().toISOString();
+      let hourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
+      let playCount = 0, infoCount = 0, totalAccMs = 0;
 
-        const nodes = await CacheManager.getNodesList(env, ctx);
-        nodeCount = nodes.length || 0;
+      const nodes = await CacheManager.getNodesList(env, ctx);
+      nodeCount = nodes.length || 0;
 
-        const now = new Date();
-        const utc8Ms = now.getTime() + 8 * 3600 * 1000;
-        const d = new Date(utc8Ms);
-        const yyyy = d.getUTCFullYear();
-        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-        const dd = String(d.getUTCDate()).padStart(2, '0');
-        const dateString = `${yyyy}-${mm}-${dd}`;
-        const startOfDayTs = Date.UTC(yyyy, d.getUTCMonth(), d.getUTCDate()) - 8 * 3600 * 1000;
-        const endOfDayTs = startOfDayTs + 86400000 - 1;
+      const now = new Date();
+      const utc8Ms = now.getTime() + 8 * 3600 * 1000;
+      const d = new Date(utc8Ms);
+      const dateString = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      const startOfDayTs = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - 8 * 3600 * 1000;
+      const endOfDayTs = startOfDayTs + 86400000 - 1;
 
-        const cfZoneId = String(config.cfZoneId || "").trim();
-        const cfApiToken = String(config.cfApiToken || "").trim();
-        const cacheKey = makeCfDashCacheKey(cfZoneId, dateString);
-        let cached = await kv.get(cacheKey, { type: "json" });
+      const cfZoneId = String(config.cfZoneId || "").trim();
+      const cfApiToken = String(config.cfApiToken || "").trim();
+      const cacheKey = makeCfDashCacheKey(cfZoneId, dateString);
+      let cached = await kv.get(cacheKey, { type: "json" });
 
-        if (cached && cached.ver === CF_DASH_CACHE_VERSION && (Date.now() - cached.ts < 3600000) && Array.isArray(cached.hourlySeries)) {
-            todayRequests = Number(cached.todayRequests) || 0;
-            todayTraffic = cached.todayTraffic || "0 B";
-            hourlySeries = cached.hourlySeries;
-            cfAnalyticsLoaded = !!cached.cfAnalyticsLoaded;
-            requestsLoaded = true;
-            requestSource = cached.requestSource || "zone_analytics";
-            requestSourceText = cached.requestSourceText || "";
-            trafficSourceText = cached.trafficSourceText || "";
-            cfAnalyticsStatus = cached.cfAnalyticsStatus || "";
-            cfAnalyticsError = cached.cfAnalyticsError || "";
-            cfAnalyticsDetail = cached.cfAnalyticsDetail || "";
-            playCount = cached.playCount || 0;
-            infoCount = cached.infoCount || 0;
-            totalAccMs = cached.totalAccMs || 0;
-        } else {
-            if (cfZoneId && cfApiToken) {
-                const startIso = new Date(startOfDayTs).toISOString();
-                const endIso = new Date(endOfDayTs).toISOString();
-                const query = `
-                query {
-                  viewer {
-                    zones(filter: { zoneTag: ${toGraphQLString(cfZoneId)} }) {
-                      series: httpRequestsAdaptiveGroups(limit: 10000, filter: { datetime_geq: ${toGraphQLString(startIso)}, datetime_leq: ${toGraphQLString(endIso)} }) {
-                        count
-                        dimensions { datetimeHour }
-                        sum { edgeResponseBytes }
-                      }
-                    }
-                  }
-                }`;
-                try {
-                    const zoneData = await fetchCloudflareGraphQLZone(cfZoneId, cfApiToken, query);
-                    if (zoneData) {
-                        let zoneTotalReq = 0, totalBytes = 0;
-                        let zoneHourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
-                        const seriesData = Array.isArray(zoneData.series) ? [...zoneData.series].sort((a, b) => String(a?.dimensions?.datetimeHour || "").localeCompare(String(b?.dimensions?.datetimeHour || ""))) : [];
-                        seriesData.forEach(item => {
-                            const req = Number(item.count) || 0;
-                            const byt = Number(item.sum?.edgeResponseBytes) || 0;
-                            zoneTotalReq += req;
-                            totalBytes += byt;
-                            const dtRaw = item?.dimensions?.datetimeHour;
-                            if (!dtRaw) return;
-                            const dt = new Date(dtRaw);
-                            if (!Number.isNaN(dt.getTime())) zoneHourlySeries[(dt.getUTCHours() + 8) % 24].total += req;
-                        });
+      if (cached && cached.ver === CF_DASH_CACHE_VERSION && (Date.now() - cached.ts < 3600000) && Array.isArray(cached.hourlySeries)) {
+          return new Response(JSON.stringify({ nodeCount, ...cached, generatedAt: cached.generatedAt || new Date(cached.ts).toISOString(), cacheStatus: "cache" }), { headers: { ...corsHeaders } });
+      } 
 
-                        todayTraffic = formatBytes(totalBytes);
-                        cfAnalyticsLoaded = true;
-                        cfAnalyticsStatus = "Cloudflare 统计正常";
-                        trafficSourceText = "视频流量当前对齐：CF Zone 总流量（edgeResponseBytes）";
-
-                        let resolvedRequestSource = "zone_analytics";
-                        try {
-                            const workerUsage = await fetchCloudflareWorkerUsageMetrics({ cfAccountId: String(config.cfAccountId || "").trim(), cfZoneId, cfApiToken, startIso, endIso });
-                            if (workerUsage && Number.isFinite(workerUsage.totalRequests)) {
-                                todayRequests = workerUsage.totalRequests;
-                                hourlySeries = workerUsage.hourlySeries;
-                                requestsLoaded = true;
-                                resolvedRequestSource = "workers_usage";
-                                requestSource = "workers_usage";
-                                requestSourceText = "今日请求量当前对齐：Cloudflare Workers Usage";
-                                cfAnalyticsStatus = "Cloudflare 统计正常（请求数已对齐 Workers Usage）";
-                                cfAnalyticsDetail = workerUsage.serviceNames?.length ? `已对齐脚本: ${workerUsage.serviceNames.join(", ")}` : cfAnalyticsDetail;
-                            }
-                        } catch (e) {
-                            console.log("CF workers usage fetch failed", e);
-                        }
-
-                        if (!requestsLoaded) {
-                            todayRequests = zoneTotalReq;
-                            hourlySeries = zoneHourlySeries;
-                            requestsLoaded = true;
-                            requestSource = "zone_analytics";
-                            requestSourceText = "今日请求量当前对齐：Cloudflare Zone Analytics";
-                        }
-                    } else {
-                        cfAnalyticsStatus = "Zone 未命中";
-                        cfAnalyticsError = "GraphQL 返回空；请检查 Zone ID 或权限";
-                        todayTraffic = "CF 无统计数据";
-                    }
-                } catch (e) {
-                    const cfDiag = classifyCloudflareAnalyticsError(e?.message || e, { zoneId: cfZoneId });
-                    cfAnalyticsStatus = cfDiag.status;
-                    cfAnalyticsError = cfDiag.hint;
-                    cfAnalyticsDetail = cfDiag.detail;
-                    todayTraffic = "CF 查询失败";
+      if (cfZoneId && cfApiToken) {
+          const startIso = new Date(startOfDayTs).toISOString();
+          const endIso = new Date(endOfDayTs).toISOString();
+          const query = `
+          query {
+            viewer {
+              zones(filter: { zoneTag: ${toGraphQLString(cfZoneId)} }) {
+                series: httpRequestsAdaptiveGroups(limit: 10000, filter: { datetime_geq: ${toGraphQLString(startIso)}, datetime_leq: ${toGraphQLString(endIso)} }) {
+                  count
+                  dimensions { datetimeHour }
+                  sum { edgeResponseBytes }
                 }
-            } else {
-                cfAnalyticsStatus = "未配置 Cloudflare";
-                cfAnalyticsError = "请在账号设置中填写并保存 Cloudflare Zone ID 与 API 令牌";
-                requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
-                trafficSourceText = "视频流量当前对齐：未配置 Cloudflare，无法获取 CF Zone 总流量";
+              }
             }
+          }`;
+          try {
+              const zoneData = await fetchCloudflareGraphQLZone(cfZoneId, cfApiToken, query);
+              if (zoneData) {
+                  let zoneTotalReq = 0, totalBytes = 0;
+                  let zoneHourlySeries = Array.from({ length: 24 }, (_, hour) => ({ label: String(hour).padStart(2, "0") + ":00", total: 0 }));
+                  const seriesData = Array.isArray(zoneData.series) ? [...zoneData.series].sort((a, b) => String(a?.dimensions?.datetimeHour || "").localeCompare(String(b?.dimensions?.datetimeHour || ""))) : [];
+                  seriesData.forEach(item => {
+                      const req = Number(item.count) || 0;
+                      const byt = Number(item.sum?.edgeResponseBytes) || 0;
+                      zoneTotalReq += req;
+                      totalBytes += byt;
+                      const dtRaw = item?.dimensions?.datetimeHour;
+                      if (dtRaw && !Number.isNaN(new Date(dtRaw).getTime())) {
+                          zoneHourlySeries[(new Date(dtRaw).getUTCHours() + 8) % 24].total += req;
+                      }
+                  });
+                  todayTraffic = formatBytes(totalBytes);
+                  cfAnalyticsLoaded = true;
+                  cfAnalyticsStatus = "Cloudflare 统计正常";
+                  trafficSourceText = "视频流量当前对齐：CF Zone 总流量（edgeResponseBytes）";
 
-            const db = this.getDB(env);
+                  let resolvedRequestSource = "zone_analytics";
+                  try {
+                      const workerUsage = await fetchCloudflareWorkerUsageMetrics({ cfAccountId: String(config.cfAccountId || "").trim(), cfZoneId, cfApiToken, startIso, endIso });
+                      if (workerUsage && Number.isFinite(workerUsage.totalRequests)) {
+                          todayRequests = workerUsage.totalRequests;
+                          hourlySeries = workerUsage.hourlySeries;
+                          requestsLoaded = true;
+                          resolvedRequestSource = "workers_usage";
+                          requestSource = "workers_usage";
+                          requestSourceText = "今日请求量当前对齐：Cloudflare Workers Usage";
+                          cfAnalyticsStatus = "Cloudflare 统计正常（请求数已对齐 Workers Usage）";
+                          cfAnalyticsDetail = workerUsage.serviceNames?.length ? `已对齐脚本: ${workerUsage.serviceNames.join(", ")}` : cfAnalyticsDetail;
+                      }
+                  } catch (e) { console.log("CF workers usage fetch failed", e); }
+
+                  if (!requestsLoaded) {
+                      todayRequests = zoneTotalReq;
+                      hourlySeries = zoneHourlySeries;
+                      requestsLoaded = true;
+                      requestSource = "zone_analytics";
+                      requestSourceText = "今日请求量当前对齐：Cloudflare Zone Analytics";
+                  }
+              } else {
+                  cfAnalyticsStatus = "Zone 未命中";
+                  cfAnalyticsError = "GraphQL 返回空；请检查 Zone ID 或权限";
+                  todayTraffic = "CF 无统计数据";
+              }
+          } catch (e) {
+              const cfDiag = classifyCloudflareAnalyticsError(e?.message || e, { zoneId: cfZoneId });
+              cfAnalyticsStatus = cfDiag.status;
+              cfAnalyticsError = cfDiag.hint;
+              cfAnalyticsDetail = cfDiag.detail;
+              todayTraffic = "CF 查询失败";
+          }
+      } else {
+          cfAnalyticsStatus = "未配置 Cloudflare";
+          cfAnalyticsError = "请在账号设置中填写并保存 Cloudflare Zone ID 与 API 令牌";
+          requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
+          trafficSourceText = "视频流量当前对齐：未配置 Cloudflare，无法获取 CF Zone 总流量";
+      }
             if (db) {
-                const videoWhereClause = getVideoRequestWhereClause();
-                playCount = (await db.prepare(`SELECT COUNT(*) as c FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND ${videoWhereClause}`).bind(startOfDayTs, endOfDayTs).first())?.c || 0;
-                infoCount = (await db.prepare(`SELECT COUNT(*) as c FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND request_path LIKE '%/PlaybackInfo%'`).bind(startOfDayTs, endOfDayTs).first())?.c || 0;
-                totalAccMs = (await db.prepare(`SELECT SUM(response_time) as st FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND ${videoWhereClause}`).bind(startOfDayTs, endOfDayTs).first())?.st || 0;
+                try {
+                    const videoWhereClause = getVideoRequestWhereClause();
+                    playCount = (await db.prepare(`SELECT COUNT(*) as c FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND ${videoWhereClause}`).bind(startOfDayTs, endOfDayTs).first())?.c || 0;
+                    infoCount = (await db.prepare(`SELECT COUNT(*) as c FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND request_path LIKE '%/PlaybackInfo%'`).bind(startOfDayTs, endOfDayTs).first())?.c || 0;
+                    totalAccMs = (await db.prepare(`SELECT SUM(response_time) as st FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? AND ${videoWhereClause}`).bind(startOfDayTs, endOfDayTs).first())?.st || 0;
 
-                if (!requestsLoaded) {
-                    todayRequests = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ?`).bind(startOfDayTs, endOfDayTs).first())?.total || 0;
-                    const dbHourly = await db.prepare(`SELECT strftime('%H', datetime(timestamp / 1000 + 28800, 'unixepoch')) as hour, COUNT(*) as total FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? GROUP BY hour ORDER BY hour ASC`).bind(startOfDayTs, endOfDayTs).all();
-                    for (const row of dbHourly?.results || []) {
-                        const index = Number.parseInt(row.hour, 10);
-                        if (!Number.isNaN(index) && hourlySeries[index]) hourlySeries[index].total += (Number(row.total) || 0);
+                    if (!requestsLoaded) {
+                        todayRequests = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ?`).bind(startOfDayTs, endOfDayTs).first())?.total || 0;
+                        const dbHourly = await db.prepare(`SELECT strftime('%H', datetime(timestamp / 1000 + 28800, 'unixepoch')) as hour, COUNT(*) as total FROM proxy_logs WHERE timestamp >= ? AND timestamp <= ? GROUP BY hour ORDER BY hour ASC`).bind(startOfDayTs, endOfDayTs).all();
+                        for (const row of dbHourly?.results || []) {
+                            const index = Number.parseInt(row.hour, 10);
+                            if (!Number.isNaN(index) && hourlySeries[index]) hourlySeries[index].total += (Number(row.total) || 0);
+                        }
+                        requestsLoaded = true;
+                        requestSource = "d1_logs";
+                        requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
                     }
-                    requestsLoaded = true;
-                    requestSource = "d1_logs";
-                    requestSourceText = "今日请求量当前对齐：本地 D1 日志（兜底口径）";
+                } catch (dbErr) {
+                    // 静默吞掉错误 (如新用户尚未初始化表)，确保 CF 流量数据仍能正常下发
+                    console.log("DB Stats read failed (table not init?):", dbErr);
                 }
             }
 
             const cachePayload = JSON.stringify({
-                ver: CF_DASH_CACHE_VERSION, ts: Date.now(),
-                todayRequests, todayTraffic, hourlySeries,
-                requestSource, requestSourceText, trafficSourceText,
-                cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail,
-                playCount, infoCount, totalAccMs
+          ver: CF_DASH_CACHE_VERSION, ts: Date.now(),
+          todayRequests, todayTraffic, hourlySeries,
+          requestSource, requestSourceText, trafficSourceText,
+          generatedAt,
+          cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail,
+          playCount, infoCount, totalAccMs
+      });
+      
+      if (ctx) ctx.waitUntil(kv.put(cacheKey, cachePayload));
+      else await kv.put(cacheKey, cachePayload);
+
+      return new Response(JSON.stringify({ todayRequests, todayTraffic, nodeCount, hourlySeries, cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail, requestSource, requestSourceText, trafficSourceText, generatedAt, cacheStatus: "live", playCount, infoCount, totalAccMs }), { headers: { ...corsHeaders } });      
+    },
+
+    async loadConfig(data, { env }) {
+      return new Response(JSON.stringify({ config: await getRuntimeConfig(env) }), { headers: { ...corsHeaders } });
+    },
+
+    async getRuntimeStatus(data, { kv }) {
+      return jsonResponse({ status: await Database.getOpsStatus(kv) });
+    },
+
+    async saveConfig(data, { env, ctx, kv }) {
+      if (data.config) {
+          await Database.persistRuntimeConfig(data.config, { env, kv, ctx });
+      }
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async exportConfig(data, { env, ctx }) {
+      return new Response(JSON.stringify({ 
+        version: Config.Defaults.Version, 
+        exportTime: new Date().toISOString(), 
+        nodes: (await CacheManager.getNodesList(env, ctx)).filter(Boolean), 
+        config: await getRuntimeConfig(env) 
+      }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async list(data, { env, ctx }) {
+      return new Response(JSON.stringify({ nodes: await CacheManager.getNodesList(env, ctx) }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async saveOrImport(data, { action, ctx, kv }) {
+      const nodesToSave = action === "save" ? [data] : data.nodes;
+      const savedNodes = [];
+      let index = await Database.getNodesIndex(kv);
+      
+      for (const n of nodesToSave) {
+        if (!n.name || !n.target) continue;
+        const name = String(n.name).toLowerCase();
+        const originalName = n.originalName ? String(n.originalName).toLowerCase() : null;
+        const isRename = !!(originalName && originalName !== name);
+        
+        let existingNode = {};
+        if (isRename) {
+            existingNode = await kv.get(`${Database.PREFIX}${originalName}`, { type: "json" }) || {};
+        } else {
+            existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
+        }
+        const val = Database.buildNodeRecord(name, n, existingNode);
+        if (!val) continue;
+        
+        await kv.put(`${Database.PREFIX}${name}`, JSON.stringify(val));
+        if (isRename) {
+          await kv.delete(`${Database.PREFIX}${originalName}`);
+          Database.invalidateNodeCaches([originalName, name], { invalidateList: true });
+          index = index.filter(x => x !== originalName);
+        } else {
+          Database.invalidateNodeCaches(name, { invalidateList: true });
+        }
+        savedNodes.push({ name, ...val });
+        index.push(name);
+      }
+      
+      if (savedNodes.length > 0) { 
+        await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+      }
+      
+      if (action === "save" && savedNodes.length === 0) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+      return new Response(JSON.stringify({ success: true, node: action === "save" ? savedNodes[0] : undefined, nodes: action === "import" ? savedNodes : undefined }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    },
+
+    async importFull(data, { env, ctx, kv }) {
+      if (data.config) await Database.persistRuntimeConfig(data.config, { env, kv, ctx });
+      if (data.nodes && Array.isArray(data.nodes)) {
+          const savedNodes = [];
+          let index = await Database.getNodesIndex(kv);
+          for (const n of data.nodes) {
+            if (!n.name || !n.target) continue;
+            const name = String(n.name).toLowerCase(); 
+            const existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
+            const val = Database.buildNodeRecord(name, n, existingNode);
+            if (!val) continue;
+            
+            await kv.put(`${Database.PREFIX}${name}`, JSON.stringify(val));
+            Database.invalidateNodeCaches(name, { invalidateList: true });
+            savedNodes.push(name);
+            index.push(name);
+          }
+          if (savedNodes.length > 0) {
+            await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+          }
+      }
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async delete(data, { ctx, kv }) {
+      if (data.name) {
+        const delName = String(data.name).toLowerCase(); 
+        await kv.delete(`${Database.PREFIX}${delName}`); 
+        Database.invalidateNodeCaches(delName, { invalidateList: true });
+        const index = (await Database.getNodesIndex(kv)).filter(n => n !== delName);
+        await Database.persistNodesIndex(index, { kv, ctx, invalidateList: true });
+      }
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async purgeCache(data, { kv }) {
+        const config = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
+        if (!config.cfZoneId || !config.cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
+        try {
+            const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(config.cfZoneId).trim())}/purge_cache`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${config.cfApiToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ purge_everything: true })
             });
-            if (ctx) ctx.waitUntil(kv.put(cacheKey, cachePayload));
-            else await kv.put(cacheKey, cachePayload);
-        }
+            if (res.ok) return jsonResponse({ success: true });
+            return jsonError("PURGE_FAILED", "清理失败，请检查密钥权限");
+        } catch(e) { return jsonError("PURGE_ERROR", e.message); }
+    },
 
-        return new Response(JSON.stringify({ todayRequests, todayTraffic, nodeCount, hourlySeries, cfAnalyticsLoaded, cfAnalyticsStatus, cfAnalyticsError, cfAnalyticsDetail, requestSource, requestSourceText, trafficSourceText, playCount, infoCount, totalAccMs }), { headers: { ...corsHeaders } });      
-      }
-      case "loadConfig": return new Response(JSON.stringify({ config: await getRuntimeConfig(env) }), { headers: { ...corsHeaders } });
-      case "saveConfig": 
-        if (data.config) {
-            const prevConfig = await getRuntimeConfig(env);
-            const nextConfig = sanitizeRuntimeConfig(data.config);
-            await kv.put(this.CONFIG_KEY, JSON.stringify(nextConfig));
-            GLOBALS.ConfigCache = null;
-            const now = new Date();
-            const utc8Ms = now.getTime() + 8 * 3600 * 1000;
-            const d = new Date(utc8Ms);
-            const yyyy = d.getUTCFullYear();
-            const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-            const dd = String(d.getUTCDate()).padStart(2, '0');
-            const dateKey = `${yyyy}-${mm}-${dd}`;
-            const staleKeys = new Set([
-              "sys:cf_dash_cache",
-              makeCfDashCacheKey(prevConfig?.cfZoneId),
-              makeCfDashCacheKey(nextConfig?.cfZoneId),
-              makeCfDashCacheKey(prevConfig?.cfZoneId, dateKey),
-              makeCfDashCacheKey(nextConfig?.cfZoneId, dateKey)
-            ]);
-            const deleteTasks = [...staleKeys].filter(Boolean).map(key => kv.delete(key));
-            if (deleteTasks.length) {
-              if (ctx) ctx.waitUntil(Promise.all(deleteTasks));
-              else await Promise.all(deleteTasks);
-            }
-        }
-        return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
-      case "exportConfig": return new Response(JSON.stringify({ version: Config.Defaults.Version, exportTime: new Date().toISOString(), nodes: (await CacheManager.getNodesList(env, ctx)).filter(Boolean), config: await getRuntimeConfig(env) }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      case "list": return new Response(JSON.stringify({ nodes: await CacheManager.getNodesList(env, ctx) }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      
-      case "save":
-      case "import": {
-        const nodesToSave = data.action === "save" ? [data] : data.nodes;
-        const savedNodes = [];
-        let index = await kv.get(this.NODES_INDEX_KEY, { type: "json" }) || [];
-        
-        for (const n of nodesToSave) {
-          if (!n.name || !n.target) continue;
-          const name = String(n.name).toLowerCase();
-          const originalName = n.originalName ? String(n.originalName).toLowerCase() : null;
-          
-          let existingNode = {};
-          if (originalName && originalName !== name) {
-              existingNode = await kv.get(`${this.PREFIX}${originalName}`, { type: "json" }) || {};
-              await kv.delete(`${this.PREFIX}${originalName}`);
-              await invalidate(originalName);
-              index = index.filter(x => x !== originalName);
-          } else {
-              existingNode = await kv.get(`${this.PREFIX}${name}`, { type: "json" }) || {};
-          }
-          
-          let parsedHeaders = n.headers !== undefined ? n.headers : existingNode.headers;
-          if (typeof parsedHeaders === "string") { try { parsedHeaders = JSON.parse(parsedHeaders); } catch { parsedHeaders = {}; } }
-          const normalizedTargets = this.normalizeTargets(n.target || existingNode.target);
-          if (!normalizedTargets) continue;
-          const baseNode = {
-            target: normalizedTargets,
-            secret: n.secret !== undefined ? n.secret : (existingNode.secret || ""),
-            tag: n.tag !== undefined ? n.tag : (existingNode.tag || ""),
-            remark: n.remark !== undefined ? n.remark : (existingNode.remark || ""),
-            headers: this.sanitizeHeaders(parsedHeaders),
-            schemaVersion: 2,
-            createdAt: existingNode.createdAt || new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          };
-          const val = this.normalizeNode(name, baseNode).data;
-          await kv.put(`${this.PREFIX}${name}`, JSON.stringify(val));
-          await invalidate(name);
-          savedNodes.push({ name, ...val });
-          index.push(name);
-        }
-        
-        if (savedNodes.length > 0 && ctx) { 
-          ctx.waitUntil((async () => { 
-            index = [...new Set(index)]; 
-            await kv.put(this.NODES_INDEX_KEY, JSON.stringify(index)); 
-            GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 }; 
-          })()); 
-        }
-        if (data.action === "save" && savedNodes.length === 0) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
-        return new Response(JSON.stringify({ success: true, node: data.action === "save" ? savedNodes[0] : undefined, nodes: data.action === "import" ? savedNodes : undefined }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
-      }
-      
-      case "importFull": {
-        if (data.config) { await kv.put(this.CONFIG_KEY, JSON.stringify(data.config)); GLOBALS.ConfigCache = null; }
-        if (data.nodes && Array.isArray(data.nodes)) {
-            const savedNodes = [];
-            for (const n of data.nodes) {
-              if (!n.name || !n.target) continue;
-              const name = String(n.name).toLowerCase(); 
-              const existingNode = await kv.get(`${this.PREFIX}${name}`, { type: "json" }) || {};
-              let parsedHeaders = n.headers !== undefined ? n.headers : existingNode.headers;
-              if (typeof parsedHeaders === "string") { try { parsedHeaders = JSON.parse(parsedHeaders); } catch { parsedHeaders = {}; } }
-              const normalizedTargets = this.normalizeTargets(n.target || existingNode.target);
-              if (!normalizedTargets) continue;
-              const val = this.normalizeNode(name, {
-                target: normalizedTargets,
-                secret: n.secret !== undefined ? n.secret : (existingNode.secret || ""),
-                tag: n.tag !== undefined ? n.tag : (existingNode.tag || ""),
-                remark: n.remark !== undefined ? n.remark : (existingNode.remark || ""),
-                headers: this.sanitizeHeaders(parsedHeaders),
-                schemaVersion: 2,
-                createdAt: existingNode.createdAt || new Date().toISOString(),
-                updatedAt: new Date().toISOString()
-              }).data;
-              await kv.put(`${this.PREFIX}${name}`, JSON.stringify(val));
-              GLOBALS.NodeCache.delete(name);
-              savedNodes.push(name);
-            }
-            if (savedNodes.length > 0 && ctx) {
-              ctx.waitUntil((async () => {
-                let index = await kv.get(this.NODES_INDEX_KEY, { type: "json" }) || [];
-                index = [...new Set([...index, ...savedNodes])];
-                await kv.put(this.NODES_INDEX_KEY, JSON.stringify(index));
-                GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
-                await CacheManager.invalidateList(ctx);
-              })());
-            }
-        }
-        return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
-      }
-      case "delete": {
-        if (data.name) {
-          const delName = String(data.name).toLowerCase(); await kv.delete(`${this.PREFIX}${delName}`); await invalidate(delName);
-          if (ctx) ctx.waitUntil((async () => { let index = await kv.get(this.NODES_INDEX_KEY, { type: "json" }) || []; await kv.put(this.NODES_INDEX_KEY, JSON.stringify(index.filter(n => n !== delName))); })());
-        }
-        return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
-      }
-      
-      case "purgeCache": {
-          const config = await kv.get(this.CONFIG_KEY, { type: "json" }) || {};
-          if (!config.cfZoneId || !config.cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
-          try {
-              const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(String(config.cfZoneId).trim())}/purge_cache`, {
-                  method: 'POST',
-                  headers: { 'Authorization': `Bearer ${config.cfApiToken}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ purge_everything: true })
-              });
-              if (res.ok) return jsonResponse({ success: true });
-              return jsonError("PURGE_FAILED", "清理失败，请检查密钥权限");
-          } catch(e) { return jsonError("PURGE_ERROR", e.message); }
-      }
-      
-      case "testTelegram": {
-          const { tgBotToken, tgChatId } = data;
-          if (!tgBotToken || !tgChatId) return jsonError("MISSING_PARAMS", "请先填写 Bot Token 和 Chat ID");
-          try {
-              const tgUrl = `https://api.telegram.org/bot${tgBotToken}/sendMessage`;
-              const msgText = "✅ Emby Proxy: Telegram 机器人测试通知成功！\n如果您能看到这条消息，说明您的通知配置完全正确。";
-              const tgRes = await fetch(tgUrl, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ chat_id: tgChatId, text: msgText })
-              });
-              const tgData = await tgRes.json();
-              if (tgData.ok) return jsonResponse({ success: true });
-              else return jsonError("TG_API_ERROR", tgData.description || "Telegram API 返回错误，请检查 Token/ChatID");
-          } catch (e) {
-              return jsonError("NETWORK_ERROR", e.message);
-          }
-      }
-
-      case "sendDailyReport": {
-          try {
-              await this.sendDailyTelegramReport(env);
-              return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
-          } catch (e) {
-              return jsonError("REPORT_FAILED", e.message);
-          }
-      }
-
-      case "pingNode": {
-          const node = await this.getNode(data.name, env, ctx);
-          if (!node || !node.target) return jsonError("NOT_FOUND", "节点不存在");
-          // 取第一个目标源站进行真实回源探测
-          const targets = String(node.target).split(",").map(i => i.trim()).filter(Boolean);
-          const start = Date.now();
-          try {
-              const controller = new AbortController();
-              const timeoutId = setTimeout(() => controller.abort(), parseInt(data.timeout || 5000));
-              await fetch(targets[0], { method: 'HEAD', signal: controller.signal });
-              clearTimeout(timeoutId);
-              return jsonResponse({ ms: Date.now() - start });
-          } catch (e) {
-              return jsonResponse({ ms: 9999 });
-          }
-      }
-      
-      case "getLogs": {
-        const db = this.getDB(env); if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
-        const { page = 1, pageSize = 50, filters = {} } = data;
-        const offset = (page - 1) * pageSize;
-        let whereClause = [], params = [];
-        
-        if (filters.keyword) { 
-            whereClause.push("(node_name LIKE ? OR request_path LIKE ? OR client_ip LIKE ? OR category LIKE ? OR CAST(status_code AS TEXT) LIKE ?)"); 
-            params.push(`%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`); 
-        }
-        if (filters.category) { whereClause.push("category = ?"); params.push(filters.category); }
-        if (filters.startDate) { whereClause.push("timestamp >= ?"); params.push(new Date(filters.startDate).getTime()); }
-        if (filters.endDate) { whereClause.push("timestamp <= ?"); params.push(new Date(filters.endDate + "T23:59:59").getTime()); }
-        
-        const where = whereClause.length > 0 ? "WHERE " + whereClause.join(" AND ") : "";
-        const total = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs ${where}`).bind(...params).first())?.total || 0;
-        const logsResult = await db.prepare(`SELECT * FROM proxy_logs ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`).bind(...params, pageSize, offset).all();
-        return new Response(JSON.stringify({ logs: logsResult.results || [], total, page, pageSize, totalPages: Math.ceil(total / pageSize) }), { headers: { ...corsHeaders } });
-      }
-      case "clearLogs": {
-        const db = this.getDB(env); if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
-        await db.prepare("DELETE FROM proxy_logs").run();
-        return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
-      }
-      case "initLogsDb": {
-        const db = this.getDB(env); if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
-        await db.prepare(`CREATE TABLE IF NOT EXISTS proxy_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', created_at TEXT NOT NULL)`).run();
+    async testTelegram(data) {
+        const { tgBotToken, tgChatId } = data;
+        if (!tgBotToken || !tgChatId) return jsonError("MISSING_PARAMS", "请先填写 Bot Token 和 Chat ID");
         try {
-          await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN category TEXT DEFAULT 'api'`).run();
+            const tgUrl = `https://api.telegram.org/bot${tgBotToken}/sendMessage`;
+            const msgText = "✅ Emby Proxy: Telegram 机器人测试通知成功！\n如果您能看到这条消息，说明您的通知配置完全正确。";
+            const tgRes = await fetch(tgUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: tgChatId, text: msgText })
+            });
+            const tgData = await tgRes.json();
+            if (tgData.ok) return jsonResponse({ success: true });
+            return jsonError("TG_API_ERROR", tgData.description || "Telegram API 返回错误，请检查 Token/ChatID");
         } catch (e) {
-          const msg = String(e && e.message || e).toLowerCase();
-          if (!msg.includes("duplicate column") && !msg.includes("already exists") && !msg.includes("duplicate") && !msg.includes("exists")) {
-            throw e;
-          }
+            return jsonError("NETWORK_ERROR", e.message);
         }
-        // [新增] 动态追加 error_detail 字段用于存储 4xx/5xx 报错明细
+    },
+
+    async sendDailyReport(data, { env }) {
         try {
-          await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN error_detail TEXT`).run();
+            await Database.sendDailyTelegramReport(env);
+            return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
         } catch (e) {
-          // 忽略已存在的报错
+            return jsonError("REPORT_FAILED", e.message);
         }
-        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON proxy_logs (timestamp)`).run();
-        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON proxy_logs (client_ip)`).run();
-        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON proxy_logs (node_name, timestamp)`).run();
-        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category ON proxy_logs (category)`).run();
-        return new Response(JSON.stringify({ success: true, schemaVersion: 2, categoryEnabled: true }), { headers: { ...corsHeaders } });
+    },
+
+    async pingNode(data, { env, ctx }) {
+        const node = await Database.getNode(data.name, env, ctx);
+        if (!node || !node.target) return jsonError("NOT_FOUND", "节点不存在");
+        const targets = String(node.target).split(",").map(i => i.trim()).filter(Boolean);
+        const start = Date.now();
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), parseInt(data.timeout || 5000));
+            await fetch(targets[0], { method: 'HEAD', signal: controller.signal });
+            clearTimeout(timeoutId);
+            return jsonResponse({ ms: Date.now() - start });
+        } catch (e) {
+            return jsonResponse({ ms: 9999 });
+        }
+    },
+
+    async getLogs(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      const { page = 1, pageSize = 50, filters = {} } = data;
+      const offset = (page - 1) * pageSize;
+      let whereClause = [], params = [];
+      
+      if (filters.keyword) { 
+          whereClause.push("(node_name LIKE ? OR request_path LIKE ? OR client_ip LIKE ? OR category LIKE ? OR CAST(status_code AS TEXT) LIKE ?)"); 
+          params.push(`%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`, `%${filters.keyword}%`); 
       }
-      default: return new Response("Invalid Action", { status: 400, headers: { ...corsHeaders } });
+      if (filters.category) { whereClause.push("category = ?"); params.push(filters.category); }
+      if (filters.startDate) { whereClause.push("timestamp >= ?"); params.push(new Date(filters.startDate).getTime()); }
+      if (filters.endDate) { whereClause.push("timestamp <= ?"); params.push(new Date(filters.endDate + "T23:59:59").getTime()); }
+      
+      const where = whereClause.length > 0 ? "WHERE " + whereClause.join(" AND ") : "";
+      const total = (await db.prepare(`SELECT COUNT(*) as total FROM proxy_logs ${where}`).bind(...params).first())?.total || 0;
+      const logsResult = await db.prepare(`SELECT * FROM proxy_logs ${where} ORDER BY timestamp DESC LIMIT ? OFFSET ?`).bind(...params, pageSize, offset).all();
+      
+      return new Response(JSON.stringify({ logs: logsResult.results || [], total, page, pageSize, totalPages: Math.ceil(total / pageSize) }), { headers: { ...corsHeaders } });
+    },
+
+    async clearLogs(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      await db.prepare("DELETE FROM proxy_logs").run();
+      return new Response(JSON.stringify({ success: true }), { headers: { ...corsHeaders } });
+    },
+
+    async initLogsDb(data, { db }) {
+      if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders } });
+      await db.prepare(`CREATE TABLE IF NOT EXISTS proxy_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', created_at TEXT NOT NULL)`).run();
+      try { await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN category TEXT DEFAULT 'api'`).run(); } catch (e) { /* ignore */ }
+      try { await db.prepare(`ALTER TABLE proxy_logs ADD COLUMN error_detail TEXT`).run(); } catch (e) { /* ignore */ }
+      
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON proxy_logs (timestamp)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON proxy_logs (client_ip)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON proxy_logs (node_name, timestamp)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category ON proxy_logs (category)`).run();
+      
+      return new Response(JSON.stringify({ success: true, schemaVersion: 2, categoryEnabled: true }), { headers: { ...corsHeaders } });
     }
+  },
+
+  // ============================================================================
+  // 重构后的 handleApi 主函数：极简派发器
+  // 边界说明：
+  // 1. 这里只做四件事：鉴别 KV、解析 JSON、归一 action、构造上下文后派发。
+  // 2. 这里不承载业务判断，业务复杂度应留在 ApiHandlers 的具体动作中。
+  // 3. 当需要新增管理功能时，优先保证这里继续保持“薄派发层”。
+  // ============================================================================
+  async handleApi(request, env, ctx) {
+    const kv = this.getKV(env);
+    if (!kv) {
+        return new Response(JSON.stringify({ error: "kv_missing" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    let data; 
+    try { 
+        data = await request.json(); 
+    } catch { 
+        return jsonError("INVALID_JSON", "请求 JSON 无效", 400); 
+    }
+
+    const normalizedRequest = this.normalizeAdminActionRequest(data);
+    if (!normalizedRequest) {
+        return jsonError("INVALID_REQUEST", "请求体必须是 JSON 对象", 400);
+    }
+
+    const actionName = (normalizedRequest.action === "save" || normalizedRequest.action === "import") ? "saveOrImport" : normalizedRequest.action;
+    const handler = this.ApiHandlers[actionName];
+
+    if (!handler) {
+        return jsonError("INVALID_ACTION", "未知的管理动作", 400, { action: normalizedRequest.action || null });
+    }
+
+    const context = {
+        action: normalizedRequest.action,
+        meta: normalizedRequest.meta,
+        request,
+        env,
+        ctx,
+        kv,
+        db: this.getDB(env)
+    };
+
+    return await handler.call(this, normalizedRequest.data, context);
   }
 };
 
 // ============================================================================
 // 3. 代理模块 (PROXY MODULE - 核心缓冲防护与 CORS 重构)
 // ============================================================================
+function normalizeEmbyAuthHeaders(headers, method = "GET", path = "") {
+  // 1. 安全提取并清洗现有 Header
+  const embyAuth = headers.get("X-Emby-Authorization")?.trim();
+  const stdAuth = headers.get("Authorization")?.trim();
+  const isEmbyStd = stdAuth?.toLowerCase().startsWith("emby ");
+
+  // 2. 确立单一真相源 (Source of Truth)
+  // 优先级: X-Emby-Auth > 符合规范的 Std Auth > null
+  let finalAuth = embyAuth || (isEmbyStd ? stdAuth : null);
+
+  // 3. 登录 API 强制补头兜底
+  if (!finalAuth && method.toUpperCase() === "POST" && path.toLowerCase().includes("/users/authenticatebyname")) {
+      finalAuth = 'Emby Client="Emby Proxy Patch", Device="Browser", DeviceId="proxy-login-patch", Version="1.0.0"';
+  }
+
+  // 4. 双向同步 (解决冲突与缺失)
+  if (finalAuth) {
+      headers.set("X-Emby-Authorization", finalAuth);
+      
+      // 仅在 Authorization 为空，或确认其也是 Emby 格式时才覆盖
+      // 绝对不覆盖正常的 Bearer/Basic 认证头
+      if (!stdAuth || isEmbyStd) {
+          headers.set("Authorization", finalAuth);
+      }
+  }
+  
+  return headers;
+}
 const Proxy = {
-  async handle(request, node, path, name, key, env, ctx, options = {}) {
-    const startTime = Date.now();
-    CacheManager.maybeCleanup();
-    if (!node || !node.target) return new Response("Invalid Node", { status: 502, headers: applySecurityHeaders(new Headers()) });
-
-    const currentConfig = await getRuntimeConfig(env);
-    const requestUrl = options.requestUrl || new URL(request.url);
-    const proxyPath = sanitizeProxyPath(path);
-    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
-    const country = request.cf?.country || "UNKNOWN";
-
+  // Proxy 模块阅读顺序建议：
+  // 1. resolve/evaluate/classify：环境裁决与请求分类
+  // 2. build*：请求状态、响应头、跳转头整形
+  // 3. perform/fetch*：上游访问与重试循环
+  // 4. handle：把上述阶段串成完整代理链路
+  resolveCorsOrigin(currentConfig, request) {
     const reqOrigin = request.headers.get("Origin");
     const allowedOrigins = String(currentConfig.corsOrigins || "").split(",").map(i => i.trim()).filter(Boolean);
-    let finalOrigin = "*";
-    if (allowedOrigins.length > 0) finalOrigin = reqOrigin && allowedOrigins.includes(reqOrigin) ? reqOrigin : allowedOrigins[0];
-    else if (reqOrigin) finalOrigin = reqOrigin;
-    const dynamicCors = getCorsHeadersForResponse(env, request, finalOrigin);
-
-    if (request.method === "OPTIONS") {
-      const headers = new Headers(dynamicCors);
-      applySecurityHeaders(headers);
-      if (finalOrigin !== "*") mergeVaryHeader(headers, "Origin");
-      return new Response(null, { headers });
-    }
-
-    const ipBlacklist = String(currentConfig.ipBlacklist || "").split(",").map(i => i.trim()).filter(Boolean);
-    if (ipBlacklist.includes(clientIp)) {
-      const headers = new Headers({ "Access-Control-Allow-Origin": finalOrigin, "Cache-Control": "no-store" });
-      applySecurityHeaders(headers);
-      return new Response("Forbidden by IP Firewall", { status: 403, headers });
-    }
-
-    const geoAllow = String(currentConfig.geoAllowlist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
-    const geoBlock = String(currentConfig.geoBlocklist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
-    if ((geoAllow.length > 0 && !geoAllow.includes(country)) || (geoBlock.length > 0 && geoBlock.includes(country))) {
-      const headers = new Headers({ "Access-Control-Allow-Origin": finalOrigin, "Cache-Control": "no-store" });
-      applySecurityHeaders(headers);
-      return new Response("Forbidden by Geo Firewall", { status: 403, headers });
-    }
-
+    if (allowedOrigins.length > 0) return reqOrigin && allowedOrigins.includes(reqOrigin) ? reqOrigin : allowedOrigins[0];
+    return reqOrigin || "*";
+  },
+  buildEdgeResponseHeaders(finalOrigin, extra = {}) {
+    const headers = new Headers({ "Access-Control-Allow-Origin": finalOrigin, "Cache-Control": "no-store", ...extra });
+    applySecurityHeaders(headers);
+    return headers;
+  },
+  classifyRequest(request, proxyPath, requestUrl, currentConfig) {
     const rangeHeader = request.headers.get("Range");
-
-    // [预热修复] 1. 提取全局开关和自定义 TTL 配置
-    const enablePrewarm = currentConfig.enablePrewarm !== false; // 默认开启
+    const enablePrewarm = currentConfig.enablePrewarm !== false;
     const prewarmCacheTtl = parseInt(currentConfig.prewarmCacheTtl) || 180;
-
-    // [预热进阶] 命中预热探测时，旁路预取后续一段数据（用于温后续 Range/分段）
-    // 默认 4MB，可在面板配置 prewarmPrefetchBytes；设置为 0 可关闭
-    const prewarmPrefetchBytes = Math.max(
-      0,
-      parseInt(currentConfig.prewarmPrefetchBytes) || (4 * 1024 * 1024)
-    );
-
-    // [预热修复] 2. 结合开关，放宽 Range 识别（兼容 bytes=0- / bytes=0-0 / bytes=0-1 / bytes=0-xxxxx），并兼容 HEAD 请求
-    // 说明：保持 0~7 位数字上限，避免把超大 Range 也误判为预热
+    const prewarmPrefetchBytes = Math.max(0, parseInt(currentConfig.prewarmPrefetchBytes) || (4 * 1024 * 1024));
     const isHeadPrewarm =
       enablePrewarm &&
       (request.method === "GET" || request.method === "HEAD") &&
       !!rangeHeader &&
       /^bytes=0-(\d{0,7})?$/.test(rangeHeader);
-
     const isImage = GLOBALS.Regex.EmbyImages.test(proxyPath) || GLOBALS.Regex.StaticExt.test(proxyPath);
     const isSubtitle = GLOBALS.Regex.SubtitleExt.test(proxyPath);
     const isManifest = GLOBALS.Regex.ManifestExt.test(proxyPath);
@@ -1360,38 +1530,59 @@ const Proxy = {
     const looksLikeVideoRoute = GLOBALS.Regex.Streaming.test(proxyPath) || /\/videos\/[^/]+\/(stream|original|download|file)/i.test(proxyPath) || /\/items\/[^/]+\/download/i.test(proxyPath) || requestUrl.searchParams.get("Static") === "true" || requestUrl.searchParams.get("Download") === "true";
     const isBigStream = looksLikeVideoRoute && !isManifest && !isSegment && !isHeadPrewarm;
     const isCacheableAsset = request.method === "GET" && !isWsUpgrade && (isImage || isSubtitle || isSegment || isHeadPrewarm);
-
-    const rpmLimit = parseInt(currentConfig.rateLimitRpm) || 0;
-    const shouldRateLimit = rpmLimit > 0 && !(isManifest || isSegment || isHeadPrewarm || isBigStream);
-    if (shouldRateLimit) {
-      let rlData = GLOBALS.RateLimitCache.get(clientIp);
-      if (!rlData || startTime > rlData.resetAt) rlData = { count: 0, resetAt: startTime + 60000 };
-      rlData.count += 1;
-      GLOBALS.RateLimitCache.set(clientIp, rlData);
-      if (rlData.count > rpmLimit) {
-        const headers = new Headers({ "Access-Control-Allow-Origin": finalOrigin, "Cache-Control": "no-store" });
-        applySecurityHeaders(headers);
-        return new Response("Rate Limit Exceeded", { status: 429, headers });
-      }
+    return {
+      rangeHeader,
+      enablePrewarm,
+      prewarmCacheTtl,
+      prewarmPrefetchBytes,
+      isHeadPrewarm,
+      isImage,
+      isSubtitle,
+      isManifest,
+      isSegment,
+      isWsUpgrade,
+      looksLikeVideoRoute,
+      isBigStream,
+      isCacheableAsset
+    };
+  },
+  evaluateFirewall(currentConfig, clientIp, country, finalOrigin) {
+    const ipBlacklist = String(currentConfig.ipBlacklist || "").split(",").map(i => i.trim()).filter(Boolean);
+    if (ipBlacklist.includes(clientIp)) {
+      return new Response("Forbidden by IP Firewall", { status: 403, headers: this.buildEdgeResponseHeaders(finalOrigin) });
     }
 
-    const enableH2 = currentConfig.enableH2 === true;
-    const enableH3 = currentConfig.enableH3 === true;
-    const peakDowngrade = currentConfig.peakDowngrade !== false;
-    const protocolFallback = currentConfig.protocolFallback !== false; 
-    const utc8Hour = (new Date().getUTCHours() + 8) % 24;
-    const isPeakHour = utc8Hour >= 20 && utc8Hour < 24;
-    const forceH1 = (peakDowngrade && isPeakHour) || (!enableH2 && !enableH3);
+    const geoAllow = String(currentConfig.geoAllowlist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
+    const geoBlock = String(currentConfig.geoBlocklist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
+    if ((geoAllow.length > 0 && !geoAllow.includes(country)) || (geoBlock.length > 0 && geoBlock.includes(country))) {
+      return new Response("Forbidden by Geo Firewall", { status: 403, headers: this.buildEdgeResponseHeaders(finalOrigin) });
+    }
 
+    return null;
+  },
+  applyRateLimit(currentConfig, clientIp, requestTraits, startTime, finalOrigin) {
+    const rpmLimit = parseInt(currentConfig.rateLimitRpm) || 0;
+    const shouldRateLimit = rpmLimit > 0 && !(requestTraits.isManifest || requestTraits.isSegment || requestTraits.isHeadPrewarm || requestTraits.isBigStream);
+    if (!shouldRateLimit) return null;
+    let rlData = GLOBALS.RateLimitCache.get(clientIp);
+    if (!rlData || startTime > rlData.resetAt) rlData = { count: 0, resetAt: startTime + 60000 };
+    rlData.count += 1;
+    GLOBALS.RateLimitCache.set(clientIp, rlData);
+    if (rlData.count > rpmLimit) {
+      return new Response("Rate Limit Exceeded", { status: 429, headers: this.buildEdgeResponseHeaders(finalOrigin) });
+    }
+    return null;
+  },
+  parseTargetBases(node, finalOrigin) {
     const targetBases = String(node.target || "").split(",").map(item => item.trim()).filter(Boolean).map(item => {
       try { return new URL(item); } catch { return null; }
     }).filter(url => url && ["http:", "https:"].includes(url.protocol));
     if (!targetBases.length) {
-      const headers = new Headers({ "Access-Control-Allow-Origin": finalOrigin, "Cache-Control": "no-store" });
-      applySecurityHeaders(headers);
-      return new Response("Invalid Node Target", { status: 502, headers });
+      return { targetBases, invalidResponse: new Response("Invalid Node Target", { status: 502, headers: this.buildEdgeResponseHeaders(finalOrigin) }) };
     }
-
+    return { targetBases, invalidResponse: null };
+  },
+  buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases) {
     const newHeaders = new Headers(request.headers);
     GLOBALS.DropRequestHeaders.forEach(h => newHeaders.delete(h));
 
@@ -1411,56 +1602,244 @@ const Proxy = {
     if (mergedCookie) newHeaders.set("Cookie", mergedCookie);
     else newHeaders.delete("Cookie");
 
-    // ================== 核心补丁：Emby 授权头双向兼容 & 登录 API 补头 ==================
-    let embyAuth = newHeaders.get("X-Emby-Authorization");
-    let stdAuth = newHeaders.get("Authorization");
-
-    if (embyAuth && !stdAuth) {
-      newHeaders.set("Authorization", embyAuth);
-    } else if (stdAuth && stdAuth.toLowerCase().startsWith("emby ") && !embyAuth) {
-      newHeaders.set("X-Emby-Authorization", stdAuth);
-    }
-
-    if (request.method === "POST" && proxyPath.toLowerCase().includes("/users/authenticatebyname")) {
-      const loginCompatAuth = 'Emby Client="Emby Proxy Patch", Device="Browser", DeviceId="proxy-login-patch", Version="1.0.0"';
-
-      if (!newHeaders.has("X-Emby-Authorization") && !newHeaders.has("Authorization")) {
-        newHeaders.set("X-Emby-Authorization", loginCompatAuth);
-        newHeaders.set("Authorization", loginCompatAuth);
-      } else if (newHeaders.has("X-Emby-Authorization") && !newHeaders.has("Authorization")) {
-        newHeaders.set("Authorization", newHeaders.get("X-Emby-Authorization"));
-      } else if (newHeaders.has("Authorization") && !newHeaders.has("X-Emby-Authorization")) {
-        const authVal = newHeaders.get("Authorization") || "";
-        if (authVal.toLowerCase().startsWith("emby ")) {
-          newHeaders.set("X-Emby-Authorization", authVal);
-        }
-      }
-    }
-    // =====================================================================================
+    normalizeEmbyAuthHeaders(newHeaders, request.method, proxyPath);
 
     newHeaders.set("X-Real-IP", clientIp);
     newHeaders.set("X-Forwarded-For", clientIp);
     newHeaders.set("X-Forwarded-Host", requestUrl.host);
     newHeaders.set("X-Forwarded-Proto", requestUrl.protocol.replace(":", ""));
-    if (isWsUpgrade) {
+    if (requestTraits.isWsUpgrade) {
       newHeaders.set("Upgrade", "websocket");
       newHeaders.set("Connection", "Upgrade");
     } else if (forceH1) {
       newHeaders.set("Connection", "keep-alive");
     }
-    if ((isBigStream || isSegment || isManifest) && !adminCustomHeaders.has("referer")) newHeaders.delete("Referer");
+    if ((requestTraits.isBigStream || requestTraits.isSegment || requestTraits.isManifest) && !adminCustomHeaders.has("referer")) {
+      newHeaders.delete("Referer");
+    }
 
-    // ================== 核心分流机制：三车道完美路由 ==================
-    // 1. 判定是否为带 Body 的非幂等请求 (POST/PUT/PATCH 等)
     const isNonIdempotent = request.method !== "GET" && request.method !== "HEAD";
-    
-    // 2. 终极内存优化：强制使用纯流式 request.body，斩断 ArrayBuffer OOM 根源
     const preparedBody = isNonIdempotent ? request.body : null;
     const preparedBodyMode = (isNonIdempotent && request.body) ? "stream" : "none";
-    
-    // 3. 剥夺重试权利：POST/PUT 只取 targetBases[0]，GET/HEAD/WS 保留完整容灾队列
     const retryTargets = isNonIdempotent ? targetBases.slice(0, 1) : targetBases;
-    // ==================================================================
+
+    return {
+      newHeaders,
+      adminCustomHeaders,
+      preparedBody,
+      preparedBodyMode,
+      retryTargets
+    };
+  },
+  evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, policy) {
+    const isSameOriginRedirect = nextUrl.origin === activeTargetBase.origin;
+    const mustDirect = isSameOriginRedirect
+      ? !policy.sourceSameOriginProxy
+      : (!policy.forceExternalProxy || shouldDirectByWangpan(nextUrl, policy.wangpanDirectKeywords));
+    if (mustDirect) {
+      return { mustDirect: true, nextMethod: null, nextBodyMode: redirectBodyMode, isSameOriginRedirect };
+    }
+    const nextMethod = normalizeRedirectMethod(policy.currentStatus, redirectMethod);
+    let nextBodyMode = redirectBodyMode;
+    if (nextMethod === "GET" || nextMethod === "HEAD") nextBodyMode = "none";
+    else if (redirectBodyMode === "stream") {
+      return { mustDirect: true, nextMethod, nextBodyMode: redirectBodyMode, isSameOriginRedirect };
+    }
+    return { mustDirect: false, nextMethod, nextBodyMode, isSameOriginRedirect };
+  },
+  buildProxyResponseHeaders(response, request, dynamicCors, finalOrigin, requestTraits, options = {}) {
+    const modifiedHeaders = new Headers(response.headers);
+
+    if (GLOBALS.DropResponseHeaders) {
+      GLOBALS.DropResponseHeaders.forEach(h => modifiedHeaders.delete(h));
+    }
+
+    modifiedHeaders.set("Access-Control-Allow-Origin", finalOrigin);
+
+    if (dynamicCors && dynamicCors["Access-Control-Expose-Headers"]) {
+      modifiedHeaders.set("Access-Control-Expose-Headers", dynamicCors["Access-Control-Expose-Headers"]);
+    }
+
+    if (dynamicCors && dynamicCors["Access-Control-Allow-Methods"]) {
+      modifiedHeaders.set("Access-Control-Allow-Methods", dynamicCors["Access-Control-Allow-Methods"]);
+    }
+
+    const resReqHeaders = request.headers.get("Access-Control-Request-Headers");
+    if (resReqHeaders) {
+      modifiedHeaders.set("Access-Control-Allow-Headers", resReqHeaders);
+      mergeVaryHeader(modifiedHeaders, "Access-Control-Request-Headers");
+    } else if (dynamicCors && dynamicCors["Access-Control-Allow-Headers"]) {
+      modifiedHeaders.set("Access-Control-Allow-Headers", dynamicCors["Access-Control-Allow-Headers"]);
+    }
+
+    if (finalOrigin !== "*") {
+      mergeVaryHeader(modifiedHeaders, "Origin");
+    }
+
+    if (!options.enableH3 || options.forceH1) {
+      modifiedHeaders.delete("Alt-Svc");
+    }
+
+    if (requestTraits.isImage || requestTraits.isSubtitle || requestTraits.isManifest) {
+      modifiedHeaders.set("Cache-Control", "public, max-age=86400");
+    } else if (requestTraits.isHeadPrewarm) {
+      modifiedHeaders.set("Cache-Control", `public, max-age=${requestTraits.prewarmCacheTtl}`);
+    } else if (requestTraits.isBigStream || options.proxiedExternalRedirect) {
+      modifiedHeaders.set("Cache-Control", "no-store");
+    }
+
+    applySecurityHeaders(modifiedHeaders);
+    return modifiedHeaders;
+  },
+  applyProxyRedirectHeaders(modifiedHeaders, response, activeTargetBase, name, key, directRedirectUrl) {
+    if (directRedirectUrl) {
+      modifiedHeaders.set("Location", directRedirectUrl.toString());
+      modifiedHeaders.set("Cache-Control", "no-store");
+      return;
+    }
+    if (!(response.status >= 300 && response.status < 400)) return;
+    const location = modifiedHeaders.get("Location");
+    if (!location) return;
+    const prefix = buildProxyPrefix(name, key);
+    if (location.startsWith("/")) {
+      modifiedHeaders.set("Location", prefix + location);
+      return;
+    }
+    try {
+      const locUrl = new URL(location);
+      if (locUrl.origin === activeTargetBase.origin) {
+        modifiedHeaders.set("Location", prefix + locUrl.pathname + locUrl.search + locUrl.hash);
+      }
+    } catch {}
+  },
+  classifyProxyLogCategory(requestTraits) {
+    if (requestTraits.isSegment) return "segment";
+    if (requestTraits.isHeadPrewarm) return "prewarm";
+    if (requestTraits.isManifest) return "manifest";
+    if (requestTraits.isBigStream) return "stream";
+    if (requestTraits.isImage) return "image";
+    if (requestTraits.isSubtitle) return "subtitle";
+    if (requestTraits.isWsUpgrade) return "websocket";
+    return "api";
+  },
+  extractProxyErrorDetail(response) {
+    if (response.status < 400) return null;
+    const hints = [];
+    const srv = response.headers.get("Server");
+    if (srv) hints.push(`Server: ${srv}`);
+    const ray = response.headers.get("CF-Ray");
+    if (ray) hints.push(`CF-Ray: ${ray}`);
+    const embyErr = response.headers.get("X-Application-Error-Code") || response.headers.get("X-Emby-Error");
+    if (embyErr) hints.push(`Emby-Error: ${embyErr}`);
+    const cfCache = response.headers.get("CF-Cache-Status");
+    if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
+    return hints.length > 0 ? hints.join(" | ") : response.statusText;
+  },
+  shouldRetryWithProtocolFallback(response, state = {}) {
+    if (response.status !== 403) return false;
+    if (state.isRetry !== false) return false;
+    if (state.protocolFallback !== true) return false;
+    if (state.preparedBodyMode === "stream") return false;
+    return true;
+  },
+  async performUpstreamFetch(targetBase, proxyPath, requestUrl, buildFetchOptions, options = {}) {
+    const finalUrl = new URL(proxyPath, targetBase);
+    finalUrl.search = requestUrl.search;
+    const fetchOptions = await buildFetchOptions(finalUrl, options);
+    const response = await fetch(finalUrl.toString(), fetchOptions);
+    return { response, targetBase, finalUrl };
+  },
+  async fetchUpstreamWithRetryLoop(state) {
+    let lastError = null;
+    let lastResponse = null;
+    let lastBase = state.retryTargets[0];
+    let lastFinalUrl = new URL(state.proxyPath, lastBase);
+    lastFinalUrl.search = state.requestUrl.search;
+
+    for (let index = 0; index < state.retryTargets.length; index++) {
+      const targetBase = state.retryTargets[index];
+      lastBase = targetBase;
+      try {
+        const upstream = await this.performUpstreamFetch(targetBase, state.proxyPath, state.requestUrl, state.buildFetchOptions, { isRetry: state.isRetry });
+        lastFinalUrl = upstream.finalUrl;
+        const response = upstream.response;
+
+        if (response.status === 101) {
+          return upstream;
+        }
+
+        if (this.shouldRetryWithProtocolFallback(response, state)) {
+          try { response.body?.cancel?.(); } catch {}
+          return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true });
+        }
+
+        if (!state.retryableStatuses.has(response.status) || index === state.retryTargets.length - 1) {
+          return upstream;
+        }
+
+        if (lastResponse) {
+          try { lastResponse.body?.cancel?.(); } catch {}
+        }
+        lastResponse = response;
+      } catch (error) {
+        lastError = error;
+        if (index === state.retryTargets.length - 1) throw error;
+      }
+    }
+
+    if (lastResponse) return { response: lastResponse, targetBase: lastBase, finalUrl: lastFinalUrl };
+    throw lastError || new Error("upstream_fetch_failed");
+  },
+  async handle(request, node, path, name, key, env, ctx, options = {}) {
+    // Proxy.handle 阶段图（单文件内的执行主链）：
+    // Phase A. 环境准备：配置、来源、CORS、客户端身份
+    // Phase B. 前置裁决：OPTIONS / 防火墙 / 限流 / 目标源合法性
+    // Phase C. 请求整备：分类、头部整理、body/重试目标准备
+    // Phase D. 上游访问：fetch + 协议回退 + 多目标重试
+    // Phase E. 跳转决策：同源/异源、直连/继续代理
+    // Phase F. 响应整形：缓存头、CORS、Location 改写
+    // Phase G. 观测记录：分类、状态码、错误细节、耗时
+    const startTime = Date.now();
+    CacheManager.maybeCleanup();
+    if (!node || !node.target) return new Response("Invalid Node", { status: 502, headers: applySecurityHeaders(new Headers()) });
+
+    const currentConfig = await getRuntimeConfig(env);
+    const requestUrl = options.requestUrl || new URL(request.url);
+    const proxyPath = sanitizeProxyPath(path);
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const country = request.cf?.country || "UNKNOWN";
+    const finalOrigin = this.resolveCorsOrigin(currentConfig, request);
+    const dynamicCors = getCorsHeadersForResponse(env, request, finalOrigin);
+
+    if (request.method === "OPTIONS") {
+      const headers = new Headers(dynamicCors);
+      applySecurityHeaders(headers);
+      if (finalOrigin !== "*") mergeVaryHeader(headers, "Origin");
+      return new Response(null, { headers });
+    }
+
+    const blockedResponse = this.evaluateFirewall(currentConfig, clientIp, country, finalOrigin);
+    if (blockedResponse) return blockedResponse;
+
+    const requestTraits = this.classifyRequest(request, proxyPath, requestUrl, currentConfig);
+    const { rangeHeader, enablePrewarm, prewarmCacheTtl, prewarmPrefetchBytes, isHeadPrewarm, isImage, isSubtitle, isManifest, isSegment, isWsUpgrade, looksLikeVideoRoute, isBigStream, isCacheableAsset } = requestTraits;
+
+    const rateLimitResponse = this.applyRateLimit(currentConfig, clientIp, requestTraits, startTime, finalOrigin);
+    if (rateLimitResponse) return rateLimitResponse;
+
+    const enableH2 = currentConfig.enableH2 === true;
+    const enableH3 = currentConfig.enableH3 === true;
+    const peakDowngrade = currentConfig.peakDowngrade !== false;
+    const protocolFallback = currentConfig.protocolFallback !== false; 
+    const utc8Hour = (new Date().getUTCHours() + 8) % 24;
+    const isPeakHour = utc8Hour >= 20 && utc8Hour < 24;
+    const forceH1 = (peakDowngrade && isPeakHour) || (!enableH2 && !enableH3);
+
+    const { targetBases, invalidResponse } = this.parseTargetBases(node, finalOrigin);
+    if (invalidResponse) return invalidResponse;
+    const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode, retryTargets } =
+      this.buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases);
+
     const sourceSameOriginProxy = currentConfig.sourceSameOriginProxy !== false;
     const forceExternalProxy = currentConfig.forceExternalProxy !== false;
     const wangpanDirectKeywords = getWangpanDirectText(currentConfig.wangpandirect || "");
@@ -1525,59 +1904,6 @@ const Proxy = {
     };
 
     const retryableStatuses = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]); 
-    
-    const fetchUpstream = async (isRetry = false) => {
-      let lastError = null;
-      let lastResponse = null;
-      let lastBase = retryTargets[0];
-      let lastFinalUrl = new URL(proxyPath, lastBase);
-      lastFinalUrl.search = requestUrl.search;
-      
-      for (let index = 0; index < retryTargets.length; index++) {
-        const targetBase = retryTargets[index];
-        const finalUrl = new URL(proxyPath, targetBase);
-        finalUrl.search = requestUrl.search;
-        lastBase = targetBase;
-        lastFinalUrl = finalUrl;
-        
-        try {
-          const fetchOptions = await buildFetchOptions(finalUrl, { isRetry });
-          const response = await fetch(finalUrl.toString(), fetchOptions);
-          
-          // 🌟 第三车道 (WebSocket 特权通道)
-          if (response.status === 101) {
-            return { response, targetBase: lastBase, finalUrl: lastFinalUrl };
-          }
-          
-          // 🌟 异常防御：403 降级重试拦截
-          if (response.status === 403 && !isRetry && protocolFallback) {
-            // 如果是 POST 流式 body，已经被消费过一次，绝不能二次 fetch，直接原样返回
-            if (preparedBodyMode === "stream") {
-              return { response, targetBase, finalUrl };
-            }
-            // 销毁无用响应体，防止 CF 内存泄漏
-            try { response.body?.cancel?.(); } catch {}
-            return await fetchUpstream(true); 
-          }
-          
-          // 如果状态码正常，或是最后一个节点，直接返回
-          if (!retryableStatuses.has(response.status) || index === retryTargets.length - 1) {
-            return { response, targetBase, finalUrl };
-          }
-          
-          // 🌟 内存防御：在进入下一次重试循环前，必须手动销毁被废弃的响应体
-          if (lastResponse) {
-            try { lastResponse.body?.cancel?.(); } catch {}
-          }
-          lastResponse = response;
-        } catch (error) {
-          lastError = error;
-          if (index === retryTargets.length - 1) throw error;
-        }
-      }
-      if (lastResponse) return { response: lastResponse, targetBase: lastBase, finalUrl: lastFinalUrl };
-      throw lastError || new Error("upstream_fetch_failed");
-    };
 
     let response;
     let finalUrl;
@@ -1587,7 +1913,16 @@ const Proxy = {
     let directRedirectStatus = null;
 
     try {
-      const upstream = await fetchUpstream();
+      const upstream = await this.fetchUpstreamWithRetryLoop({
+        retryTargets,
+        proxyPath,
+        requestUrl,
+        buildFetchOptions,
+        retryableStatuses,
+        protocolFallback,
+        preparedBodyMode,
+        isRetry: false
+      });
       response = upstream.response;
       activeTargetBase = upstream.targetBase;
       finalUrl = upstream.finalUrl;
@@ -1601,26 +1936,21 @@ const Proxy = {
         const nextUrl = resolveRedirectTarget(location, finalUrl || activeTargetBase);
         if (!nextUrl) break;
 
-        const isSameOriginRedirect = nextUrl.origin === activeTargetBase.origin;
-        const mustDirect = isSameOriginRedirect
-          ? !sourceSameOriginProxy
-          : (!forceExternalProxy || shouldDirectByWangpan(nextUrl, wangpanDirectKeywords));
+        const redirectDecision = this.evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, {
+          sourceSameOriginProxy,
+          forceExternalProxy,
+          wangpanDirectKeywords,
+          currentStatus: response.status
+        });
 
-        if (mustDirect) {
+        if (redirectDecision.mustDirect) {
           directRedirectUrl = nextUrl;
           break;
         }
 
-        const nextMethod = normalizeRedirectMethod(response.status, redirectMethod);
-        let nextBodyMode = redirectBodyMode;
-        let nextBody = redirectBody;
-        if (nextMethod === "GET" || nextMethod === "HEAD") {
-          nextBodyMode = "none";
-          nextBody = null;
-        } else if (redirectBodyMode === "stream") {
-          directRedirectUrl = nextUrl;
-          break;
-        }
+        const nextMethod = redirectDecision.nextMethod;
+        const nextBodyMode = redirectDecision.nextBodyMode;
+        const nextBody = nextBodyMode === "none" ? null : redirectBody;
 
         try { response.body?.cancel?.(); } catch {}
 
@@ -1628,14 +1958,14 @@ const Proxy = {
           method: nextMethod,
           bodyMode: nextBodyMode,
           body: nextBody,
-          isExternalRedirect: !isSameOriginRedirect
+          isExternalRedirect: !redirectDecision.isSameOriginRedirect
         });
         response = await fetch(nextUrl.toString(), redirectFetchOptions);
         finalUrl = nextUrl;
         redirectMethod = nextMethod;
         redirectBodyMode = nextBodyMode;
         redirectBody = nextBody;
-        if (!isSameOriginRedirect) proxiedExternalRedirect = true;
+        if (!redirectDecision.isSameOriginRedirect) proxiedExternalRedirect = true;
         redirectHop += 1;
       }
 
@@ -1646,95 +1976,15 @@ const Proxy = {
         try { response.body?.cancel?.(); } catch {}
       }
 
-      const modifiedHeaders = new Headers(response.headers);
+      const modifiedHeaders = this.buildProxyResponseHeaders(response, request, dynamicCors, finalOrigin, requestTraits, {
+        enableH3,
+        forceH1,
+        proxiedExternalRedirect
+      });
+      this.applyProxyRedirectHeaders(modifiedHeaders, response, activeTargetBase, name, key, directRedirectUrl);
 
-      if (GLOBALS.DropResponseHeaders) {
-        GLOBALS.DropResponseHeaders.forEach(h => modifiedHeaders.delete(h));
-      }
-
-      modifiedHeaders.set("Access-Control-Allow-Origin", finalOrigin);
-
-      if (dynamicCors && dynamicCors["Access-Control-Expose-Headers"]) {
-        modifiedHeaders.set("Access-Control-Expose-Headers", dynamicCors["Access-Control-Expose-Headers"]);
-      }
-
-      if (dynamicCors && dynamicCors["Access-Control-Allow-Methods"]) {
-        modifiedHeaders.set("Access-Control-Allow-Methods", dynamicCors["Access-Control-Allow-Methods"]);
-      }
-
-      const resReqHeaders = request.headers.get("Access-Control-Request-Headers");
-      if (resReqHeaders) {
-        modifiedHeaders.set("Access-Control-Allow-Headers", resReqHeaders);
-        mergeVaryHeader(modifiedHeaders, "Access-Control-Request-Headers");
-      } else if (dynamicCors && dynamicCors["Access-Control-Allow-Headers"]) {
-        modifiedHeaders.set("Access-Control-Allow-Headers", dynamicCors["Access-Control-Allow-Headers"]);
-      }
-
-      if (finalOrigin !== "*") {
-        mergeVaryHeader(modifiedHeaders, "Origin");
-      }
-
-      if (!enableH3 || forceH1) {
-        modifiedHeaders.delete("Alt-Svc");
-      }
-
-      // 🌟 透传 Range 的同时，强行命令 CF 边缘节点缓存静态资源与高频探测
-      if (isImage || isSubtitle || isManifest) {
-        modifiedHeaders.set("Cache-Control", "public, max-age=86400");
-      } else if (isHeadPrewarm) {
-        // [预热修复] 4. 使用面板自定义的缓存时长下发给播放器
-        modifiedHeaders.set("Cache-Control", `public, max-age=${prewarmCacheTtl}`);
-      } else if (isBigStream || proxiedExternalRedirect) {
-        modifiedHeaders.set("Cache-Control", "no-store");
-      }
-
-      if (directRedirectUrl) {
-        modifiedHeaders.set("Location", directRedirectUrl.toString());
-        modifiedHeaders.set("Cache-Control", "no-store");
-      } else if (response.status >= 300 && response.status < 400) {
-        const location = modifiedHeaders.get("Location");
-        if (location) {
-          const prefix = buildProxyPrefix(name, key);
-          if (location.startsWith("/")) {
-            modifiedHeaders.set("Location", prefix + location);
-          } else {
-            try {
-              const locUrl = new URL(location);
-              if (locUrl.origin === activeTargetBase.origin) {
-                modifiedHeaders.set("Location", prefix + locUrl.pathname + locUrl.search + locUrl.hash);
-              }
-            } catch {}
-          }
-        }
-      }
-
-      applySecurityHeaders(modifiedHeaders);
-      
-      // 生成高精度的后端请求分类打标
-      let reqCategory = "api";
-      if (isSegment) reqCategory = "segment";
-      else if (isHeadPrewarm) reqCategory = "prewarm";
-      else if (isManifest) reqCategory = "manifest";
-      else if (isBigStream) reqCategory = "stream";
-      else if (isImage) reqCategory = "image";
-      else if (isSubtitle) reqCategory = "subtitle";
-      else if (isWsUpgrade) reqCategory = "websocket";
-
-      // [新增] 智能提取 4xx/5xx 的异常请求头
-      let errorDetail = null;
-      if (response.status >= 400) {
-          const hints = [];
-          const srv = response.headers.get("Server");
-          if (srv) hints.push(`Server: ${srv}`);
-          const ray = response.headers.get("CF-Ray");
-          if (ray) hints.push(`CF-Ray: ${ray}`);
-          const embyErr = response.headers.get("X-Application-Error-Code") || response.headers.get("X-Emby-Error");
-          if (embyErr) hints.push(`Emby-Error: ${embyErr}`);
-          const cfCache = response.headers.get("CF-Cache-Status");
-          if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
-          
-          errorDetail = hints.length > 0 ? hints.join(" | ") : response.statusText;
-      }
+      const reqCategory = this.classifyProxyLogCategory(requestTraits);
+      const errorDetail = this.extractProxyErrorDetail(response);
 
       Logger.record(env, ctx, {
         nodeName: name,
@@ -1791,7 +2041,10 @@ const Proxy = {
 
                 const prefetchRes = await fetch(finalUrl.toString(), prefetchOptions);
                 try {
-                  prefetchRes.body?.cancel?.();
+                  if (prefetchRes.body) {
+                    // 将数据流直接导入黑洞，触发 CF 边缘缓存但完全不占用 Worker 内存
+                    await prefetchRes.body.pipeTo(new WritableStream({ write() {} }));
+                  }
                 } catch {}
               } catch {}
             })()
@@ -1801,6 +2054,14 @@ const Proxy = {
 
       const finalStatus = directRedirectStatus || response.status;
       const finalStatusText = directRedirectStatus ? "Temporary Redirect" : response.statusText;
+      if (!directRedirectStatus && response.status === 101 && response.webSocket) {
+        return new Response(null, {
+          status: 101,
+          statusText: response.statusText,
+          headers: modifiedHeaders,
+          webSocket: response.webSocket
+        });
+      }
       return new Response(directRedirectStatus ? null : response.body, {
         status: finalStatus,
         statusText: finalStatusText,
@@ -1836,6 +2097,12 @@ const Proxy = {
   }
 };
 
+// ============================================================================
+// 4. 日志与观测模块 (LOGGER & OPS MODULE)
+// 说明：
+// - 这里负责请求日志的内存排队、批量刷入 D1，以及运行状态的最小回写。
+// - 这是“可解释观测”边界，不承诺强一致审计。
+// ============================================================================
 const Logger = {
   record(env, ctx, logData) {
     const db = Database.getDB(env);
@@ -1853,8 +2120,20 @@ const Logger = {
       if (lastSeen && (currentMs - lastSeen) < dedupeWindow) return;
       GLOBALS.LogDedupe.set(dedupKey, currentMs);
       if (GLOBALS.LogDedupe.size > 10000) {
+        const scannedEntries = [];
         for (const [key, ts] of GLOBALS.LogDedupe) {
-          if ((currentMs - ts) > dedupeWindow) GLOBALS.LogDedupe.delete(key);
+          scannedEntries.push([key, ts]);
+          if (scannedEntries.length >= 5000) break;
+        }
+        for (const [key, ts] of scannedEntries) {
+          if (!GLOBALS.LogDedupe.has(key)) continue;
+          if ((currentMs - ts) > dedupeWindow) {
+            GLOBALS.LogDedupe.delete(key);
+          } else {
+            // 把已检查但仍在窗口内的热点 key 滚到尾部，避免前缀长期占住裁剪游标。
+            GLOBALS.LogDedupe.delete(key);
+            GLOBALS.LogDedupe.set(key, ts);
+          }
           if (GLOBALS.LogDedupe.size <= 5000) break;
         }
       }
@@ -1874,11 +2153,25 @@ const Logger = {
       errorDetail: logData.errorDetail || null, // [新增] 记录错误详情
       createdAt: new Date().toISOString()
     });
+    // 💡 [极简修复 1] 内存泄流阀：如果 D1 阻塞导致队列堆积，强行丢弃最老的日志，死守内存底线
+    if (GLOBALS.LogQueue.length > 2000) {
+      GLOBALS.LogQueue.splice(0, 1000); 
+      Database.patchOpsStatus(env, {
+        log: {
+          lastOverflowAt: new Date().toISOString(),
+          lastOverflowDropCount: 1000,
+          queueLengthAfterDrop: GLOBALS.LogQueue.length
+        }
+      }, ctx);
+      console.error("Log queue overflow, dropping 1000 logs to prevent OOM.");
+    }
 
     if (!GLOBALS.LogLastFlushAt) GLOBALS.LogLastFlushAt = currentMs;
     const configuredDelayMinutes = Number(GLOBALS.ConfigCache?.data?.logWriteDelayMinutes);
-    const flushWindowMs = Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 60000 : 60000);
-    const shouldFlush = GLOBALS.LogQueue.length >= 100 || flushWindowMs === 0 || (currentMs - GLOBALS.LogLastFlushAt) >= flushWindowMs;
+    const configuredFlushCount = Number(GLOBALS.ConfigCache?.data?.logFlushCountThreshold);
+    const flushWindowMs = Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 60000 : Config.Defaults.LogFlushDelayMinutes * 60000);
+    const flushCountThreshold = Math.max(1, Number.isFinite(configuredFlushCount) ? Math.floor(configuredFlushCount) : Config.Defaults.LogFlushCountThreshold);
+    const shouldFlush = GLOBALS.LogQueue.length >= flushCountThreshold || flushWindowMs === 0 || (currentMs - GLOBALS.LogLastFlushAt) >= flushWindowMs;
     if (shouldFlush && !GLOBALS.LogFlushPending) {
       GLOBALS.LogFlushPending = true;
       ctx.waitUntil(this.flush(env).finally(() => {
@@ -1891,11 +2184,36 @@ const Logger = {
     const db = Database.getDB(env);
     if (!db || GLOBALS.LogQueue.length === 0) return;
     const batchLogs = GLOBALS.LogQueue.splice(0, GLOBALS.LogQueue.length);
+    const chunkSize = Math.max(1, parseInt(Config.Defaults.LogBatchChunkSize, 10) || 50);
+    let writtenCount = 0;
     try {
-      const statements = batchLogs.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
-      await db.batch(statements);
+      for (let index = 0; index < batchLogs.length; index += chunkSize) {
+        const chunk = batchLogs.slice(index, index + chunkSize);
+        const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt));
+        await db.batch(statements);
+        writtenCount += chunk.length;
+      }
+      await Database.patchOpsStatus(env, {
+        log: {
+          lastFlushAt: new Date().toISOString(),
+          lastFlushCount: writtenCount,
+          lastFlushStatus: "success",
+          queueLengthAfterFlush: GLOBALS.LogQueue.length,
+          lastFlushError: null
+        }
+      });
     } catch (e) {
       // 🌟 性能防御：D1 写入失败直接丢弃批次，严禁 unshift 导致队列内存堆积与时间轴错乱
+      await Database.patchOpsStatus(env, {
+        log: {
+          lastFlushErrorAt: new Date().toISOString(),
+          lastFlushStatus: "failed",
+          lastFlushError: e?.message || String(e),
+          lastDroppedBatchSize: Math.max(0, batchLogs.length - writtenCount),
+          lastFlushWrittenBeforeError: writtenCount,
+          queueLengthAfterFlush: GLOBALS.LogQueue.length
+        }
+      });
       console.log("Log flush failed, dropping batch.", e);
     }
   }
@@ -1965,9 +2283,28 @@ const UI_HTML = `<!DOCTYPE html>
       
       <div id="view-dashboard" class="view-section w-full mx-auto space-y-6">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-blue-500 min-w-0 overflow-hidden relative"><p class="text-sm text-slate-500 truncate">今日请求量</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-req-count">0</h3><p class="text-xs font-medium text-slate-500 mt-2 break-all" id="dash-req-hint">&nbsp;</p><p class="text-[11px] font-medium text-brand-600 dark:text-brand-400 mt-2 break-all bg-brand-50 dark:bg-brand-500/10 inline-block px-2.5 py-1 rounded-md" id="dash-emby-metrics">请求: 播放 0 次 | 信息 0 次 , 加速 0秒</p></div>
-           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-emerald-500 min-w-0 overflow-hidden"><p class="text-sm text-slate-500 truncate">视频流量 (CF Zone 总流量)</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-traffic-count">0 B</h3><p class="text-xs font-medium text-slate-500 mt-2 break-all" id="dash-traffic-hint">&nbsp;</p><p class="text-[11px] text-slate-400 mt-1 break-all whitespace-pre-line" id="dash-traffic-detail">&nbsp;</p></div>
-           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-purple-500 min-w-0 overflow-hidden"><p class="text-sm text-slate-500 truncate">接入节点</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-node-count">0</h3></div>
+           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-blue-500 min-w-0 overflow-hidden relative"><p class="text-sm text-slate-500 truncate">今日请求量</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-req-count">0</h3><p class="text-xs font-medium text-slate-500 mt-2 break-all" id="dash-req-hint">&nbsp;</p><div id="dash-req-meta" class="flex flex-wrap gap-2 mt-3"></div><p class="text-[11px] font-medium text-brand-600 dark:text-brand-400 mt-2 break-all bg-brand-50 dark:bg-brand-500/10 inline-block px-2.5 py-1 rounded-md" id="dash-emby-metrics">请求: 播放 0 次 | 信息 0 次 , 加速 0秒</p></div>
+           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-emerald-500 min-w-0 overflow-hidden"><p class="text-sm text-slate-500 truncate">视频流量 (CF Zone 总流量)</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-traffic-count">0 B</h3><p class="text-xs font-medium text-slate-500 mt-2 break-all" id="dash-traffic-hint">&nbsp;</p><div id="dash-traffic-meta" class="flex flex-wrap gap-2 mt-3"></div><p class="text-[11px] text-slate-400 mt-2 break-all whitespace-pre-line" id="dash-traffic-detail">&nbsp;</p></div>
+           <div class="glass-card rounded-3xl p-6 shadow-sm border-l-4 border-purple-500 min-w-0 overflow-hidden"><p class="text-sm text-slate-500 truncate">接入节点</p><h3 class="text-2xl md:text-3xl font-bold mt-2 break-all" id="dash-node-count">0</h3><p id="dash-node-meta" class="text-xs font-medium text-slate-500 mt-2 break-all">&nbsp;</p><div id="dash-node-badges" class="flex flex-wrap gap-2 mt-3"></div></div>
+        </div>
+        <div class="glass-card rounded-3xl p-6 shadow-sm">
+          <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+              <h3 class="font-semibold text-lg">运行状态</h3>
+              <p id="dash-runtime-updated" class="text-xs text-slate-500 mt-1">最近同步：未加载</p>
+            </div>
+            <button onclick="App.loadDashboard()" class="px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-xl text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition flex items-center justify-center">
+              <i data-lucide="refresh-cw" class="w-4 h-4 mr-2"></i>刷新状态
+            </button>
+          </div>
+          <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mt-4">
+            <div id="dash-runtime-log-card" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <p class="text-sm text-slate-500">日志写入状态加载中...</p>
+            </div>
+            <div id="dash-runtime-scheduled-card" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <p class="text-sm text-slate-500">定时任务状态加载中...</p>
+            </div>
+          </div>
         </div>
         <div class="glass-card rounded-3xl p-6 shadow-sm flex flex-col">
            <h3 class="font-semibold text-lg mb-4">请求趋势</h3>
@@ -2109,8 +2446,10 @@ const UI_HTML = `<!DOCTYPE html>
                 <label class="block text-sm text-slate-500 mb-1">日志保存天数 (超过将由系统自动清理)</label>
                 <input type="number" id="cfg-log-days" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-4 dark:text-white" value="7">
                 <label class="block text-sm text-slate-500 mb-1">日志写入延迟（分钟）</label>
-                <input type="number" min="0" step="0.5" id="cfg-log-delay" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="1">
-                <p class="text-xs text-slate-500 mb-4">控制内存日志队列写入 D1 的延迟窗口；达到批量阈值时会提前写入。设为 0 表示尽快写入。</p>
+                <input type="number" min="0" step="0.5" id="cfg-log-delay" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-3 dark:text-white" value="20">
+                <label class="block text-sm text-slate-500 mb-1">日志提前写入条数阈值</label>
+                <input type="number" min="1" step="1" id="cfg-log-flush-count" class="w-full p-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="50">
+                <p class="text-xs text-slate-500 mb-4">内存日志队列满足“达到延迟分钟”或“累计达到条数阈值”任一条件即写入 D1。默认 20 分钟 / 50 条；设延迟为 0 表示尽快写入。</p>
                 
                 <h3 class="font-bold mb-4 mt-6 text-slate-900 dark:text-white border-t border-slate-200 dark:border-slate-800 pt-4">Telegram 每日报表与告警机器人</h3>
                 
@@ -2193,9 +2532,13 @@ const UI_HTML = `<!DOCTYPE html>
       nodes: [],
       settingsSourceDirectNodes: [],
       nodeHealth: {},
+      nodeMutationSeq: 0,
+      nodeMutationVersion: {},
       logPage: 1,
       logTotalPages: 1,
       dashboardSeries: [],
+      dashboardLoadSeq: 0,
+      runtimeStatus: {},
       loginPromise: null,
       chart: null,
 
@@ -2224,6 +2567,9 @@ const UI_HTML = `<!DOCTYPE html>
         const encodedSecret = node.secret ? "/" + encodeURIComponent(String(node.secret)) : "";
         return window.location.origin + "/" + encodedName + encodedSecret;
       },
+      normalizeNodeKey(value) {
+        return String(value || '').trim().toLowerCase();
+      },
       normalizeNodeNameList(value) {
         const rawList = Array.isArray(value) ? value : String(value || '').split(/[\\r\\n,，;；|]+/);
         const seen = new Set();
@@ -2237,6 +2583,30 @@ const UI_HTML = `<!DOCTYPE html>
           result.push(name);
         });
         return result;
+      },
+      markNodeMutation(names) {
+        const mutationId = ++this.nodeMutationSeq;
+        this.normalizeNodeNameList(names).forEach(name => {
+          const key = this.normalizeNodeKey(name);
+          if (key) this.nodeMutationVersion[key] = mutationId;
+        });
+        return mutationId;
+      },
+      isNodeMutationCurrent(names, mutationId) {
+        const keys = this.normalizeNodeNameList(names)
+          .map(name => this.normalizeNodeKey(name))
+          .filter(Boolean);
+        return keys.length > 0 && keys.every(key => this.nodeMutationVersion[key] === mutationId);
+      },
+      async rollbackNodesState(message) {
+        try {
+          await this.loadNodes();
+        } catch (rollbackErr) {
+          console.error('loadNodes rollback failed', rollbackErr);
+          alert(message + '；自动回滚失败，请检查网络后手动刷新页面');
+          return;
+        }
+        alert(message);
       },
 
       updateSourceDirectNodesSummary() {
@@ -2383,6 +2753,167 @@ const UI_HTML = `<!DOCTYPE html>
         html.classList.toggle('dark');
         localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
       },
+
+      escapeHtml(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      },
+
+      formatLocalDateTime(value) {
+        if (!value) return '未记录';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString('zh-CN', {
+          hour12: false,
+          timeZone: 'Asia/Shanghai'
+        });
+      },
+
+      summarizeRuntimeTimestamp(value, prefix) {
+        if (!value) return '';
+        return prefix + this.formatLocalDateTime(value);
+      },
+
+      buildDashboardBadge(label, tone = 'slate') {
+        const palette = {
+          emerald: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400',
+          blue: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400',
+          amber: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400',
+          red: 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400',
+          slate: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
+        };
+        return '<span class="px-2.5 py-1 rounded-full text-[11px] font-medium ' + (palette[tone] || palette.slate) + '">' + this.escapeHtml(label) + '</span>';
+      },
+
+      renderDashboardBadges(containerId, items) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        const badges = (Array.isArray(items) ? items : [])
+          .filter(item => item && item.label)
+          .map(item => this.buildDashboardBadge(item.label, item.tone))
+          .join('');
+        container.innerHTML = badges || this.buildDashboardBadge('待加载', 'slate');
+      },
+
+      getRequestSourceBadge(data) {
+        const source = String(data?.requestSource || '').toLowerCase();
+        if (source === 'workers_usage') return { label: '请求口径: Workers Usage', tone: 'emerald' };
+        if (source === 'zone_analytics') return { label: '请求口径: Zone Analytics', tone: 'blue' };
+        if (source === 'd1_logs') return { label: '请求口径: D1 兜底', tone: 'amber' };
+        return { label: '请求口径: 待确认', tone: 'slate' };
+      },
+
+      getTrafficStatusBadge(data) {
+        if (data?.cfAnalyticsLoaded) return { label: '流量状态: Cloudflare 正常', tone: 'emerald' };
+        const status = String(data?.cfAnalyticsStatus || '');
+        if (status.includes('未配置')) return { label: '流量状态: 未配置', tone: 'amber' };
+        if (status.includes('失败') || data?.cfAnalyticsError) return { label: '流量状态: 查询失败', tone: 'red' };
+        return { label: '流量状态: 降级/未知', tone: 'slate' };
+      },
+
+      getStatsFreshnessBadge(data) {
+        const cacheStatus = String(data?.cacheStatus || 'live').toLowerCase();
+        if (cacheStatus === 'cache') return { label: '统计快照: 缓存命中', tone: 'blue' };
+        return { label: '统计快照: 实时汇总', tone: 'emerald' };
+      },
+
+      getRuntimeStatusMeta(status) {
+        const key = String(status || 'idle').toLowerCase();
+        if (key === 'success') return { label: '正常', badgeClass: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400', dotClass: 'bg-emerald-500' };
+        if (key === 'running') return { label: '运行中', badgeClass: 'bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400', dotClass: 'bg-blue-500' };
+        if (key === 'partial_failure') return { label: '部分失败', badgeClass: 'bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400', dotClass: 'bg-amber-500' };
+        if (key === 'failed') return { label: '失败', badgeClass: 'bg-red-50 text-red-600 dark:bg-red-500/10 dark:text-red-400', dotClass: 'bg-red-500' };
+        if (key === 'skipped') return { label: '已跳过', badgeClass: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300', dotClass: 'bg-slate-400' };
+        return { label: '待记录', badgeClass: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300', dotClass: 'bg-slate-400' };
+      },
+
+      formatRuntimeStateText(status) {
+        return this.getRuntimeStatusMeta(status).label;
+      },
+
+      buildRuntimeStatusCard(title, status, summary, lines = [], detail = '') {
+        const meta = this.getRuntimeStatusMeta(status);
+        const lineHtml = lines
+          .filter(Boolean)
+          .map(line => '<li class="text-sm text-slate-600 dark:text-slate-300 break-all">' + this.escapeHtml(line) + '</li>')
+          .join('');
+        const detailHtml = detail
+          ? '<p class="text-xs text-slate-400 break-all mt-3">' + this.escapeHtml(detail) + '</p>'
+          : '';
+        return '<div class="h-full rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/60 p-4">'
+          + '<div class="flex items-start justify-between gap-3">'
+          + '<div class="min-w-0">'
+          + '<div class="flex items-center gap-2">'
+          + '<span class="w-2.5 h-2.5 rounded-full ' + meta.dotClass + '"></span>'
+          + '<h4 class="font-semibold text-slate-900 dark:text-white">' + this.escapeHtml(title) + '</h4>'
+          + '</div>'
+          + '<p class="text-xs text-slate-500 mt-1 break-all">' + this.escapeHtml(summary || '暂无运行记录') + '</p>'
+          + '</div>'
+          + '<span class="px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap ' + meta.badgeClass + '">' + this.escapeHtml(meta.label) + '</span>'
+          + '</div>'
+          + '<ul class="space-y-2 mt-4">' + lineHtml + '</ul>'
+          + detailHtml
+          + '</div>';
+      },
+
+      renderRuntimeStatus(statusPayload) {
+        const status = statusPayload && typeof statusPayload === 'object' ? statusPayload : {};
+        this.runtimeStatus = status;
+        const updated = document.getElementById('dash-runtime-updated');
+        if (updated) {
+          updated.textContent = '最近同步：' + this.formatLocalDateTime(status.updatedAt);
+        }
+
+        const log = status.log && typeof status.log === 'object' ? status.log : {};
+        const logSummary = this.summarizeRuntimeTimestamp(log.lastFlushAt || log.lastFlushErrorAt || log.lastOverflowAt, '最近日志事件：');
+        const logLines = [
+          log.lastFlushAt ? ('最近成功写入：' + this.formatLocalDateTime(log.lastFlushAt)) : '',
+          Number.isFinite(Number(log.lastFlushCount)) ? ('最近写入批次：' + Number(log.lastFlushCount) + ' 条') : '',
+          Number.isFinite(Number(log.queueLengthAfterFlush)) ? ('写入后队列长度：' + Number(log.queueLengthAfterFlush)) : '',
+          log.lastOverflowAt ? ('最近队列溢出：' + this.formatLocalDateTime(log.lastOverflowAt) + '，丢弃 ' + (Number(log.lastOverflowDropCount) || 0) + ' 条') : ''
+        ].filter(Boolean);
+        const logDetail = log.lastFlushError ? ('最近写入错误：' + log.lastFlushError) : '';
+        const logCard = document.getElementById('dash-runtime-log-card');
+        if (logCard) {
+          logCard.innerHTML = this.buildRuntimeStatusCard('日志写入', log.lastFlushStatus || (log.lastOverflowAt ? 'partial_failure' : 'idle'), logSummary, logLines, logDetail);
+        }
+
+        const scheduled = status.scheduled && typeof status.scheduled === 'object' ? status.scheduled : {};
+        const cleanup = scheduled.cleanup && typeof scheduled.cleanup === 'object' ? scheduled.cleanup : {};
+        const report = scheduled.report && typeof scheduled.report === 'object' ? scheduled.report : {};
+        const scheduledSummary = this.summarizeRuntimeTimestamp(scheduled.lastFinishedAt || scheduled.lastStartedAt || scheduled.lastErrorAt, '最近调度：');
+        const scheduledLines = [
+          scheduled.lastStartedAt ? ('最近开始：' + this.formatLocalDateTime(scheduled.lastStartedAt)) : '',
+          scheduled.lastFinishedAt ? ('最近结束：' + this.formatLocalDateTime(scheduled.lastFinishedAt)) : '',
+          cleanup.status ? ('日志清理：' + this.formatRuntimeStateText(cleanup.status) + (cleanup.lastSuccessAt ? '（' + this.formatLocalDateTime(cleanup.lastSuccessAt) + '）' : cleanup.lastSkippedAt ? '（' + this.formatLocalDateTime(cleanup.lastSkippedAt) + '）' : cleanup.lastErrorAt ? '（' + this.formatLocalDateTime(cleanup.lastErrorAt) + '）' : '')) : '',
+          report.status ? ('日报发送：' + this.formatRuntimeStateText(report.status) + (report.lastSuccessAt ? '（' + this.formatLocalDateTime(report.lastSuccessAt) + '）' : report.lastSkippedAt ? '（' + this.formatLocalDateTime(report.lastSkippedAt) + '）' : report.lastErrorAt ? '（' + this.formatLocalDateTime(report.lastErrorAt) + '）' : '')) : ''
+        ].filter(Boolean);
+        const scheduledDetail = scheduled.lastError || cleanup.lastError || report.lastError
+          ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || report.lastError))
+          : '';
+        const scheduledCard = document.getElementById('dash-runtime-scheduled-card');
+        if (scheduledCard) {
+          scheduledCard.innerHTML = this.buildRuntimeStatusCard('定时任务', scheduled.status || 'idle', scheduledSummary, scheduledLines, scheduledDetail);
+        }
+      },
+
+      renderRuntimeStatusError(message) {
+        const updated = document.getElementById('dash-runtime-updated');
+        if (updated) updated.textContent = '最近同步：运行状态加载失败';
+        const errorMessage = message || '未知错误';
+        const logCard = document.getElementById('dash-runtime-log-card');
+        if (logCard) {
+          logCard.innerHTML = this.buildRuntimeStatusCard('日志写入', 'failed', '运行状态接口暂时不可用', [], errorMessage);
+        }
+        const scheduledCard = document.getElementById('dash-runtime-scheduled-card');
+        if (scheduledCard) {
+          scheduledCard.innerHTML = this.buildRuntimeStatusCard('定时任务', 'failed', '运行状态接口暂时不可用', [], errorMessage);
+        }
+      },
       
       async apiCall(action, payload={}) {
           const requestInit = {
@@ -2445,52 +2976,98 @@ const UI_HTML = `<!DOCTYPE html>
         document.getElementById('set-' + id).classList.remove('hidden');
       },
 
-      async loadDashboard() {
-         try {
-             const data = await this.apiCall('getDashboardStats');
-             document.getElementById('dash-req-count').textContent = data.todayRequests || 0;
-             document.getElementById('dash-traffic-count').textContent = data.todayTraffic || '0 B';
-             document.getElementById('dash-node-count').textContent = data.nodeCount || 0;
-             const reqHint = document.getElementById('dash-req-hint');
-             if (reqHint) {
-               const hint = data.requestSourceText || '今日请求量口径：未知';
-               reqHint.textContent = hint || ' ';
-               reqHint.title = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
-             }
-             const reqCount = document.getElementById('dash-req-count');
-             if (reqCount) reqCount.title = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
-             
-             const embyMetrics = document.getElementById('dash-emby-metrics');
-             if (embyMetrics) {
-                 let accSecs = Math.floor((data.totalAccMs || 0) / 1000);
-                 let accHrs = Math.floor(accSecs / 3600);
-                 let accMins = Math.floor((accSecs % 3600) / 60);
-                 let accRemSecs = accSecs % 60;
-                 embyMetrics.textContent = '请求: 播放请求 ' + (data.playCount || 0) + ' 次 | 获取播放信息 ' + (data.infoCount || 0) + ' 次 ，共加速时长: ' + accHrs + '小时' + accMins + '分钟' + accRemSecs + '秒';
-             }
+      renderDashboardStats(data) {
+         document.getElementById('dash-req-count').textContent = data.todayRequests || 0;
+         document.getElementById('dash-traffic-count').textContent = data.todayTraffic || '0 B';
+         document.getElementById('dash-node-count').textContent = data.nodeCount || 0;
+         const reqHint = document.getElementById('dash-req-hint');
+         if (reqHint) {
+           const hint = data.requestSourceText || '今日请求量口径：未知';
+           reqHint.textContent = hint || ' ';
+           reqHint.title = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         }
+         const reqCount = document.getElementById('dash-req-count');
+         if (reqCount) reqCount.title = [data.requestSourceText || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         this.renderDashboardBadges('dash-req-meta', [
+           this.getRequestSourceBadge(data),
+           this.getStatsFreshnessBadge(data)
+         ]);
 
-             const trafficHint = document.getElementById('dash-traffic-hint');
-             if (trafficHint) {
-               const hint = data.trafficSourceText || data.cfAnalyticsStatus || data.cfAnalyticsError || '';
-               trafficHint.textContent = hint || ' ';
-               trafficHint.title = [data.trafficSourceText || '', data.cfAnalyticsStatus || '', data.cfAnalyticsError || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
-             }
-             const trafficDetail = document.getElementById('dash-traffic-detail');
-             if (trafficDetail) {
-               const detailLines = [data.cfAnalyticsStatus, data.cfAnalyticsError, data.cfAnalyticsDetail].filter(Boolean);
-               trafficDetail.textContent = detailLines.length ? detailLines.join('\\n') : ' ';
-             }
-             const trafficCount = document.getElementById('dash-traffic-count');
-             if (trafficCount) trafficCount.title = [data.trafficSourceText || '', data.cfAnalyticsStatus || '', data.cfAnalyticsError || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
-             this.dashboardSeries = Array.isArray(data.hourlySeries) ? data.hourlySeries : [];
-             this.renderChart();
-         } catch(e) {
-             const reqHint = document.getElementById('dash-req-hint');
-             if (reqHint) reqHint.textContent = '加载仪表盘失败';
-             const trafficHint = document.getElementById('dash-traffic-hint');
-             if (trafficHint) trafficHint.textContent = '加载仪表盘失败';
-             const trafficDetail = document.getElementById('dash-traffic-detail');
-             if (trafficDetail) trafficDetail.textContent = e?.message || '未知错误';
+         const embyMetrics = document.getElementById('dash-emby-metrics');
+         if (embyMetrics) {
+             let accSecs = Math.floor((data.totalAccMs || 0) / 1000);
+             let accHrs = Math.floor(accSecs / 3600);
+             let accMins = Math.floor((accSecs % 3600) / 60);
+             let accRemSecs = accSecs % 60;
+             embyMetrics.textContent = '请求: 播放请求 ' + (data.playCount || 0) + ' 次 | 获取播放信息 ' + (data.infoCount || 0) + ' 次 ，共加速时长: ' + accHrs + '小时' + accMins + '分钟' + accRemSecs + '秒';
+         }
+
+         const trafficHint = document.getElementById('dash-traffic-hint');
+         if (trafficHint) {
+           const hint = data.trafficSourceText || data.cfAnalyticsStatus || data.cfAnalyticsError || '';
+           trafficHint.textContent = hint || ' ';
+           trafficHint.title = [data.trafficSourceText || '', data.cfAnalyticsStatus || '', data.cfAnalyticsError || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         }
+         const trafficDetail = document.getElementById('dash-traffic-detail');
+         if (trafficDetail) {
+           const detailLines = [data.cfAnalyticsStatus, data.cfAnalyticsError, data.cfAnalyticsDetail].filter(Boolean);
+           trafficDetail.textContent = detailLines.length ? detailLines.join('\\n') : ' ';
+         }
+         const trafficCount = document.getElementById('dash-traffic-count');
+         if (trafficCount) trafficCount.title = [data.trafficSourceText || '', data.cfAnalyticsStatus || '', data.cfAnalyticsError || '', data.cfAnalyticsDetail || ''].filter(Boolean).join(' | ');
+         this.renderDashboardBadges('dash-traffic-meta', [
+           this.getTrafficStatusBadge(data),
+           this.getStatsFreshnessBadge(data)
+         ]);
+         const nodeMeta = document.getElementById('dash-node-meta');
+         if (nodeMeta) {
+           nodeMeta.textContent = '统计时间：' + this.formatLocalDateTime(data.generatedAt);
+         }
+         this.renderDashboardBadges('dash-node-badges', [
+           { label: '节点索引: 已加载', tone: 'emerald' },
+           this.getStatsFreshnessBadge(data)
+         ]);
+         this.dashboardSeries = Array.isArray(data.hourlySeries) ? data.hourlySeries : [];
+         this.renderChart();
+      },
+
+      renderDashboardError(message) {
+         document.getElementById('dash-req-count').textContent = '0';
+         document.getElementById('dash-traffic-count').textContent = '0 B';
+         document.getElementById('dash-node-count').textContent = '0';
+         this.dashboardSeries = [];
+         this.renderChart();
+         const reqHint = document.getElementById('dash-req-hint');
+         if (reqHint) reqHint.textContent = '加载仪表盘失败';
+         const trafficHint = document.getElementById('dash-traffic-hint');
+         if (trafficHint) trafficHint.textContent = '加载仪表盘失败';
+         const trafficDetail = document.getElementById('dash-traffic-detail');
+         if (trafficDetail) trafficDetail.textContent = message || '未知错误';
+         const nodeMeta = document.getElementById('dash-node-meta');
+         if (nodeMeta) nodeMeta.textContent = '统计时间：不可用';
+         this.renderDashboardBadges('dash-req-meta', [{ label: '请求口径: 加载失败', tone: 'red' }]);
+         this.renderDashboardBadges('dash-traffic-meta', [{ label: '流量状态: 加载失败', tone: 'red' }]);
+         this.renderDashboardBadges('dash-node-badges', [{ label: '节点索引: 未确认', tone: 'red' }]);
+      },
+
+      async loadDashboard() {
+         const loadSeq = ++this.dashboardLoadSeq;
+         const [statsResult, runtimeResult] = await Promise.allSettled([
+           this.apiCall('getDashboardStats'),
+           this.apiCall('getRuntimeStatus')
+         ]);
+         if (loadSeq !== this.dashboardLoadSeq) return;
+
+         if (statsResult.status === 'fulfilled') {
+           this.renderDashboardStats(statsResult.value);
+         } else {
+           this.renderDashboardError(statsResult.reason?.message || '未知错误');
+         }
+
+         if (runtimeResult.status === 'fulfilled') {
+           this.renderRuntimeStatus(runtimeResult.value.status || {});
+         } else {
+           this.renderRuntimeStatusError(runtimeResult.reason?.message || '未知错误');
          }
       },
 
@@ -2548,7 +3125,8 @@ const UI_HTML = `<!DOCTYPE html>
           document.getElementById('cfg-cors').value = cfg.corsOrigins || '';
           
           document.getElementById('cfg-log-days').value = cfg.logRetentionDays || 7;
-          document.getElementById('cfg-log-delay').value = Number.isFinite(Number(cfg.logWriteDelayMinutes)) ? Number(cfg.logWriteDelayMinutes) : 1;
+          document.getElementById('cfg-log-delay').value = Number.isFinite(Number(cfg.logWriteDelayMinutes)) ? Number(cfg.logWriteDelayMinutes) : 20;
+          document.getElementById('cfg-log-flush-count').value = Number.isFinite(Number(cfg.logFlushCountThreshold)) ? Number(cfg.logFlushCountThreshold) : 50;
           document.getElementById('cfg-tg-token').value = cfg.tgBotToken || '';
           document.getElementById('cfg-tg-chatid').value = cfg.tgChatId || '';
           
@@ -2584,7 +3162,9 @@ const UI_HTML = `<!DOCTYPE html>
           } else if(section === 'logs') {
               newConfig.logRetentionDays = parseInt(document.getElementById('cfg-log-days').value) || 7;
               const logDelayMinutes = parseFloat(document.getElementById('cfg-log-delay').value);
-              newConfig.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : 1;
+              const logFlushCountThreshold = parseInt(document.getElementById('cfg-log-flush-count').value, 10);
+              newConfig.logWriteDelayMinutes = Number.isFinite(logDelayMinutes) ? Math.max(0, logDelayMinutes) : 20;
+              newConfig.logFlushCountThreshold = Number.isFinite(logFlushCountThreshold) ? Math.max(1, logFlushCountThreshold) : 50;
               newConfig.tgBotToken = document.getElementById('cfg-tg-token').value.trim();
               newConfig.tgChatId = document.getElementById('cfg-tg-chatid').value.trim();
           } else if(section === 'account') {
@@ -2952,6 +3532,9 @@ const UI_HTML = `<!DOCTYPE html>
       
       async saveNode(e) {
           e.preventDefault();
+          const form = e.currentTarget;
+          const submitBtn = e.submitter || form?.querySelector('button[type="submit"]');
+          const originalBtnText = submitBtn ? submitBtn.innerHTML : '';
           let headersObj = {};
           const hKeys = document.querySelectorAll('.header-key');
           const hVals = document.querySelectorAll('.header-val');
@@ -2976,14 +3559,77 @@ const UI_HTML = `<!DOCTYPE html>
               return;
           }
 
-          await this.apiCall('save', payload);
+          if (submitBtn) {
+              submitBtn.disabled = true;
+              submitBtn.innerHTML = '保存中...';
+          }
+
+          const originalNameKey = this.normalizeNodeKey(payload.originalName);
+          const optimisticNameKey = this.normalizeNodeKey(payload.name);
+          const mutationNames = [payload.originalName, payload.name];
+          const mutationId = this.markNodeMutation(mutationNames);
+          const optimisticIdx = this.nodes.findIndex(n => {
+              const currentName = this.normalizeNodeKey(n?.name);
+              return currentName === originalNameKey || currentName === optimisticNameKey;
+          });
+          const previousNode = optimisticIdx > -1 ? this.nodes[optimisticIdx] : null;
+          const optimisticNode = {
+              ...(previousNode || {}),
+              name: payload.name,
+              target: payload.target,
+              secret: payload.secret,
+              tag: payload.tag,
+              remark: payload.remark,
+              headers: payload.headers
+          };
+
+          if (optimisticIdx > -1) {
+              this.nodes[optimisticIdx] = optimisticNode;
+          } else {
+              this.nodes.push(optimisticNode);
+          }
+
           document.getElementById('node-modal').close();
-          this.loadNodes();
+          this.renderNodesGrid();
+
+          this.apiCall('save', payload).then(res => {
+              if (!this.isNodeMutationCurrent([...mutationNames, res?.node?.name], mutationId)) return;
+              if (res && res.node) {
+                  const finalIdx = this.nodes.findIndex(n =>
+                      this.normalizeNodeKey(n?.name) === this.normalizeNodeKey(res.node.name)
+                  );
+
+                  if (finalIdx > -1) {
+                      this.nodes[finalIdx] = res.node;
+                  } else {
+                      this.nodes.push(res.node);
+                  }
+
+                  this.renderNodesGrid();
+              }
+          }).catch(err => {
+              if (!this.isNodeMutationCurrent(mutationNames, mutationId)) return;
+              return this.rollbackNodesState('后台同步到 KV 数据库失败: ' + err.message);
+          }).finally(() => {
+              if (submitBtn) {
+                  submitBtn.disabled = false;
+                  submitBtn.innerHTML = originalBtnText;
+              }
+          });
       },
       
       async deleteNode(name) {
-          await this.apiCall('delete', {name});
-          this.loadNodes();
+          const normalizedName = this.normalizeNodeKey(name);
+          const mutationId = this.markNodeMutation([name]);
+          this.nodes = this.nodes.filter(n => String(n?.name || '').trim().toLowerCase() !== normalizedName);
+          this.renderNodesGrid();
+
+          try {
+              await this.apiCall('delete', {name});
+          } catch(err) {
+              if (!this.isNodeMutationCurrent([name], mutationId)) return;
+              await this.rollbackNodesState('后台删除节点失败: ' + err.message);
+          }
       },
       
       formatRelativeTime(ts) {
@@ -3212,6 +3858,12 @@ const UI_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// ============================================================================
+// 6. 运行时入口 (RUNTIME ENTRYPOINTS)
+// 说明：
+// - `fetch` 负责 UI / API / 代理主入口分发。
+// - `scheduled` 负责日志清理与日报等定时任务。
+// ============================================================================
 function renderLandingPage() {
   const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.0</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.0</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
   const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' });
@@ -3303,26 +3955,90 @@ export default {
       const db = Database.getDB(env);
       const kv = Database.getKV(env);
       if (!kv) return;
-      
+
+      const startedAt = new Date().toISOString();
+      await Database.patchOpsStatus(kv, {
+        scheduled: {
+          status: "running",
+          lastStartedAt: startedAt
+        }
+      }).catch(() => {});
+
+      const scheduledState = {
+        status: "success",
+        lastStartedAt: startedAt,
+        lastFinishedAt: null,
+        lastSuccessAt: null,
+        lastErrorAt: null,
+        lastError: null,
+        cleanup: {},
+        report: {}
+      };
+
       try {
         const config = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
         
         if (db) {
           try {
             const retentionDays = config.logRetentionDays || 7; 
-            const expireTime = Date.当前() - (retentionDays * 24 * 60 * 60 * 1000);
+            const expireTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
             await db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?").bind(expireTime).run();
+            scheduledState.cleanup = {
+              status: "success",
+              lastSuccessAt: new Date().toISOString(),
+              retentionDays: Number(retentionDays) || 7
+            };
           } catch (dbErr) {
+            scheduledState.status = "partial_failure";
+            scheduledState.cleanup = {
+              status: "failed",
+              lastErrorAt: new Date().toISOString(),
+              lastError: dbErr?.message || String(dbErr)
+            };
             console.error("Scheduled DB Cleanup Error: ", dbErr);
           }
+        } else {
+          scheduledState.cleanup = {
+            status: "skipped",
+            lastSkippedAt: new Date().toISOString(),
+            reason: "db_not_configured"
+          };
         }
         
         const { tgBotToken, tgChatId } = config;
         if (tgBotToken && tgChatId) {
-            await Database.sendDailyTelegramReport(env);
+            try {
+              await Database.sendDailyTelegramReport(env);
+              scheduledState.report = {
+                status: "success",
+                lastSuccessAt: new Date().toISOString()
+              };
+            } catch (reportErr) {
+              scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
+              scheduledState.report = {
+                status: "failed",
+                lastErrorAt: new Date().toISOString(),
+                lastError: reportErr?.message || String(reportErr)
+              };
+              console.error("Scheduled Daily Report Error: ", reportErr);
+            }
+        } else {
+          scheduledState.report = {
+            status: "skipped",
+            lastSkippedAt: new Date().toISOString(),
+            reason: "telegram_not_configured"
+          };
         }
       } catch (err) {
+          scheduledState.status = "failed";
+          scheduledState.lastErrorAt = new Date().toISOString();
+          scheduledState.lastError = err?.message || String(err);
           console.error("Scheduled Task Error: ", err);
+      } finally {
+          const finishedAt = new Date().toISOString();
+          scheduledState.lastFinishedAt = finishedAt;
+          if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
+          await Database.patchOpsStatus(kv, { scheduled: scheduledState }).catch(() => {});
       }
     })());
   }
