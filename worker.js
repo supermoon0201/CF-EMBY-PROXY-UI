@@ -4981,6 +4981,7 @@ const Proxy = {
       const isProtocolFallbackRetry = options.protocolFallbackRetry === true;
       const shouldStripAuthOnProtocolFallback = options.stripAuthOnProtocolFallback === true;
       const compatRealClientIpMode = options.compatRealClientIpMode ? normalizeNodeRealClientIpMode(options.compatRealClientIpMode) : "";
+      const compatImageBrowserHeaders = options.compatImageBrowserHeaders === true;
       const compatForceOriginReferer = options.compatForceOriginReferer === true;
       const compatClearOriginReferer = options.compatClearOriginReferer === true;
       const stripFetchMetadataHeaders = options.stripFetchMetadataHeaders === true;
@@ -5033,6 +5034,14 @@ const Proxy = {
       if (compatClearOriginReferer) {
         if (!adminCustomHeaders.has("origin")) headers.delete("Origin");
         if (!adminCustomHeaders.has("referer")) headers.delete("Referer");
+      }
+
+      if (compatImageBrowserHeaders) {
+        headers.set(
+          "User-Agent",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        );
+        headers.set("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8,*/*;q=0.5");
       }
 
       if (compatForceOriginReferer) {
@@ -5096,6 +5105,7 @@ const Proxy = {
       body: fetchContext.body,
       isExternalRedirect: fetchContext.isExternalRedirect === true,
       compatRealClientIpMode: options.compatRealClientIpMode,
+      compatImageBrowserHeaders: options.compatImageBrowserHeaders === true,
       compatForceOriginReferer: options.compatForceOriginReferer === true,
       compatClearOriginReferer: options.compatClearOriginReferer === true,
       stripFetchMetadataHeaders: options.stripFetchMetadataHeaders === true,
@@ -5115,12 +5125,14 @@ const Proxy = {
       if (replaySafe && effectiveBodyMode !== "stream") {
         const imageCompatibilityStages = [
           {
+            compatImageBrowserHeaders: true,
             compatClearOriginReferer: true,
             stripFetchMetadataHeaders: true,
             forceIdentityEncoding: true,
             removeRangeHeaders: true
           },
           {
+            compatImageBrowserHeaders: true,
             compatForceOriginReferer: true,
             stripFetchMetadataHeaders: true,
             forceIdentityEncoding: true,
