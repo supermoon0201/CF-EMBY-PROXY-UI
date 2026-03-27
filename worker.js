@@ -6285,10 +6285,10 @@ const UI_HTML = `<!DOCTYPE html>
           </div>
 
           <div class="overflow-x-auto min-h-0 w-full mb-4">
-            <table class="w-full text-left border-collapse table-fixed min-w-[860px]">
+            <table class="w-full text-left border-collapse table-fixed min-w-[980px]">
               <thead>
                 <tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800">
-                  <th class="py-3 px-4 w-56">候选 IP</th>
+                  <th class="py-3 px-4 w-[26rem]">候选 IP</th>
                   <th class="py-3 px-4 w-28">线路</th>
                   <th class="py-3 px-4 w-32">来源</th>
                   <th class="py-3 px-4 w-28">延迟</th>
@@ -6300,15 +6300,15 @@ const UI_HTML = `<!DOCTYPE html>
                   <td colspan="5" class="py-8 text-center text-slate-500">暂无候选数据，点击“获取节点并测速”开始。</td>
                 </tr>
                 <tr v-for="(candidate, index) in App.getSchedulerCandidates()" v-else :key="candidate.ip + '-' + index" class="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
-                  <td class="py-3 px-4 font-mono text-xs text-slate-700 dark:text-slate-200">{{ candidate.ip }}</td>
-                  <td class="py-3 px-4">
+                  <td class="py-3 px-4 w-[26rem] font-mono text-xs break-all whitespace-normal leading-6 text-slate-700 dark:text-slate-200">{{ candidate.ip }}</td>
+                  <td class="py-3 px-4 whitespace-nowrap">
                     <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">{{ App.getSchedulerCandidateLineText(candidate) }}</span>
                   </td>
-                  <td class="py-3 px-4 text-xs text-slate-500">{{ candidate.source || '-' }}</td>
-                  <td class="py-3 px-4 text-sm font-medium" :class="App.getSchedulerLatencyTextClass(candidate.latencyMs, candidate.testing)">
+                  <td class="py-3 px-4 text-xs text-slate-500 whitespace-nowrap">{{ candidate.source || '-' }}</td>
+                  <td class="py-3 px-4 text-sm font-medium whitespace-nowrap" :class="App.getSchedulerLatencyTextClass(candidate.latencyMs, candidate.testing)">
                     {{ App.getSchedulerLatencyText(candidate) }}
                   </td>
-                  <td class="py-3 px-4">
+                  <td class="py-3 px-4 whitespace-nowrap">
                     <button @click="App.saveSchedulerSingleCandidate(candidate)" :disabled="App.isSchedulerSingleSaveDisabled(candidate)" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">同步到 DNS</button>
                   </td>
                 </tr>

@@ -53,3 +53,20 @@ test('rendered admin ui scheduler copy button keeps pill content from shrinking'
   assert.equal(response.status, 200);
   assert.match(html, /App\.copySchedulerIpsForItdog\(\)[^>]+class="[^"]*inline-flex[^"]*shrink-0[^"]*whitespace-nowrap/);
 });
+
+test('rendered admin ui scheduler table keeps ipv6 candidate cells wrapped without squeezing adjacent columns', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(
+    html,
+    /<th class="py-3 px-4 w-\[26rem\]">候选 IP<\/th>[\s\S]*?<td class="[^"]*py-3[^"]*px-4[^"]*w-\[26rem\][^"]*font-mono[^"]*text-xs[^"]*break-all[^"]*whitespace-normal[^"]*leading-6[^"]*text-slate-700[^"]*dark:text-slate-200[^"]*">/
+  );
+  assert.match(html, /<th class="py-3 px-4 w-28">线路<\/th>/);
+  assert.match(html, /<th class="py-3 px-4 w-32">来源<\/th>/);
+  assert.match(html, /<th class="py-3 px-4 w-28">延迟<\/th>/);
+  assert.match(html, /<td class="py-3 px-4 whitespace-nowrap">/);
+  assert.match(html, /<td class="py-3 px-4 text-xs text-slate-500 whitespace-nowrap">/);
+  assert.match(html, /<td class="py-3 px-4 text-sm font-medium whitespace-nowrap"/);
+});
