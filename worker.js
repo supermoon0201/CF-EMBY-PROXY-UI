@@ -5108,6 +5108,40 @@ const Proxy = {
     let currentState = upstreamState && typeof upstreamState === "object" ? { ...upstreamState } : upstreamState;
     if (!currentState?.response || !currentState?.finalUrl) return currentState;
 
+    if (execution.requestTraits.isImage === true) {
+      const method = String(fetchContext.method || execution.request.method || "GET").toUpperCase();
+      const effectiveBodyMode = fetchContext.bodyMode || transport.preparedBodyMode;
+      const replaySafe = method === "GET" || method === "HEAD" || effectiveBodyMode === "buffered";
+      if (replaySafe && effectiveBodyMode !== "stream") {
+        const imageCompatibilityStages = [
+          {
+            compatClearOriginReferer: true,
+            stripFetchMetadataHeaders: true,
+            forceIdentityEncoding: true,
+            removeRangeHeaders: true
+          },
+          {
+            compatForceOriginReferer: true,
+            stripFetchMetadataHeaders: true,
+            forceIdentityEncoding: true,
+            removeRangeHeaders: true
+          }
+        ];
+        for (const stageOptions of imageCompatibilityStages) {
+          if (!currentState?.response || currentState.response.status !== 403) break;
+          try { currentState.response.body?.cancel?.(); } catch {}
+          const recovered = await this.performCompatibilityFetch(
+            currentState.finalUrl,
+            buildFetchOptions,
+            execution,
+            fetchContext,
+            stageOptions
+          );
+          currentState = { ...currentState, response: recovered.response, finalUrl: recovered.finalUrl };
+        }
+      }
+    }
+
     if (this.shouldUseMedia403CompatibilityLadder(execution, transport, currentState, fetchContext)) {
       const stages = buildMedia403CompatibilityModes(execution.node?.realClientIpMode);
       for (const stage of stages) {
