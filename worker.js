@@ -419,6 +419,88 @@ export function selectNodeCompatAutofixMode({ originalMode = "", stickyMargin = 
   return { mode: best.mode, bestMode: best.mode, changed: best.mode !== normalizedOriginal };
 }
 
+function scoreNodeCompatProbeResult(result, weight = 1) {
+  return result?.ok === true ? (Number(weight) || 0) : 0;
+}
+
+async function probeNodeCompatAutofixPath({ env, ctx, nodeName, node, mode, requestUrl, path, search = "" }) {
+  const probeUrl = new URL(requestUrl.origin);
+  const encodedName = encodeURIComponent(String(nodeName || "").trim().toLowerCase());
+  const encodedSecret = node?.secret ? `${encodeURIComponent(String(node.secret))}/` : "";
+  probeUrl.pathname = `/${encodedName}/${encodedSecret}`;
+  probeUrl.pathname += String(path || "").replace(/^\/+/, "");
+  probeUrl.search = String(search || "");
+
+  const response = await Proxy.handle(
+    new Request(probeUrl.toString(), {
+      method: "GET",
+      headers: {
+        "CF-Connecting-IP": "1.1.1.1",
+        "Accept": "application/json"
+      }
+    }),
+    { ...node, realClientIpMode: normalizeNodeRealClientIpMode(mode) },
+    sanitizeProxyPath(path || "/"),
+    encodedName,
+    node?.secret || "",
+    env,
+    ctx,
+    { requestUrl: probeUrl }
+  );
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    url: probeUrl.toString(),
+    path: `${sanitizeProxyPath(path || "/")}${search || ""}`
+  };
+}
+
+async function probeNodeCompatAutofixMode({ env, ctx, nodeName, node, mode, requestUrl }) {
+  const publicProbe = await probeNodeCompatAutofixPath({
+    env,
+    ctx,
+    nodeName,
+    node,
+    mode,
+    requestUrl,
+    path: "/System/Info/Public"
+  });
+  const mediaProbe = await probeNodeCompatAutofixPath({
+    env,
+    ctx,
+    nodeName,
+    node,
+    mode,
+    requestUrl,
+    path: "/Items",
+    search: "?Limit=1&StartIndex=0"
+  });
+  const mediaProbe2 = await probeNodeCompatAutofixPath({
+    env,
+    ctx,
+    nodeName,
+    node,
+    mode,
+    requestUrl,
+    path: "/Items/Latest",
+    search: "?Limit=1"
+  });
+  const pass = publicProbe.ok === true && (mediaProbe.ok === true || mediaProbe2.ok === true);
+  const score = scoreNodeCompatProbeResult(publicProbe, 1)
+    + scoreNodeCompatProbeResult(mediaProbe, 2)
+    + scoreNodeCompatProbeResult(mediaProbe2, 2);
+
+  return {
+    mode: normalizeNodeRealClientIpMode(mode),
+    pass,
+    score,
+    publicProbe,
+    mediaProbe,
+    mediaProbe2
+  };
+}
+
 export function shouldBanUpstreamLine(status = 0, error = null) {
   if (error) return true;
   const code = Number(status) || 0;
@@ -3927,9 +4009,9 @@ const Database = {
     },
 
     async pingNode(data, { env, ctx }) {
-        const currentConfig = await getRuntimeConfig(env);
-        const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? Config.Defaults.PingTimeoutMs, 1000, 180000);
-        const forceRefresh = data.forceRefresh === true;
+      const currentConfig = await getRuntimeConfig(env);
+      const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? Config.Defaults.PingTimeoutMs, 1000, 180000);
+      const forceRefresh = data.forceRefresh === true;
 
         if (data.target) {
           const normalizedTarget = Database.normalizeSingleTarget(data.target);
@@ -4009,6 +4091,62 @@ const Database = {
           line: matchedLine || null,
           node: { name: nodeName.toLowerCase(), ...normalizedNode }
         });
+    },
+
+    async nodeCompatAutofix(data, { env, ctx, kv, request }) {
+      const nodeName = String(data?.name || "").trim().toLowerCase();
+      if (!nodeName) return jsonError("MISSING_PARAMS", "name 不能为空");
+
+      const node = await Database.getNode(nodeName, env, ctx);
+      if (!node) return jsonError("NOT_FOUND", "节点不存在", 404, { name: nodeName });
+
+      const originalMode = normalizeNodeRealClientIpMode(node.realClientIpMode);
+      const routeRequestUrl = new URL(request.url);
+      const tried = [];
+      for (const mode of buildNodeCompatAutofixCandidateModes(originalMode)) {
+        tried.push(await probeNodeCompatAutofixMode({
+          env,
+          ctx,
+          nodeName,
+          node,
+          mode,
+          requestUrl: routeRequestUrl
+        }));
+      }
+
+      const selected = selectNodeCompatAutofixMode({
+        originalMode,
+        stickyMargin: 0.15,
+        tried
+      });
+      if (!selected.bestMode) {
+        return jsonError("NODE_COMPAT_AUTOFIX_FAILED", "自动修复未找到可用兼容模式", 400, { tried });
+      }
+
+      const bestScore = tried
+        .filter(item => normalizeNodeRealClientIpMode(item?.mode) === selected.bestMode)
+        .reduce((max, item) => Math.max(max, Number(item?.score) || 0), Number.NEGATIVE_INFINITY);
+
+      if (selected.changed) {
+        const updatedNode = Database.normalizeNode(nodeName, {
+          ...node,
+          realClientIpMode: selected.mode,
+          updatedAt: new Date().toISOString()
+        }).data;
+        await kv.put(`${Database.PREFIX}${nodeName}`, JSON.stringify(updatedNode));
+        Database.invalidateNodeCaches(nodeName, { invalidateList: true });
+      }
+
+      return jsonResponse({
+        ok: true,
+        name: nodeName,
+        mode: selected.mode,
+        bestMode: selected.bestMode,
+        bestScore: Number.isFinite(bestScore) ? bestScore : 0,
+        originalMode,
+        changed: selected.changed,
+        tried
+      });
     },
 
     async getLogs(data, { db, env }) {
