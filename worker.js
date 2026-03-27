@@ -6274,8 +6274,8 @@ const UI_HTML = `<!DOCTYPE html>
               <button @click="App.saveSchedulerTopCandidates()" :disabled="App.isSchedulerTopSaveDisabled()" class="px-4 py-2 bg-rose-600 text-white rounded-xl text-sm font-medium hover:bg-rose-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
                 <i data-lucide="upload-cloud" class="w-4 h-4 mr-2"></i>同步 TOP3 到 DNS
               </button>
-              <button @click="App.copySchedulerIpsForItdog()" :disabled="!App.schedulerCandidates.length" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
-                <i data-lucide="copy" class="w-4 h-4 mr-2"></i>复制去 ITDog
+              <button @click="App.copySchedulerIpsForItdog()" :disabled="!App.schedulerCandidates.length" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition inline-flex shrink-0 items-center gap-2 whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
+                <i data-lucide="copy" class="w-4 h-4"></i>复制去 ITDog
               </button>
             </div>
           </div>
@@ -11173,7 +11173,7 @@ const UI_HTML = `<!DOCTYPE html>
               return;
           }
           try {
-              await this.writeClipboard(ips.join('\\n'));
+              await uiBrowserBridge.writeClipboard(ips.join('\\n'));
               this.showMessage('候选 IP 已复制，即将打开 ITDog。', { tone: 'success' });
               window.open('https://www.itdog.cn/batch_tcping/', '_blank', 'noopener');
           } catch (e) {

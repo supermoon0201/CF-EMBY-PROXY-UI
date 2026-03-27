@@ -35,3 +35,21 @@ test('rendered admin ui scheduler probes candidates through admin api instead of
   assert.match(script, /apiCall\('probeRemoteCandidateIp'/);
   assert.doesNotMatch(script, /fetch\('https:\/\/'\s*\+\s*target\s*\+\s*'\/cdn-cgi\/trace'/);
 });
+
+test('rendered admin ui scheduler copy action uses browser bridge clipboard helper', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+  const script = extractLastInlineScript(html);
+
+  assert.equal(response.status, 200);
+  assert.match(script, /uiBrowserBridge\.writeClipboard\(/);
+  assert.doesNotMatch(script, /this\.writeClipboard\(/);
+});
+
+test('rendered admin ui scheduler copy button keeps pill content from shrinking', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /App\.copySchedulerIpsForItdog\(\)[^>]+class="[^"]*inline-flex[^"]*shrink-0[^"]*whitespace-nowrap/);
+});
