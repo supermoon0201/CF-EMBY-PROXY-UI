@@ -378,6 +378,67 @@ export function getRealClientIpHeaderMode(node) {
   return "real-ip-only";
 }
 
+export function buildNodeCompatAutofixCandidateModes(originalMode = "") {
+  const canonicalModes = ["realip_only", "off", "dual"];
+  const normalizedOriginal = normalizeNodeRealClientIpMode(originalMode);
+  return canonicalModes.includes(normalizedOriginal)
+    ? [normalizedOriginal, ...canonicalModes.filter(mode => mode !== normalizedOriginal)]
+    : canonicalModes;
+}
+
+export function selectNodeCompatAutofixMode({ originalMode = "", stickyMargin = 0.15, tried = [] } = {}) {
+  const normalizedOriginal = normalizeNodeRealClientIpMode(originalMode);
+  const candidateModes = buildNodeCompatAutofixCandidateModes(normalizedOriginal);
+  const usableResults = (Array.isArray(tried) ? tried : [])
+    .filter(item => item && item.pass === true)
+    .map(item => ({
+      mode: normalizeNodeRealClientIpMode(item.mode),
+      score: Number(item.score),
+      order: candidateModes.indexOf(normalizeNodeRealClientIpMode(item.mode))
+    }))
+    .filter(item => candidateModes.includes(item.mode) && Number.isFinite(item.score));
+
+  if (usableResults.length === 0) {
+    return { mode: normalizedOriginal, bestMode: "", changed: false };
+  }
+
+  usableResults.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.order - b.order;
+  });
+
+  const best = usableResults[0];
+  const originalResult = usableResults.find(item => item.mode === normalizedOriginal);
+  if (originalResult) {
+    const stickyFloor = best.score * (1 - Math.max(0, Number(stickyMargin) || 0));
+    if (originalResult.score >= stickyFloor) {
+      return { mode: normalizedOriginal, bestMode: best.mode, changed: false };
+    }
+  }
+
+  return { mode: best.mode, bestMode: best.mode, changed: best.mode !== normalizedOriginal };
+}
+
+export function shouldBanUpstreamLine(status = 0, error = null) {
+  if (error) return true;
+  const code = Number(status) || 0;
+  return code === 403 || code === 404 || code === 416 || code >= 500;
+}
+
+export function buildRotatedRetryTargets(targets = [], startIndex = 0) {
+  if (!Array.isArray(targets) || targets.length === 0) return [];
+  const total = targets.length;
+  const offset = ((Number(startIndex) || 0) % total + total) % total;
+  return targets.slice(offset).concat(targets.slice(0, offset));
+}
+
+export function advanceLineCursor(currentIndex = 0, total = 0) {
+  const safeTotal = Math.floor(Number(total) || 0);
+  if (safeTotal <= 0) return 0;
+  const safeCurrent = Math.floor(Number(currentIndex) || 0);
+  return ((safeCurrent + 1) % safeTotal + safeTotal) % safeTotal;
+}
+
 // 保留节点 target 自带的子路径，避免 /node/foo 被错误拼到源站根目录。
 function buildUpstreamProxyUrl(targetBase, proxyPath = "/") {
   const baseUrl = targetBase instanceof URL ? new URL(targetBase.toString()) : new URL(String(targetBase || ""));
