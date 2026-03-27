@@ -11070,7 +11070,7 @@ const UI_HTML = `<!DOCTYPE html>
               return;
           }
           const contentList = records.map(item => item.content);
-          const confirmText = '确定把当前站点 ' + this.schedulerCurrentHost + ' 更新为以下 ' + contentList.length + ' 条地址吗？\n' + contentList.join('\n');
+          const confirmText = '确定把当前站点 ' + this.schedulerCurrentHost + ' 更新为以下 ' + contentList.length + ' 条地址吗？\\n' + contentList.join('\\n');
           if (!await this.askConfirm(confirmText, { title: '保存优选 DNS', tone: 'warning', confirmText: '保存' })) return;
 
           this.schedulerSavePending = true;
@@ -11110,7 +11110,7 @@ const UI_HTML = `<!DOCTYPE html>
               return;
           }
           try {
-              await this.writeClipboard(ips.join('\n'));
+              await this.writeClipboard(ips.join('\\n'));
               this.showMessage('候选 IP 已复制，即将打开 ITDog。', { tone: 'success' });
               window.open('https://www.itdog.cn/batch_tcping/', '_blank', 'noopener');
           } catch (e) {
