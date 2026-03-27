@@ -24,6 +24,31 @@ test('deduplicates parsed candidate IPs from remote source text', () => {
   assert.deepEqual(parsed.map(item => item.ip), ['1.1.1.1', '[2400:3200::1]']);
 });
 
+test('parses uouin html table rows for carrier and ipv6 candidates', () => {
+  const parsed = parseRemoteCandidateIpsFromSource(`
+    <table>
+      <tbody>
+        <tr><th scope="row">1</th><td>电信</td><td>172.64.82.114</td></tr>
+        <tr><th scope="row">2</th><td>联通</td><td>104.16.1.1</td></tr>
+        <tr><th scope="row">3</th><td>移动</td><td>104.17.1.1</td></tr>
+        <tr><th scope="row">4</th><td>多线</td><td>104.18.1.1</td></tr>
+        <tr><th scope="row">5</th><td>IPV6</td><td>2a06:98c1:3121::1</td></tr>
+      </tbody>
+    </table>
+  `, 'uouin');
+
+  assert.deepEqual(
+    parsed.map(item => ({ lineType: item.lineType, ip: item.ip })),
+    [
+      { lineType: '电信', ip: '172.64.82.114' },
+      { lineType: '联通', ip: '104.16.1.1' },
+      { lineType: '移动', ip: '104.17.1.1' },
+      { lineType: '多线', ip: '104.18.1.1' },
+      { lineType: 'ipv6', ip: '[2a06:98c1:3121::1]' }
+    ]
+  );
+});
+
 test('parses github top list candidates and removes private IPs', () => {
   const parsed = parseRemoteCandidateIpsFromSource('1.1.1.1 10.0.0.1 8.8.8.8 8.8.8.8', 'github-top10');
   assert.deepEqual(parsed.map(item => item.ip), ['1.1.1.1', '8.8.8.8']);

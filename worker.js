@@ -709,9 +709,15 @@ export function parseRemoteCandidateIpsFromSource(text = "", source = "") {
   const pushCandidate = (ip, options = {}) => {
     let nextIp = String(ip || "").trim();
     if (!nextIp) return;
-    const isIpv6 = nextIp.includes(":");
-    if (isIpv6 && !nextIp.startsWith("[")) nextIp = `[${nextIp}]`;
-    if (!isIpv6 && isPrivateOrLoopbackIpv4(nextIp)) return;
+    const normalizedIp = nextIp.replace(/^\[|\]$/g, "");
+    const isIpv6 = normalizedIp.includes(":");
+    if (isIpv6) {
+      if (!isValidIpv6Address(normalizedIp)) return;
+      nextIp = `[${normalizedIp}]`;
+    } else {
+      if (!isValidIpv4Address(normalizedIp) || isPrivateOrLoopbackIpv4(normalizedIp)) return;
+      nextIp = normalizedIp;
+    }
     if (seen.has(nextIp)) return;
     seen.add(nextIp);
     candidates.push({
@@ -724,9 +730,12 @@ export function parseRemoteCandidateIpsFromSource(text = "", source = "") {
   };
 
   if (normalizedSource === "uouin") {
+    const searchableText = rawText
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ");
     const regex = /(电信|联通|移动|多线|ipv6)\s+([0-9a-fA-F:.]+)/gi;
     let match;
-    while ((match = regex.exec(rawText)) !== null) {
+    while ((match = regex.exec(searchableText)) !== null) {
       pushCandidate(match[2], { lineType: match[1] });
     }
     return candidates;
