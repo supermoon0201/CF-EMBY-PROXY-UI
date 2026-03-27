@@ -151,6 +151,8 @@ const GLOBALS = {
   LogFlushTask: null,
   LogClearEpochMs: 0,
   LogLastFlushAt: 0,
+  LineCursor: new Map(),
+  LineBan: new Map(),
   OpsStatusWriteChain: Promise.resolve(),
   OpsStatusDbReady: new WeakMap(),
   InitCheckWarnedFingerprints: new Set(),
@@ -433,10 +435,7 @@ export function selectNodeCompatAutofixMode({ originalMode = "", stickyMargin = 
 }
 
 function scoreNodeCompatProbeResult(result, weight = 1) {
-  const baseWeight = Number(weight) || 0;
-  if (result?.ok === true) return baseWeight;
-  if (Number(result?.status) === 401) return baseWeight * 0.75;
-  return 0;
+  return result?.ok === true ? (Number(weight) || 0) : 0;
 }
 
 async function buildInternalNodeCompatProbeHeaders(env, probeUrl, clientIp = "unknown") {
@@ -462,10 +461,8 @@ async function isTrustedInternalNodeCompatProbeRequest(request, env) {
   return signature === await Auth.sign(env.JWT_SECRET, payload);
 }
 
-function isNodeCompatProbeAcceptable(result, options = {}) {
-  if (result?.ok === true) return true;
-  if (options.allow401 === true && Number(result?.status) === 401) return true;
-  return false;
+function isNodeCompatProbeAcceptable(result) {
+  return result?.ok === true;
 }
 
 async function probeNodeCompatAutofixPath({ env, ctx, nodeName, node, mode, requestUrl, clientIp, path, search = "" }) {
@@ -537,8 +534,8 @@ async function probeNodeCompatAutofixMode({ env, ctx, nodeName, node, mode, requ
     search: "?Limit=1"
   });
   const pass = publicProbe.ok === true && (
-    isNodeCompatProbeAcceptable(mediaProbe, { allow401: true })
-    || isNodeCompatProbeAcceptable(mediaProbe2, { allow401: true })
+    isNodeCompatProbeAcceptable(mediaProbe)
+    || isNodeCompatProbeAcceptable(mediaProbe2)
   );
   const score = scoreNodeCompatProbeResult(publicProbe, 1)
     + scoreNodeCompatProbeResult(mediaProbe, 2)
@@ -572,6 +569,55 @@ export function advanceLineCursor(currentIndex = 0, total = 0) {
   if (safeTotal <= 0) return 0;
   const safeCurrent = Math.floor(Number(currentIndex) || 0);
   return ((safeCurrent + 1) % safeTotal + safeTotal) % safeTotal;
+}
+
+function buildLineStateKey(nodeName = "") {
+  return String(nodeName || "").trim().toLowerCase();
+}
+
+function buildLineBanKey(lineStateKey = "", targetBase = "") {
+  return `${buildLineStateKey(lineStateKey)}|${String(targetBase || "").trim()}`;
+}
+
+function getRetryTargetKey(targetBase = "") {
+  return targetBase instanceof URL ? targetBase.toString() : String(targetBase || "").trim();
+}
+
+function readLineCursor(lineStateKey = "", total = 0) {
+  const safeTotal = Math.floor(Number(total) || 0);
+  if (safeTotal <= 0) return 0;
+  const current = Math.floor(Number(GLOBALS.LineCursor.get(buildLineStateKey(lineStateKey))) || 0);
+  return ((current % safeTotal) + safeTotal) % safeTotal;
+}
+
+function isLineCurrentlyBanned(lineStateKey = "", targetBase = "", nowValue = Date.now()) {
+  const banKey = buildLineBanKey(lineStateKey, getRetryTargetKey(targetBase));
+  const entry = GLOBALS.LineBan.get(banKey);
+  const exp = Number(entry?.exp ?? entry ?? 0);
+  if (!exp || exp <= Number(nowValue) || 0) {
+    if (entry) GLOBALS.LineBan.delete(banKey);
+    return false;
+  }
+  return true;
+}
+
+function banLineTarget(lineStateKey = "", targetBase = "", ttlMs = 60000, nowValue = Date.now()) {
+  const safeKey = buildLineStateKey(lineStateKey);
+  const targetKey = getRetryTargetKey(targetBase);
+  if (!safeKey || !targetKey) return;
+  GLOBALS.LineBan.set(buildLineBanKey(safeKey, targetKey), {
+    exp: (Number(nowValue) || Date.now()) + Math.max(1000, Number(ttlMs) || 60000)
+  });
+}
+
+function orderRetryTargetsWithLineState(lineStateKey = "", retryTargets = [], nowValue = Date.now()) {
+  const targets = Array.isArray(retryTargets) ? retryTargets.slice() : [];
+  if (targets.length <= 1) return targets;
+  const safeLineStateKey = buildLineStateKey(lineStateKey);
+  if (!safeLineStateKey) return targets;
+  const rotatedTargets = buildRotatedRetryTargets(targets, readLineCursor(safeLineStateKey, targets.length));
+  const allowedTargets = rotatedTargets.filter(targetBase => !isLineCurrentlyBanned(safeLineStateKey, targetBase, nowValue));
+  return allowedTargets.length ? allowedTargets : rotatedTargets;
 }
 
 // 保留节点 target 自带的子路径，避免 /node/foo 被错误拼到源站根目录。
@@ -4996,14 +5042,15 @@ const Proxy = {
   async fetchUpstreamWithRetryLoop(state) {
     let lastError = null;
     let lastResponse = null;
-    let lastBase = state.retryTargets[0];
+    const orderedTargets = orderRetryTargetsWithLineState(state.lineStateKey, state.retryTargets, Date.now());
+    let lastBase = orderedTargets[0];
     let lastFinalUrl = buildUpstreamProxyUrl(lastBase, state.proxyPath);
     lastFinalUrl.search = state.requestUrl.search;
 
     const totalPasses = Math.max(1, clampIntegerConfig(state.maxExtraAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3) + 1);
     for (let pass = 0; pass < totalPasses; pass++) {
-      for (let index = 0; index < state.retryTargets.length; index++) {
-        const targetBase = state.retryTargets[index];
+      for (let index = 0; index < orderedTargets.length; index++) {
+        const targetBase = orderedTargets[index];
         lastBase = targetBase;
         const effectiveRetry = state.isRetry === true || pass > 0;
         try {
@@ -5018,6 +5065,12 @@ const Proxy = {
           const response = upstream.response;
 
           if (response.status === 101) {
+            if (state.lineStateKey && state.retryTargets?.length > 1) {
+              const originalIndex = state.retryTargets.findIndex(item => getRetryTargetKey(item) === getRetryTargetKey(targetBase));
+              if (originalIndex >= 0) {
+                GLOBALS.LineCursor.set(buildLineStateKey(state.lineStateKey), advanceLineCursor(originalIndex, state.retryTargets.length));
+              }
+            }
             return upstream;
           }
 
@@ -5026,8 +5079,16 @@ const Proxy = {
             return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true, protocolFallbackRetry: true });
           }
 
-          const isLastTarget = index === state.retryTargets.length - 1;
+          const isLastTarget = index === orderedTargets.length - 1;
           const isLastPass = pass === totalPasses - 1;
+          if (response.ok && state.lineStateKey && state.retryTargets?.length > 1) {
+            const originalIndex = state.retryTargets.findIndex(item => getRetryTargetKey(item) === getRetryTargetKey(targetBase));
+            if (originalIndex >= 0) {
+              GLOBALS.LineCursor.set(buildLineStateKey(state.lineStateKey), advanceLineCursor(originalIndex, state.retryTargets.length));
+            }
+          } else if (shouldBanUpstreamLine(response.status, null)) {
+            banLineTarget(state.lineStateKey, targetBase, 60000, Date.now());
+          }
           if (state.allowAutomaticRetry !== true || !state.retryableStatuses.has(response.status) || (isLastTarget && isLastPass)) {
             return upstream;
           }
@@ -5038,7 +5099,8 @@ const Proxy = {
           lastResponse = response;
         } catch (error) {
           lastError = error;
-          const isLastTarget = index === state.retryTargets.length - 1;
+          banLineTarget(state.lineStateKey, targetBase, 60000, Date.now());
+          const isLastTarget = index === orderedTargets.length - 1;
           const isLastPass = pass === totalPasses - 1;
           if (isLastTarget && isLastPass) throw error;
         }
@@ -5614,6 +5676,7 @@ const Proxy = {
   async executeUpstreamFlow(execution, transport, buildFetchOptions) {
     const upstream = await this.fetchUpstreamWithRetryLoop({
       retryTargets: transport.retryTargets,
+      lineStateKey: execution.nodeName,
       proxyPath: execution.proxyPath,
       requestUrl: execution.requestUrl,
       buildFetchOptions,
@@ -6378,6 +6441,10 @@ const UI_HTML = `<!DOCTYPE html>
         <div class="flex gap-2">
           <button type="button" :disabled="pingPending" class="px-3 border border-emerald-200 dark:border-emerald-800/50 text-emerald-600 dark:text-emerald-400 rounded-xl hover:bg-emerald-50 dark:hover:bg-emerald-900/30 transition flex items-center justify-center flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed" title="测试当前启用线路" @click="pingNode">
             <i v-if="!pingPending" data-lucide="activity" class="w-4 h-4"></i>
+            <i v-else data-lucide="loader" class="w-4 h-4 animate-spin"></i>
+          </button>
+          <button type="button" :disabled="compatAutofixPending" class="px-3 border border-amber-200 dark:border-amber-800/50 text-amber-600 dark:text-amber-400 rounded-xl hover:bg-amber-50 dark:hover:bg-amber-900/30 transition flex items-center justify-center flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed" title="自动修复兼容模式" @click="autofixCompat">
+            <i v-if="!compatAutofixPending" data-lucide="wand-sparkles" class="w-4 h-4"></i>
             <i v-else data-lucide="loader" class="w-4 h-4 animate-spin"></i>
           </button>
           <copy-button :text="link" label="复制"></copy-button>
@@ -8040,6 +8107,7 @@ const UI_HTML = `<!DOCTYPE html>
         nodeHealth: {},
         nodesHealthCheckPending: false,
         nodePingPending: {},
+        nodeCompatAutofixPending: {},
         nodeMutationSeq: 0,
         nodeMutationVersion: {},
         pageLoadSeq: 0,
@@ -10260,11 +10328,25 @@ const UI_HTML = `<!DOCTYPE html>
           return this.nodePingPending?.[key] === true;
       },
 
+      isNodeCompatAutofixPending(name) {
+          const key = this.normalizeNodeKey(name);
+          return this.nodeCompatAutofixPending?.[key] === true;
+      },
+
       setNodePingPending(name, pending) {
           const key = this.normalizeNodeKey(name);
           if (!key) return;
           this.nodePingPending = {
             ...(this.nodePingPending || {}),
+            [key]: pending === true
+          };
+      },
+
+      setNodeCompatAutofixPending(name, pending) {
+          const key = this.normalizeNodeKey(name);
+          if (!key) return;
+          this.nodeCompatAutofixPending = {
+            ...(this.nodeCompatAutofixPending || {}),
             [key]: pending === true
           };
       },
@@ -10290,6 +10372,21 @@ const UI_HTML = `<!DOCTYPE html>
              this.updateNodeCardStatus(name, 9999);
           } finally {
              this.setNodePingPending(name, false);
+          }
+      },
+
+      async autofixNodeCompat(name) {
+          const normalizedName = this.normalizeNodeKey(name);
+          if (!normalizedName || this.isNodeCompatAutofixPending(normalizedName)) return;
+          this.setNodeCompatAutofixPending(normalizedName, true);
+          try {
+              const res = await this.apiCall('nodeCompatAutofix', { name: normalizedName });
+              await this.loadNodes();
+              this.showMessage('兼容模式已' + (res?.changed ? '修复' : '确认') + '为 ' + (res?.mode || '未知'), { tone: 'success' });
+          } catch (error) {
+              this.showMessage('自动修复兼容模式失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.setNodeCompatAutofixPending(normalizedName, false);
           }
       },
 
@@ -12371,6 +12468,9 @@ const UI_HTML = `<!DOCTYPE html>
         pingPending() {
           return this.app.isNodePingPending(this.hydratedNode.name);
         },
+        compatAutofixPending() {
+          return this.app.isNodeCompatAutofixPending(this.hydratedNode.name);
+        },
         latencyTitle() {
           return this.activeLine?.latencyUpdatedAt ? ('最近测速：' + this.app.formatLocalDateTime(this.activeLine.latencyUpdatedAt)) : '尚未测速';
         }
@@ -12383,6 +12483,11 @@ const UI_HTML = `<!DOCTYPE html>
           const nodeName = String(this.hydratedNode.name || '').trim();
           if (!nodeName) return;
           await this.app.checkSingleNodeHealth(nodeName);
+        },
+        async autofixCompat() {
+          const nodeName = String(this.hydratedNode.name || '').trim();
+          if (!nodeName) return;
+          await this.app.autofixNodeCompat(nodeName);
         },
         editNode() {
           const nodeName = String(this.hydratedNode.name || '').trim();

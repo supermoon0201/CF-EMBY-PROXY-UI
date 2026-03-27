@@ -46,6 +46,16 @@ test('rendered admin ui scheduler copy action uses browser bridge clipboard help
   assert.doesNotMatch(script, /this\.writeClipboard\(/);
 });
 
+test('rendered admin ui node card exposes nodeCompatAutofix action', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+  const script = extractLastInlineScript(html);
+
+  assert.equal(response.status, 200);
+  assert.match(script, /apiCall\('nodeCompatAutofix'/);
+  assert.match(html, /自动修复兼容/);
+});
+
 test('rendered admin ui scheduler copy button keeps pill content from shrinking', async () => {
   const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
   const html = await response.text();
