@@ -8,7 +8,12 @@ import {
   buildRemoteCandidateProbeUrl,
   buildMedia403CompatibilityModes,
   shouldFallbackToNoRange,
-  selectTopCandidatesForDns
+  selectTopCandidatesForDns,
+  buildNodeCompatAutofixCandidateModes,
+  selectNodeCompatAutofixMode,
+  shouldBanUpstreamLine,
+  buildRotatedRetryTargets,
+  advanceLineCursor
 } from '../worker.js';
 
 test('maps legacy and new real client IP modes', () => {
@@ -79,4 +84,31 @@ test('keeps only the fastest usable top3 candidates', () => {
     { ip: '4.4.4.4', latencyMs: 95 }
   ]);
   assert.deepEqual(top.map(item => item.ip), ['2.2.2.2', '4.4.4.4', '1.1.1.1']);
+});
+
+test('orders node compat autofix candidates and keeps sticky original mode', () => {
+  assert.deepEqual(buildNodeCompatAutofixCandidateModes('dual'), ['dual', 'realip_only', 'off']);
+  assert.deepEqual(buildNodeCompatAutofixCandidateModes('smart'), ['realip_only', 'off', 'dual']);
+
+  const selected = selectNodeCompatAutofixMode({
+    originalMode: 'off',
+    stickyMargin: 0.15,
+    tried: [
+      { mode: 'off', pass: true, score: 90 },
+      { mode: 'dual', pass: true, score: 100 },
+      { mode: 'realip_only', pass: false, score: -10 }
+    ]
+  });
+
+  assert.deepEqual(selected, { mode: 'off', bestMode: 'dual', changed: false });
+});
+
+test('decides upstream line bans and retry rotation helpers', () => {
+  assert.equal(shouldBanUpstreamLine(403, null), true);
+  assert.equal(shouldBanUpstreamLine(503, null), true);
+  assert.equal(shouldBanUpstreamLine(401, null), false);
+  assert.equal(shouldBanUpstreamLine(429, null), false);
+  assert.equal(shouldBanUpstreamLine(0, new Error('network')), true);
+  assert.deepEqual(buildRotatedRetryTargets(['a', 'b', 'c'], 1), ['b', 'c', 'a']);
+  assert.equal(advanceLineCursor(2, 3), 0);
 });
