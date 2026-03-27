@@ -25,3 +25,13 @@ test('rendered admin ui inline script is syntactically valid', async () => {
   assert.equal(response.status, 200);
   assert.doesNotThrow(() => new Function(script));
 });
+
+test('rendered admin ui scheduler probes candidates through admin api instead of browser https ip fetch', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+  const script = extractLastInlineScript(html);
+
+  assert.equal(response.status, 200);
+  assert.match(script, /apiCall\('probeRemoteCandidateIp'/);
+  assert.doesNotMatch(script, /fetch\('https:\/\/'\s*\+\s*target\s*\+\s*'\/cdn-cgi\/trace'/);
+});

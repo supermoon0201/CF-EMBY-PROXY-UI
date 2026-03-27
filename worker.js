@@ -862,6 +862,53 @@ async function listRemoteCandidateIpsByType(type = "") {
   return { type: normalizedType, candidates: deduped, sourceSummary };
 }
 
+export function buildRemoteCandidateProbeUrl(ip = "") {
+  const normalizedIp = String(ip || "").trim().replace(/^\[|\]$/g, "");
+  if (!normalizedIp) return "";
+  if (isValidIpv6Address(normalizedIp)) return `http://[${normalizedIp}]/cdn-cgi/trace`;
+  if (isValidIpv4Address(normalizedIp)) return `http://${normalizedIp}/cdn-cgi/trace`;
+  return "";
+}
+
+async function probeRemoteCandidateIpLatency(ip = "", options = {}) {
+  const probeUrl = buildRemoteCandidateProbeUrl(ip);
+  const timeoutMs = clampIntegerConfig(options.timeoutMs, 2500, 500, 10000);
+  if (!probeUrl) {
+    return { ok: false, latencyMs: 9999, url: "", status: 0, error: "invalid_ip" };
+  }
+
+  const controller = new AbortController();
+  const startedAt = nowMs();
+  let timeoutId = null;
+  try {
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const response = await fetch(probeUrl, {
+      method: "GET",
+      redirect: "manual",
+      cache: "no-store",
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: controller.signal
+    });
+    return {
+      ok: true,
+      latencyMs: Math.max(1, nowMs() - startedAt),
+      url: probeUrl,
+      status: Number(response?.status) || 0,
+      error: ""
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      latencyMs: 9999,
+      url: probeUrl,
+      status: 0,
+      error: error?.name === "AbortError" ? "timeout" : String(error?.message || error || "probe_failed")
+    };
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
+}
+
 function parseKeywordTerms(raw = "") {
   return String(raw || "")
     .split(/[\n\r,，;；|]+/)
@@ -3506,6 +3553,23 @@ const Database = {
       } catch (error) {
         return jsonError("REMOTE_CANDIDATE_FETCH_FAILED", error?.message || "远程候选 IP 拉取失败", 500);
       }
+    },
+
+    async probeRemoteCandidateIp(data) {
+      const ip = String(data?.ip || "").trim();
+      if (!ip) return jsonError("MISSING_PARAMS", "ip 不能为空");
+      const result = await probeRemoteCandidateIpLatency(ip, {
+        timeoutMs: data?.timeout ?? data?.timeoutMs
+      });
+      if (!result.url) return jsonError("INVALID_IP", "候选 IP 无效", 400, { ip });
+      return jsonResponse({
+        ok: result.ok,
+        ip,
+        latencyMs: result.latencyMs,
+        status: result.status,
+        url: result.url,
+        error: result.error
+      });
     },
 
     async listDnsRecords(data, { env, kv, request }) {
@@ -6192,7 +6256,7 @@ const UI_HTML = `<!DOCTYPE html>
             <div class="min-w-0">
               <h3 class="font-semibold text-lg flex-shrink-0">优选调度</h3>
               <p class="text-xs text-slate-500 mt-1 break-all">{{ App.schedulerHintText }}</p>
-              <p class="text-[11px] text-slate-500 mt-1">当前页会从远程优选源拉取候选 IP，在浏览器侧测速，并通过现有 Cloudflare DNS 保存链路把单条或 TOP3 结果写回当前站点。</p>
+              <p class="text-[11px] text-slate-500 mt-1">当前页会从远程优选源拉取候选 IP，由 Worker 侧代测延迟，并通过现有 Cloudflare DNS 保存链路把单条或 TOP3 结果写回当前站点。</p>
             </div>
             <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
               <select v-model="App.schedulerType" class="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
@@ -7703,7 +7767,7 @@ const UI_HTML = `<!DOCTYPE html>
         schedulerSourceSummary: [],
         schedulerCurrentHost: '',
         schedulerHintText: '当前站点：加载中...',
-        schedulerStatusText: '点击“获取节点并测速”后，系统会拉取远程候选 IP，并在浏览器侧执行延迟探测。',
+        schedulerStatusText: '点击“获取节点并测速”后，系统会拉取远程候选 IP，并由 Worker 侧执行延迟探测。',
         schedulerFetchPending: false,
         schedulerTestingPending: false,
         schedulerSavePending: false,
@@ -10956,22 +11020,12 @@ const UI_HTML = `<!DOCTYPE html>
       async probeSchedulerCandidate(ip) {
           const target = String(ip || '').trim();
           if (!target) return 9999;
-          const controller = new AbortController();
-          const startedAt = performance.now();
-          let timeoutId = null;
           try {
-              timeoutId = setTimeout(() => controller.abort(), 2500);
-              await fetch('https://' + target + '/cdn-cgi/trace', {
-                  method: 'GET',
-                  mode: 'no-cors',
-                  cache: 'no-store',
-                  signal: controller.signal
-              });
-              return Math.max(1, Math.round(performance.now() - startedAt));
+              const res = await this.apiCall('probeRemoteCandidateIp', { ip: target, timeout: 2500 });
+              const latencyMs = Number(res?.latencyMs);
+              return Number.isFinite(latencyMs) ? Math.max(1, Math.round(latencyMs)) : 9999;
           } catch {
               return 9999;
-          } finally {
-              if (timeoutId !== null) clearTimeout(timeoutId);
           }
       },
 
@@ -11046,7 +11100,7 @@ const UI_HTML = `<!DOCTYPE html>
                   this.schedulerStatusText = '当前线路类型未返回候选 IP，请切换类型或稍后重试。';
                   return;
               }
-              this.schedulerStatusText = '已拉取 ' + this.schedulerCandidates.length + ' 个候选，开始浏览器侧测速。';
+              this.schedulerStatusText = '已拉取 ' + this.schedulerCandidates.length + ' 个候选，开始 Worker 侧测速。';
               await this.runSchedulerLatencyTests();
           } catch (e) {
               this.schedulerCandidates = [];

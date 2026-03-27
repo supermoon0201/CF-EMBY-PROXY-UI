@@ -5,6 +5,7 @@ import {
   normalizeNodeRealClientIpMode,
   getRealClientIpHeaderMode,
   parseRemoteCandidateIpsFromSource,
+  buildRemoteCandidateProbeUrl,
   buildMedia403CompatibilityModes,
   shouldFallbackToNoRange,
   selectTopCandidatesForDns
@@ -52,6 +53,12 @@ test('parses uouin html table rows for carrier and ipv6 candidates', () => {
 test('parses github top list candidates and removes private IPs', () => {
   const parsed = parseRemoteCandidateIpsFromSource('1.1.1.1 10.0.0.1 8.8.8.8 8.8.8.8', 'github-top10');
   assert.deepEqual(parsed.map(item => item.ip), ['1.1.1.1', '8.8.8.8']);
+});
+
+test('builds worker-side remote candidate probe urls over http for ip targets', () => {
+  assert.equal(buildRemoteCandidateProbeUrl('162.159.45.186'), 'http://162.159.45.186/cdn-cgi/trace');
+  assert.equal(buildRemoteCandidateProbeUrl('[2606:4700:4700::1111]'), 'http://[2606:4700:4700::1111]/cdn-cgi/trace');
+  assert.equal(buildRemoteCandidateProbeUrl('not-an-ip'), '');
 });
 
 test('builds media 403 compatibility ladder in the expected order', () => {

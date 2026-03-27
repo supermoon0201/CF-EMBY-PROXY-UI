@@ -67,7 +67,7 @@
 - 支持全局 Ping / 健康检查
 - 支持仪表盘展示请求量、运行状态、流量趋势、资源分类徽章
 - 支持 DNS 编辑双模式：`CNAME模式` / `A模式` 可切换，保存时自动处理互斥关系
-- 支持独立的 **优选调度** 页面：远程拉取候选 IP、浏览器侧测速、单条或 TOP3 结果直接复用现有 DNS 保存链路
+- 支持独立的 **优选调度** 页面：远程拉取候选 IP、Worker 侧测速、单条或 TOP3 结果直接复用现有 DNS 保存链路
 - 支持推荐优选域名卡片、DNS 历史卡片回填，以及 DNS 实用链接快捷跳转
 - 支持全局设置新手 / 高手模式切换，默认新手模式隐藏高风险高级项
 - 支持冷启动初始化自检，缺少 `JWT_SECRET` / `ADMIN_PASS` 时直接在控制台与页面提示
@@ -467,13 +467,13 @@ https://你的域名/secret_portal_99
 - **仪表盘**：展示请求量、流量趋势、资源类别、运行状态、定时任务状态，按需手动刷新
 - **节点管理**：搜索节点、导入/导出配置、全局 Ping
 - **日志记录**：按日期范围查询请求记录、初始化 DB、手动清理
-- **优选调度**：拉取远程候选 IP、浏览器侧测速、复制去 ITDog、把单条或 TOP3 结果同步到当前站点 DNS
+- **优选调度**：拉取远程候选 IP、Worker 侧测速、复制去 ITDog、把单条或 TOP3 结果同步到当前站点 DNS
 - **DNS 编辑**：当前站点 DNS 草稿编辑、推荐优选域名、历史记录回填、实用链接
 - **设置页**：系统 UI、代理与网络、静态资源策略、安全防护、日志设置、监控告警、账号设置、备份与恢复
 
 ### 优选调度页说明
 
-- 调度页会先读取当前站点上下文，然后调用后台 `listRemoteCandidateIps` 拉取候选 IP，最后在浏览器侧执行延迟探测
+- 调度页会先读取当前站点上下文，然后调用后台 `listRemoteCandidateIps` 拉取候选 IP，最后由 Worker 侧执行延迟探测
 - “同步 TOP3 到 DNS” 与 “同步到 DNS” 不会走第二套写入接口，而是直接复用现有 `saveDnsRecords`
 - 候选列表按测速结果升序排序；默认只会把延迟有效、在阈值内的候选参与 TOP3 选择
 - “复制去 ITDog” 会把当前候选 IP 批量复制到剪贴板，并打开 ITDog 批量 TCP Ping 页面，方便做外部复核
@@ -810,7 +810,7 @@ https://你的域名/hk/123
 | `设置 -> 备份与恢复` | 导入全局设置 / 导入完整备份 | `importSettings` / `importFull` | 把 JSON 内容重新写回 KV |
 | `设置 -> 备份与恢复` | 恢复此快照 / 清理快照 | `restoreConfigSnapshot` / `clearConfigSnapshots` | 管理 `sys:config_snapshots:v1` 中的设置快照 |
 | `设置 -> 备份与恢复`（高手模式） | `一键整理 KV 数据` | `tidyKvData` | 修复旧版本升级后的索引、脏配置和遗留缓存键问题 |
-| `优选调度` | 获取节点并测速 / 同步 TOP3 到 DNS | `listRemoteCandidateIps` / `listDnsRecords` / `saveDnsRecords` | 拉取候选 IP、浏览器侧测速，并复用现有 DNS 保存链路写回当前站点 |
+| `优选调度` | 获取节点并测速 / 同步 TOP3 到 DNS | `listRemoteCandidateIps` / `probeRemoteCandidateIp` / `listDnsRecords` / `saveDnsRecords` | 拉取候选 IP、Worker 侧测速，并复用现有 DNS 保存链路写回当前站点 |
 | `DNS 编辑` | 刷新 / 保存 DNS | `listDnsRecords` / `saveDnsRecords` | 按当前站点整体同步 `CNAME` 或 `A / AAAA` 草稿，并维护 CNAME 历史 |
 | `仪表盘` | 打开页面或刷新页面 | `getRuntimeStatus` | 查看日志刷盘、定时任务和租约状态；D1 不可用时回退到 KV 兜底 |
 | `后台登录页` | 提交登录密码 | `POST ADMIN_PATH/login` | 登录失败会写入 `fail:{ip}`，达到阈值后临时锁定 |
