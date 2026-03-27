@@ -361,20 +361,21 @@ function normalizeNodeMediaAuthMode(value = "") {
   return "auto";
 }
 
-function normalizeNodeRealClientIpMode(value = "") {
+export function normalizeNodeRealClientIpMode(value = "") {
   const normalized = String(value || "").trim().toLowerCase();
-  if (normalized === "forward") return "forward";
-  if (normalized === "strip") return "strip";
-  if (normalized === "disable" || normalized === "none") return "disable";
-  return "forward";
+  if (!normalized || normalized === "smart" || normalized === "auto") return "smart";
+  if (["realip_only", "realip", "strip", "strict", "x-real-ip"].includes(normalized)) return "realip_only";
+  if (["off", "disable", "none", "close"].includes(normalized)) return "off";
+  if (["dual", "both", "full", "forward"].includes(normalized)) return "dual";
+  return "smart";
 }
 
-function getRealClientIpHeaderMode(node) {
+export function getRealClientIpHeaderMode(node) {
   const nodeMode = normalizeNodeRealClientIpMode(node?.realClientIpMode);
-  if (nodeMode === "forward") return "full";
-  if (nodeMode === "strip") return "real-ip-only";
-  if (nodeMode === "disable") return "none";
-  return "full";
+  if (nodeMode === "dual") return "full";
+  if (nodeMode === "smart" || nodeMode === "realip_only") return "real-ip-only";
+  if (nodeMode === "off") return "none";
+  return "real-ip-only";
 }
 
 // 保留节点 target 自带的子路径，避免 /node/foo 被错误拼到源站根目录。
@@ -694,9 +695,162 @@ const DEFAULT_WANGPAN_DIRECT_TERMS = [
   "quark", "yun.uc.cn", "r2.cloudflarestorage", "volces.com", "tos-s3"
 ];
 const DEFAULT_WANGPAN_DIRECT_TEXT = DEFAULT_WANGPAN_DIRECT_TERMS.join(",");
+const UPSTREAM_RETRYABLE_STATUSES = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]);
+
+function isPrivateOrLoopbackIpv4(ip = "") {
+  return /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/.test(String(ip || ""));
+}
+
+export function parseRemoteCandidateIpsFromSource(text = "", source = "") {
+  const rawText = String(text || "");
+  const normalizedSource = String(source || "").trim().toLowerCase();
+  const seen = new Set();
+  const candidates = [];
+  const pushCandidate = (ip, options = {}) => {
+    let nextIp = String(ip || "").trim();
+    if (!nextIp) return;
+    const isIpv6 = nextIp.includes(":");
+    if (isIpv6 && !nextIp.startsWith("[")) nextIp = `[${nextIp}]`;
+    if (!isIpv6 && isPrivateOrLoopbackIpv4(nextIp)) return;
+    if (seen.has(nextIp)) return;
+    seen.add(nextIp);
+    candidates.push({
+      ip: nextIp,
+      family: isIpv6 ? "ipv6" : "ipv4",
+      lineType: String(options.lineType || "").trim().toLowerCase(),
+      source: normalizedSource || "unknown",
+      displayText: nextIp
+    });
+  };
+
+  if (normalizedSource === "uouin") {
+    const regex = /(电信|联通|移动|多线|ipv6)\s+([0-9a-fA-F:.]+)/gi;
+    let match;
+    while ((match = regex.exec(rawText)) !== null) {
+      pushCandidate(match[2], { lineType: match[1] });
+    }
+    return candidates;
+  }
+
+  const ipv4Matches = rawText.match(/\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g) || [];
+  ipv4Matches.forEach(ip => pushCandidate(ip, { lineType: normalizedSource }));
+  return candidates;
+}
+
+export function isResolvableStrmRequest(proxyPath = "") {
+  const normalizedPath = String(proxyPath || "").trim();
+  if (!/\.strm$/i.test(normalizedPath)) return false;
+  return !/\/emby\/videos\/[^/]+\/stream\.strm$/i.test(normalizedPath);
+}
+
+export function extractFirstValidStrmUrl(text = "") {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && !line.startsWith("#"));
+  for (const line of lines) {
+    try {
+      const url = new URL(line);
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        return url.toString();
+      }
+    } catch {}
+  }
+  return "";
+}
 
 function escapeRegexLiteral(value = "") {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function buildMedia403CompatibilityModes(configuredMode = "") {
+  const normalizedMode = normalizeNodeRealClientIpMode(configuredMode);
+  const modes = ["origin", "off", "dual", "realip_only"];
+  if (normalizedMode === "off" || normalizedMode === "dual" || normalizedMode === "realip_only") {
+    return ["origin", ...modes.slice(1)];
+  }
+  return modes;
+}
+
+export function shouldFallbackToNoRange(rangeHeader = "", status = 0, contentRange = "") {
+  const rangeText = String(rangeHeader || "").trim();
+  const match = /^\s*bytes\s*=\s*(\d+)-/i.exec(rangeText);
+  const start = match ? Number(match[1]) : NaN;
+  if (!Number.isFinite(start) || start !== 0) return false;
+  const normalizedStatus = Number(status) || 0;
+  const hasContentRange = !!String(contentRange || "").trim();
+  return normalizedStatus === 416 || (normalizedStatus !== 206 && !hasContentRange);
+}
+
+export function selectTopCandidatesForDns(candidates = [], options = {}) {
+  const thresholdMs = Math.max(1, Number(options.thresholdMs) || 2000);
+  const limit = Math.max(1, Math.floor(Number(options.limit) || 3));
+  return (Array.isArray(candidates) ? candidates : [])
+    .map(item => ({ ...item, latencyMs: Number(item?.latencyMs) }))
+    .filter(item => Number.isFinite(item.latencyMs) && item.latencyMs > 0 && item.latencyMs < thresholdMs)
+    .sort((a, b) => a.latencyMs - b.latencyMs)
+    .slice(0, limit);
+}
+
+async function fetchTextWithTimeout(url, options = {}) {
+  const timeoutMs = Math.max(0, Number(options.timeoutMs) || 5000);
+  let timeoutId = null;
+  const controller = new AbortController();
+  if (timeoutMs > 0) timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0", ...(options.headers || {}) },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`remote_source_http_${response.status}`);
+    return await response.text();
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
+}
+
+async function listRemoteCandidateIpsByType(type = "") {
+  const normalizedType = String(type || "all").trim().toLowerCase() || "all";
+  const candidates = [];
+  const sourceSummary = [];
+  const appendCandidates = (items = [], filterFn = null) => {
+    for (const item of Array.isArray(items) ? items : []) {
+      if (typeof filterFn === "function" && !filterFn(item)) continue;
+      candidates.push(item);
+    }
+  };
+
+  if (["all", "电信", "联通", "移动", "多线", "ipv6"].includes(normalizedType)) {
+    try {
+      const text = await fetchTextWithTimeout("https://api.uouin.com/cloudflare.html");
+      const parsed = parseRemoteCandidateIpsFromSource(text, "uouin");
+      appendCandidates(parsed, item => normalizedType === "all" || item.lineType === normalizedType);
+      sourceSummary.push({ source: "uouin", ok: true, count: parsed.length });
+    } catch (error) {
+      sourceSummary.push({ source: "uouin", ok: false, error: String(error?.message || error || "unknown_error") });
+    }
+  }
+
+  if (["all", "优选"].includes(normalizedType)) {
+    try {
+      const text = await fetchTextWithTimeout("https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html");
+      const parsed = parseRemoteCandidateIpsFromSource(text, "github-top10");
+      appendCandidates(parsed);
+      sourceSummary.push({ source: "github-top10", ok: true, count: parsed.length });
+    } catch (error) {
+      sourceSummary.push({ source: "github-top10", ok: false, error: String(error?.message || error || "unknown_error") });
+    }
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = String(candidate?.ip || "").trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(candidate);
+  }
+  return { type: normalizedType, candidates: deduped, sourceSummary };
 }
 
 function parseKeywordTerms(raw = "") {
@@ -3330,6 +3484,21 @@ const Database = {
       }
     },
 
+    async listRemoteCandidateIps(data) {
+      try {
+        const result = await listRemoteCandidateIpsByType(data?.type || "all");
+        return jsonResponse({
+          ok: true,
+          type: result.type,
+          totalCount: result.candidates.length,
+          candidates: result.candidates,
+          sourceSummary: result.sourceSummary
+        });
+      } catch (error) {
+        return jsonError("REMOTE_CANDIDATE_FETCH_FAILED", error?.message || "远程候选 IP 拉取失败", 500);
+      }
+    },
+
     async listDnsRecords(data, { env, kv, request }) {
         const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
         const cfZoneId = String(config.cfZoneId || "").trim();
@@ -4512,6 +4681,7 @@ const Proxy = {
         const effectiveRetry = state.isRetry === true || pass > 0;
         try {
           const upstream = await this.performUpstreamFetch(targetBase, state.proxyPath, state.requestUrl, state.buildFetchOptions, {
+            ...(state.fetchOptions || {}),
             isRetry: effectiveRetry,
             protocolFallbackRetry: state.protocolFallbackRetry === true,
             stripAuthOnProtocolFallback: state.stripAuthOnProtocolFallback === true,
@@ -4725,7 +4895,7 @@ const Proxy = {
     });
   },
   createBuildFetchOptions(execution, transport) {
-    const { request, requestTraits, protocolFallback } = execution;
+    const { request, requestTraits, protocolFallback, clientIp } = execution;
     const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode } = transport;
     return async (targetUrl, options = {}) => {
       const headers = new Headers(newHeaders);
@@ -4737,6 +4907,12 @@ const Proxy = {
       const isExternalRedirect = options.isExternalRedirect === true;
       const isProtocolFallbackRetry = options.protocolFallbackRetry === true;
       const shouldStripAuthOnProtocolFallback = options.stripAuthOnProtocolFallback === true;
+      const compatRealClientIpMode = options.compatRealClientIpMode ? normalizeNodeRealClientIpMode(options.compatRealClientIpMode) : "";
+      const compatForceOriginReferer = options.compatForceOriginReferer === true;
+      const compatClearOriginReferer = options.compatClearOriginReferer === true;
+      const stripFetchMetadataHeaders = options.stripFetchMetadataHeaders === true;
+      const forceIdentityEncoding = options.forceIdentityEncoding === true;
+      const removeRangeHeaders = options.removeRangeHeaders === true;
 
       if (headers.has("Origin") && !adminCustomHeaders.has("origin")) {
         headers.set("Origin", targetOrigin);
@@ -4770,6 +4946,43 @@ const Proxy = {
         headers.set("Connection", "keep-alive");
       }
 
+      if (compatRealClientIpMode) {
+        headers.delete("X-Real-IP");
+        headers.delete("X-Forwarded-For");
+        if (compatRealClientIpMode === "dual") {
+          headers.set("X-Real-IP", clientIp);
+          headers.set("X-Forwarded-For", clientIp);
+        } else if (compatRealClientIpMode === "smart" || compatRealClientIpMode === "realip_only") {
+          headers.set("X-Real-IP", clientIp);
+        }
+      }
+
+      if (compatClearOriginReferer) {
+        if (!adminCustomHeaders.has("origin")) headers.delete("Origin");
+        if (!adminCustomHeaders.has("referer")) headers.delete("Referer");
+      }
+
+      if (compatForceOriginReferer) {
+        if (!adminCustomHeaders.has("origin")) headers.set("Origin", targetOrigin);
+        if (!adminCustomHeaders.has("referer")) headers.set("Referer", targetOrigin + "/");
+      }
+
+      if (stripFetchMetadataHeaders) {
+        headers.delete("Sec-Fetch-Site");
+        headers.delete("Sec-Fetch-Mode");
+        headers.delete("Sec-Fetch-Dest");
+        headers.delete("Sec-Fetch-User");
+      }
+
+      if (forceIdentityEncoding) {
+        headers.set("Accept-Encoding", "identity");
+      }
+
+      if (removeRangeHeaders) {
+        headers.delete("Range");
+        headers.delete("If-Range");
+      }
+
       if (effectiveMethod === "GET" || effectiveMethod === "HEAD") {
         headers.delete("Content-Length");
       }
@@ -4792,36 +5005,93 @@ const Proxy = {
       return fetchOptions;
     };
   },
-  async executeUpstreamFlow(execution, transport, buildFetchOptions) {
-    const retryableStatuses = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]);
+  shouldUseMedia403CompatibilityLadder(execution, transport, upstreamState, fetchContext = {}) {
+    if (!upstreamState?.response || upstreamState.response.status !== 403) return false;
+    const method = String(fetchContext.method || execution.request.method || "GET").toUpperCase();
+    const effectiveBodyMode = fetchContext.bodyMode || transport.preparedBodyMode;
+    const replaySafe = method === "GET" || method === "HEAD" || effectiveBodyMode === "buffered";
+    if (!replaySafe || effectiveBodyMode === "stream") return false;
+    return execution.requestTraits.isBigStream
+      || execution.requestTraits.isManifest
+      || execution.requestTraits.isSegment
+      || this.isPlaybackInfoRequest(execution.proxyPath);
+  },
+  async performCompatibilityFetch(finalUrl, buildFetchOptions, execution, fetchContext = {}, options = {}) {
+    return await this.performFetchWithTimeout(finalUrl, buildFetchOptions, {
+      method: fetchContext.method,
+      bodyMode: fetchContext.bodyMode,
+      body: fetchContext.body,
+      isExternalRedirect: fetchContext.isExternalRedirect === true,
+      compatRealClientIpMode: options.compatRealClientIpMode,
+      compatForceOriginReferer: options.compatForceOriginReferer === true,
+      compatClearOriginReferer: options.compatClearOriginReferer === true,
+      stripFetchMetadataHeaders: options.stripFetchMetadataHeaders === true,
+      forceIdentityEncoding: options.forceIdentityEncoding === true,
+      removeRangeHeaders: options.removeRangeHeaders === true,
+      timeoutMs: execution.upstreamTimeoutMs
+    });
+  },
+  async maybeRecoverPlaybackCompatibility(execution, transport, buildFetchOptions, upstreamState, fetchContext = {}) {
+    let currentState = upstreamState && typeof upstreamState === "object" ? { ...upstreamState } : upstreamState;
+    if (!currentState?.response || !currentState?.finalUrl) return currentState;
+
+    if (this.shouldUseMedia403CompatibilityLadder(execution, transport, currentState, fetchContext)) {
+      const stages = buildMedia403CompatibilityModes(execution.node?.realClientIpMode);
+      for (const stage of stages) {
+        if (!currentState?.response || currentState.response.status !== 403) break;
+        try { currentState.response.body?.cancel?.(); } catch {}
+        const stageOptions = stage === "origin"
+          ? { compatForceOriginReferer: true, forceIdentityEncoding: true }
+          : stage === "off"
+            ? { compatRealClientIpMode: "off", compatClearOriginReferer: true, stripFetchMetadataHeaders: true, forceIdentityEncoding: true }
+            : stage === "dual"
+              ? { compatRealClientIpMode: "dual", compatForceOriginReferer: true, stripFetchMetadataHeaders: true, forceIdentityEncoding: true }
+              : { compatRealClientIpMode: "realip_only", compatForceOriginReferer: true, stripFetchMetadataHeaders: true, forceIdentityEncoding: true };
+        const recovered = await this.performCompatibilityFetch(currentState.finalUrl, buildFetchOptions, execution, fetchContext, stageOptions);
+        currentState = { ...currentState, response: recovered.response, finalUrl: recovered.finalUrl };
+      }
+    }
+
+    const method = String(fetchContext.method || execution.request.method || "GET").toUpperCase();
+    const canTryNoRange = (method === "GET" || method === "HEAD")
+      && currentState?.response
+      && currentState.response.status !== 403
+      && (execution.requestTraits.isBigStream || execution.requestTraits.isManifest || execution.requestTraits.isSegment);
+    if (canTryNoRange && shouldFallbackToNoRange(
+      execution.request.headers.get("Range"),
+      currentState.response.status,
+      currentState.response.headers.get("Content-Range")
+    )) {
+      try { currentState.response.body?.cancel?.(); } catch {}
+      const recovered = await this.performCompatibilityFetch(currentState.finalUrl, buildFetchOptions, execution, fetchContext, {
+        removeRangeHeaders: true,
+        forceIdentityEncoding: true
+      });
+      currentState = { ...currentState, response: recovered.response, finalUrl: recovered.finalUrl };
+    }
+
+    return currentState;
+  },
+  shouldTryResolveStrm(execution) {
+    const method = String(execution?.request?.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") return false;
+    if (execution?.requestTraits?.isWsUpgrade === true) return false;
+    return isResolvableStrmRequest(execution?.proxyPath || "");
+  },
+  async followRedirectChainFromState(execution, transport, buildFetchOptions, initialState, fetchContext = {}) {
     const sourceSameOriginProxy = execution.currentConfig.sourceSameOriginProxy !== false;
     const forceExternalProxy = execution.currentConfig.forceExternalProxy !== false;
     const wangpanDirectKeywords = getWangpanDirectText(execution.currentConfig.wangpandirect || "");
 
-    const upstream = await this.fetchUpstreamWithRetryLoop({
-      retryTargets: transport.retryTargets,
-      proxyPath: execution.proxyPath,
-      requestUrl: execution.requestUrl,
-      buildFetchOptions,
-      retryableStatuses,
-      protocolFallback: execution.protocolFallback,
-      preparedBodyMode: transport.preparedBodyMode,
-      allowAutomaticRetry: transport.allowAutomaticRetry,
-      stripAuthOnProtocolFallback: execution.requestTraits.canStripAuthOnProtocolFallback,
-      upstreamTimeoutMs: execution.upstreamTimeoutMs,
-      maxExtraAttempts: transport.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
-      isRetry: false
-    });
-
-    let response = upstream.response;
-    let activeTargetBase = upstream.targetBase;
-    let finalUrl = upstream.finalUrl;
-    let proxiedExternalRedirect = false;
-    let directRedirectUrl = null;
+    let response = initialState.response;
+    let activeTargetBase = initialState.activeTargetBase;
+    let finalUrl = initialState.finalUrl;
+    let proxiedExternalRedirect = initialState.proxiedExternalRedirect === true;
+    let directRedirectUrl = initialState.directRedirectUrl || null;
     let redirectHop = 0;
-    let redirectMethod = String(execution.request.method || "GET").toUpperCase();
-    let redirectBodyMode = transport.preparedBodyMode;
-    let redirectBody = transport.preparedBody;
+    let redirectMethod = String(fetchContext.method || execution.request.method || "GET").toUpperCase();
+    let redirectBodyMode = fetchContext.bodyMode || transport.preparedBodyMode;
+    let redirectBody = fetchContext.body !== undefined ? fetchContext.body : transport.preparedBody;
 
     while (response.status >= 300 && response.status < 400 && redirectHop < 8) {
       const location = response.headers.get("Location");
@@ -4855,7 +5125,7 @@ const Proxy = {
           body: nextBody,
           isExternalRedirect: !redirectDecision.isSameOriginRedirect
         },
-        retryableStatuses,
+        retryableStatuses: UPSTREAM_RETRYABLE_STATUSES,
         protocolFallback: execution.protocolFallback,
         preparedBodyMode: nextBodyMode,
         allowAutomaticRetry: transport.allowAutomaticRetry,
@@ -4864,8 +5134,18 @@ const Proxy = {
         maxExtraAttempts: transport.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
         isRetry: false
       });
-      response = redirectUpstream.response;
-      finalUrl = redirectUpstream.finalUrl;
+      const recoveredRedirect = await this.maybeRecoverPlaybackCompatibility(execution, transport, buildFetchOptions, {
+        response: redirectUpstream.response,
+        finalUrl: redirectUpstream.finalUrl,
+        targetBase: activeTargetBase
+      }, {
+        method: nextMethod,
+        bodyMode: nextBodyMode,
+        body: nextBody,
+        isExternalRedirect: !redirectDecision.isSameOriginRedirect
+      });
+      response = recoveredRedirect.response;
+      finalUrl = recoveredRedirect.finalUrl;
       redirectMethod = nextMethod;
       redirectBodyMode = nextBodyMode;
       redirectBody = nextBody;
@@ -4880,6 +5160,112 @@ const Proxy = {
       proxiedExternalRedirect,
       directRedirectUrl
     };
+  },
+  async tryResolveStrmUpstreamState(execution, transport, buildFetchOptions) {
+    if (!this.shouldTryResolveStrm(execution)) return null;
+
+    const strmUpstream = await this.fetchUpstreamWithRetryLoop({
+      retryTargets: transport.retryTargets,
+      proxyPath: execution.proxyPath,
+      requestUrl: execution.requestUrl,
+      buildFetchOptions,
+      fetchOptions: {
+        method: "GET",
+        bodyMode: "none",
+        body: null,
+        removeRangeHeaders: true
+      },
+      retryableStatuses: UPSTREAM_RETRYABLE_STATUSES,
+      protocolFallback: execution.protocolFallback,
+      preparedBodyMode: "none",
+      allowAutomaticRetry: transport.allowAutomaticRetry,
+      stripAuthOnProtocolFallback: execution.requestTraits.canStripAuthOnProtocolFallback,
+      upstreamTimeoutMs: execution.upstreamTimeoutMs,
+      maxExtraAttempts: transport.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
+      isRetry: false
+    });
+
+    const baseState = {
+      finalUrl: strmUpstream.finalUrl,
+      activeTargetBase: strmUpstream.targetBase,
+      proxiedExternalRedirect: false,
+      directRedirectUrl: null
+    };
+    if (!strmUpstream.response.ok) {
+      return { ...baseState, response: strmUpstream.response };
+    }
+
+    let strmText = "";
+    try {
+      strmText = await strmUpstream.response.text();
+    } catch {
+      return {
+        ...baseState,
+        response: new Response("STRM parse error", {
+          status: 500,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        })
+      };
+    }
+
+    const resolvedUrl = extractFirstValidStrmUrl(strmText);
+    if (!resolvedUrl) {
+      return {
+        ...baseState,
+        response: new Response("Bad STRM", {
+          status: 400,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        })
+      };
+    }
+
+    const syntheticRedirect = new Response(null, {
+      status: 302,
+      statusText: "Found",
+      headers: { Location: resolvedUrl }
+    });
+    return await this.followRedirectChainFromState(execution, transport, buildFetchOptions, {
+      ...baseState,
+      response: syntheticRedirect
+    }, {
+      method: String(execution.request.method || "GET").toUpperCase(),
+      bodyMode: transport.preparedBodyMode,
+      body: transport.preparedBody
+    });
+  },
+  async executeUpstreamFlow(execution, transport, buildFetchOptions) {
+    const upstream = await this.fetchUpstreamWithRetryLoop({
+      retryTargets: transport.retryTargets,
+      proxyPath: execution.proxyPath,
+      requestUrl: execution.requestUrl,
+      buildFetchOptions,
+      retryableStatuses: UPSTREAM_RETRYABLE_STATUSES,
+      protocolFallback: execution.protocolFallback,
+      preparedBodyMode: transport.preparedBodyMode,
+      allowAutomaticRetry: transport.allowAutomaticRetry,
+      stripAuthOnProtocolFallback: execution.requestTraits.canStripAuthOnProtocolFallback,
+      upstreamTimeoutMs: execution.upstreamTimeoutMs,
+      maxExtraAttempts: transport.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
+      isRetry: false
+    });
+
+    let compatibleUpstream = await this.maybeRecoverPlaybackCompatibility(execution, transport, buildFetchOptions, upstream, {
+      method: String(execution.request.method || "GET").toUpperCase(),
+      bodyMode: transport.preparedBodyMode,
+      body: transport.preparedBody,
+      isExternalRedirect: false
+    });
+    return await this.followRedirectChainFromState(execution, transport, buildFetchOptions, {
+      response: compatibleUpstream.response,
+      finalUrl: compatibleUpstream.finalUrl,
+      activeTargetBase: upstream.targetBase,
+      proxiedExternalRedirect: false,
+      directRedirectUrl: null
+    }, {
+      method: String(execution.request.method || "GET").toUpperCase(),
+      bodyMode: transport.preparedBodyMode,
+      body: transport.preparedBody
+    });
   },
   async buildSuccessResponse(execution, buildFetchOptions, upstreamState) {
     const finalStatus = upstreamState.response.status;
@@ -5003,20 +5389,42 @@ const Proxy = {
     const { targetBases, invalidResponse } = this.parseTargetBases(execution.node, execution.finalOrigin);
     if (invalidResponse) return invalidResponse;
 
+    let transport = null;
+    let buildFetchOptions = null;
+    if (this.shouldTryResolveStrm(execution)) {
+      transport = await this.buildProxyRequestState(
+        execution.request,
+        execution.node,
+        execution.proxyPath,
+        execution.requestUrl,
+        execution.clientIp,
+        execution.requestTraits,
+        execution.forceH1,
+        targetBases
+      );
+      buildFetchOptions = this.createBuildFetchOptions(execution, transport);
+      const strmUpstreamState = await this.tryResolveStrmUpstreamState(execution, transport, buildFetchOptions);
+      if (strmUpstreamState) {
+        return await this.buildSuccessResponse(execution, buildFetchOptions, strmUpstreamState);
+      }
+    }
+
     const directResponse = this.maybeBuildDirectRedirectResponse(execution, targetBases);
     if (directResponse) return directResponse;
 
-    const transport = await this.buildProxyRequestState(
-      execution.request,
-      execution.node,
-      execution.proxyPath,
-      execution.requestUrl,
-      execution.clientIp,
-      execution.requestTraits,
-      execution.forceH1,
-      targetBases
-    );
-    const buildFetchOptions = this.createBuildFetchOptions(execution, transport);
+    if (!transport || !buildFetchOptions) {
+      transport = await this.buildProxyRequestState(
+        execution.request,
+        execution.node,
+        execution.proxyPath,
+        execution.requestUrl,
+        execution.clientIp,
+        execution.requestTraits,
+        execution.forceH1,
+        targetBases
+      );
+      buildFetchOptions = this.createBuildFetchOptions(execution, transport);
+    }
 
     try {
       const upstreamState = await this.executeUpstreamFlow(execution, transport, buildFetchOptions);
@@ -5617,9 +6025,7 @@ const UI_HTML = `<!DOCTYPE html>
       </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-      <a v-for="item in App.navItems.slice(0, 4)" :key="item.hash" :href="item.hash" @click.prevent="App.navigate(item.hash)" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50" :class="App.getNavItemClass(item.hash)"><i :data-lucide="item.icon" class="w-5 h-5 mr-3"></i> {{ item.label }}</a>
-      <div class="my-4 border-t border-slate-200 dark:border-slate-800"></div>
-      <a :href="App.navItems[4].hash" @click.prevent="App.navigate(App.navItems[4].hash)" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50" :class="App.getNavItemClass(App.navItems[4].hash)"><i :data-lucide="App.navItems[4].icon" class="w-5 h-5 mr-3"></i> {{ App.navItems[4].label }}</a>
+      <a v-for="item in App.navItems" :key="item.hash" :href="item.hash" @click.prevent="App.navigate(item.hash)" class="nav-item flex items-center px-3 py-2.5 rounded-xl text-sm font-medium transition-colors text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:bg-slate-100 dark:hover:text-white dark:hover:bg-slate-800/50" :class="App.getNavItemClass(item.hash)"><i :data-lucide="item.icon" class="w-5 h-5 mr-3"></i> {{ item.label }}</a>
     </nav>
   </aside>
 
@@ -5767,6 +6173,92 @@ const UI_HTML = `<!DOCTYPE html>
               <button @click="App.changeLogPage(-1)" :disabled="App.logPage <= 1" class="px-4 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">上一页</button>
               <span id="log-page-info" class="text-sm font-mono text-slate-500">{{ App.logPage }} / {{ App.logTotalPages }}</span>
               <button @click="App.changeLogPage(1)" :disabled="App.logPage >= App.logTotalPages" class="px-4 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">下一页</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="view-scheduler" class="view-section w-full mx-auto space-y-6" :class="{ active: App.currentHash === '#scheduler' }">
+        <div class="glass-card rounded-3xl p-6 shadow-sm flex flex-col min-h-[calc(100vh-120px)]">
+          <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+            <div class="min-w-0">
+              <h3 class="font-semibold text-lg flex-shrink-0">优选调度</h3>
+              <p class="text-xs text-slate-500 mt-1 break-all">{{ App.schedulerHintText }}</p>
+              <p class="text-[11px] text-slate-500 mt-1">当前页会从远程优选源拉取候选 IP，在浏览器侧测速，并通过现有 Cloudflare DNS 保存链路把单条或 TOP3 结果写回当前站点。</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
+              <select v-model="App.schedulerType" class="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                <option value="all">综合混合源</option>
+                <option value="电信">电信专属</option>
+                <option value="联通">联通专属</option>
+                <option value="移动">移动专属</option>
+                <option value="多线">多线 BGP</option>
+                <option value="ipv6">IPv6 节点</option>
+                <option value="优选">优选库</option>
+              </select>
+              <button @click="App.fetchSchedulerCandidates()" :disabled="App.schedulerFetchPending || App.schedulerTestingPending" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
+                <i :data-lucide="App.schedulerFetchPending || App.schedulerTestingPending ? 'loader' : 'radar'" :class="App.schedulerFetchPending || App.schedulerTestingPending ? 'w-4 h-4 mr-2 animate-spin' : 'w-4 h-4 mr-2'"></i>{{ App.getSchedulerFetchButtonText() }}
+              </button>
+              <button @click="App.saveSchedulerTopCandidates()" :disabled="App.isSchedulerTopSaveDisabled()" class="px-4 py-2 bg-rose-600 text-white rounded-xl text-sm font-medium hover:bg-rose-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
+                <i data-lucide="upload-cloud" class="w-4 h-4 mr-2"></i>同步 TOP3 到 DNS
+              </button>
+              <button @click="App.copySchedulerIpsForItdog()" :disabled="!App.schedulerCandidates.length" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
+                <i data-lucide="copy" class="w-4 h-4 mr-2"></i>复制去 ITDog
+              </button>
+            </div>
+          </div>
+
+          <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 px-4 py-3 text-sm text-slate-600 dark:text-slate-300 mb-4">
+            {{ App.schedulerStatusText }}
+          </div>
+
+          <div class="overflow-x-auto min-h-0 w-full mb-4">
+            <table class="w-full text-left border-collapse table-fixed min-w-[860px]">
+              <thead>
+                <tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800">
+                  <th class="py-3 px-4 w-56">候选 IP</th>
+                  <th class="py-3 px-4 w-28">线路</th>
+                  <th class="py-3 px-4 w-32">来源</th>
+                  <th class="py-3 px-4 w-28">延迟</th>
+                  <th class="py-3 px-4">操作</th>
+                </tr>
+              </thead>
+              <tbody class="text-sm">
+                <tr v-if="!App.schedulerCandidates.length">
+                  <td colspan="5" class="py-8 text-center text-slate-500">暂无候选数据，点击“获取节点并测速”开始。</td>
+                </tr>
+                <tr v-for="(candidate, index) in App.getSchedulerCandidates()" v-else :key="candidate.ip + '-' + index" class="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
+                  <td class="py-3 px-4 font-mono text-xs text-slate-700 dark:text-slate-200">{{ candidate.ip }}</td>
+                  <td class="py-3 px-4">
+                    <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">{{ App.getSchedulerCandidateLineText(candidate) }}</span>
+                  </td>
+                  <td class="py-3 px-4 text-xs text-slate-500">{{ candidate.source || '-' }}</td>
+                  <td class="py-3 px-4 text-sm font-medium" :class="App.getSchedulerLatencyTextClass(candidate.latencyMs, candidate.testing)">
+                    {{ App.getSchedulerLatencyText(candidate) }}
+                  </td>
+                  <td class="py-3 px-4">
+                    <button @click="App.saveSchedulerSingleCandidate(candidate)" :disabled="App.isSchedulerSingleSaveDisabled(candidate)" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">同步到 DNS</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800 space-y-4">
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <p class="text-xs text-slate-500">{{ App.getSchedulerFooterHint() }}</p>
+              <button @click="App.loadSchedulerContext()" :disabled="App.schedulerFetchPending || App.schedulerTestingPending || App.schedulerSavePending" class="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">
+                <i data-lucide="refresh-cw" class="w-4 h-4"></i>刷新当前站点
+              </button>
+            </div>
+            <div v-if="App.schedulerSourceSummary.length" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
+              <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500 mb-3">Source Status</div>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div v-for="(entry, index) in App.schedulerSourceSummary" :key="'scheduler-source-' + index" class="rounded-xl border px-3 py-2 text-sm" :class="entry.ok ? 'border-emerald-200 bg-emerald-50/70 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/20 dark:text-emerald-300' : 'border-amber-200 bg-amber-50/70 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300'">
+                  <div class="font-medium">{{ entry.source }}</div>
+                  <div class="text-xs mt-1">{{ entry.ok ? ('已解析 ' + (entry.count || 0) + ' 条候选') : ('失败：' + (entry.error || '未知错误')) }}</div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -6608,11 +7100,12 @@ const UI_HTML = `<!DOCTYPE html>
             <div>
               <label class="block text-sm text-slate-500 mb-1">真实客户端 IP 透传</label>
               <select id="form-real-client-ip-mode" v-model="App.nodeModalForm.realClientIpMode" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
-                <option value="forward">透传 X-Real-IP 和 X-Forwarded-For (推荐)</option>
-                <option value="strip">仅保留 X-Real-IP</option>
-                <option value="disable">强制不透传【慎用】</option>
+                <option value="smart">自动（推荐，仅 X-Real-IP）</option>
+                <option value="realip_only">严格（仅保留 X-Real-IP）</option>
+                <option value="off">保守（不透传）</option>
+                <option value="dual">最大兼容（X-Real-IP + X-Forwarded-For）</option>
               </select>
-              <p class="mt-1 text-xs text-slate-400">真实客户端 IP 透传由 <code>X-Real-IP</code> 和 <code>X-Forwarded-For</code> 决定。你可以按节点选择透传这两个请求头、仅保留 <code>X-Real-IP</code>，或强制不透传 <code>X-Real-IP</code> 和 <code>X-Forwarded-For</code>。</p>
+              <p class="mt-1 text-xs text-slate-400">真实客户端 IP 透传由 <code>X-Real-IP</code> 和 <code>X-Forwarded-For</code> 决定。自动与严格模式默认只保留 <code>X-Real-IP</code>，最大兼容模式会同时附加 <code>X-Forwarded-For</code>，保守模式则完全不透传。</p>
             </div>
           </div>
 	        
@@ -6981,6 +7474,7 @@ const UI_HTML = `<!DOCTYPE html>
       '#nodes': '节点列表',
       '#logs': '日志记录',
       '#dns': 'DNS编辑',
+      '#scheduler': '优选调度',
       '#settings': '全局设置'
     };
 
@@ -6989,6 +7483,7 @@ const UI_HTML = `<!DOCTYPE html>
       { hash: '#nodes', icon: 'server', label: '节点列表' },
       { hash: '#logs', icon: 'activity', label: '日志记录' },
       { hash: '#dns', icon: 'globe', label: 'DNS编辑' },
+      { hash: '#scheduler', icon: 'radar', label: '优选调度' },
       { hash: '#settings', icon: 'settings', label: '全局设置' }
     ];
 
@@ -7021,10 +7516,21 @@ const UI_HTML = `<!DOCTYPE html>
 
     function normalizeNodeRealClientIpMode(value = '') {
       const normalized = String(value || '').trim().toLowerCase();
-      if (normalized === 'forward') return 'forward';
-      if (normalized === 'strip') return 'strip';
-      if (normalized === 'disable' || normalized === 'none') return 'disable';
-      return 'forward';
+      if (!normalized || normalized === 'smart' || normalized === 'auto') return 'smart';
+      if (['realip_only', 'realip', 'strip', 'strict', 'x-real-ip'].includes(normalized)) return 'realip_only';
+      if (['off', 'disable', 'none', 'close'].includes(normalized)) return 'off';
+      if (['dual', 'both', 'full', 'forward'].includes(normalized)) return 'dual';
+      return 'smart';
+    }
+
+    function selectTopCandidatesForDns(candidates = [], options = {}) {
+      const thresholdMs = Math.max(1, Number(options.thresholdMs) || 2000);
+      const limit = Math.max(1, Math.floor(Number(options.limit) || 3));
+      return (Array.isArray(candidates) ? candidates : [])
+        .map(item => ({ ...item, latencyMs: Number(item?.latencyMs) }))
+        .filter(item => Number.isFinite(item.latencyMs) && item.latencyMs > 0 && item.latencyMs < thresholdMs)
+        .sort((a, b) => a.latencyMs - b.latencyMs)
+        .slice(0, limit);
     }
 
     function normalizeNodeModalHeaderRows(rawHeaders) {
@@ -7052,7 +7558,7 @@ const UI_HTML = `<!DOCTYPE html>
         remark: '',
         secret: '',
         mediaAuthMode: 'auto',
-        realClientIpMode: 'forward',
+        realClientIpMode: 'smart',
         activeLineId: '',
         headers: []
       };
@@ -7183,6 +7689,17 @@ const UI_HTML = `<!DOCTYPE html>
         dnsHistoryLimit: 5,
         dnsBatchSaving: false,
         dnsLoadSeq: 0,
+        schedulerType: 'all',
+        schedulerCandidates: [],
+        schedulerSourceSummary: [],
+        schedulerCurrentHost: '',
+        schedulerHintText: '当前站点：加载中...',
+        schedulerStatusText: '点击“获取节点并测速”后，系统会拉取远程候选 IP，并在浏览器侧执行延迟探测。',
+        schedulerFetchPending: false,
+        schedulerTestingPending: false,
+        schedulerSavePending: false,
+        schedulerLoadSeq: 0,
+        schedulerProbeSeq: 0,
         runtimeConfig: {},
         configSnapshots: [],
         runtimeStatus: {},
@@ -9062,6 +9579,7 @@ const UI_HTML = `<!DOCTYPE html>
         if (hash === '#nodes') this.runRouteLoader(hash, () => this.loadNodes(), '节点列表加载失败: ');
         if (hash === '#logs') this.runRouteLoader(hash, () => this.loadLogs(1), '日志加载失败: ');
         if (hash === '#dns') this.runRouteLoader(hash, () => this.loadDnsRecords(), 'DNS 加载失败: ');
+        if (hash === '#scheduler') this.runRouteLoader(hash, () => this.loadSchedulerContext(), '优选调度加载失败: ');
         if (hash === '#settings') this.runRouteLoader(hash, () => this.loadSettings(), '设置加载失败: ');
       },
 
@@ -10338,6 +10856,265 @@ const UI_HTML = `<!DOCTYPE html>
               this.dnsEmptyText = 'DNS 记录加载失败';
               const message = e && e.message ? e.message : '未知错误';
               this.showMessage('DNS 记录加载失败: ' + message, { tone: 'error', modal: true });
+          }
+      },
+
+      applySchedulerDnsContext(payload) {
+          const res = payload && typeof payload === 'object' ? payload : {};
+          const zoneText = String(res.zoneName || res.zoneId || '未识别').trim() || '未识别';
+          this.schedulerCurrentHost = String(res.currentHost || '').trim().toLowerCase();
+          this.schedulerHintText = '当前站点：' + (this.schedulerCurrentHost || '未识别') + ' · Zone：' + zoneText;
+      },
+
+      async loadSchedulerContext() {
+          const loadSeq = ++this.schedulerLoadSeq;
+          this.schedulerHintText = '当前站点：加载中...';
+          try {
+              const res = await this.apiCall('listDnsRecords');
+              if (loadSeq !== this.schedulerLoadSeq) return;
+              this.applyDnsResponse(res);
+              this.applySchedulerDnsContext(res);
+          } catch (e) {
+              if (loadSeq !== this.schedulerLoadSeq) return;
+              this.schedulerCurrentHost = '';
+              this.schedulerHintText = '当前站点：加载失败（请检查 CF Zone ID、API 令牌权限）';
+              this.showMessage('优选调度无法读取当前站点 DNS: ' + (e?.message || '未知错误'), { tone: 'warning', modal: true });
+          }
+      },
+
+      getSchedulerFetchButtonText() {
+          if (this.schedulerFetchPending) return '拉取中...';
+          if (this.schedulerTestingPending) return '测速中...';
+          return '获取节点并测速';
+      },
+
+      getSchedulerCandidates() {
+          return (Array.isArray(this.schedulerCandidates) ? this.schedulerCandidates.slice() : []).sort((a, b) => {
+              const aTesting = a?.testing === true;
+              const bTesting = b?.testing === true;
+              if (aTesting !== bTesting) return aTesting ? -1 : 1;
+              const aLatency = Number(a?.latencyMs);
+              const bLatency = Number(b?.latencyMs);
+              const aFinite = Number.isFinite(aLatency);
+              const bFinite = Number.isFinite(bLatency);
+              if (aFinite && bFinite) return aLatency - bLatency;
+              if (aFinite) return -1;
+              if (bFinite) return 1;
+              return String(a?.ip || '').localeCompare(String(b?.ip || ''));
+          });
+      },
+
+      getSchedulerCandidateLineText(candidate) {
+          const line = String(candidate?.lineType || '').trim();
+          if (line) return line;
+          const family = String(candidate?.family || '').trim().toLowerCase();
+          return family === 'ipv6' ? 'ipv6' : '未知';
+      },
+
+      getSchedulerLatencyText(candidate) {
+          if (candidate?.testing === true) return '测速中...';
+          const latencyMs = Number(candidate?.latencyMs);
+          if (!Number.isFinite(latencyMs)) return '待测速';
+          if (latencyMs >= 9999) return '超时';
+          return Math.round(latencyMs) + ' ms';
+      },
+
+      getSchedulerLatencyTextClass(latencyMs, testing = false) {
+          if (testing === true) return 'text-brand-600 dark:text-brand-400';
+          const normalized = Number(latencyMs);
+          if (!Number.isFinite(normalized)) return 'text-slate-400';
+          if (normalized >= 9999) return 'text-red-500';
+          if (normalized <= 120) return 'text-emerald-600 dark:text-emerald-400';
+          if (normalized <= 300) return 'text-amber-600 dark:text-amber-400';
+          return 'text-slate-500';
+      },
+
+      getSchedulerFooterHint() {
+          const top = selectTopCandidatesForDns(this.schedulerCandidates);
+          if (!this.schedulerCurrentHost) return '当前站点未识别：可以继续拉取和测速，但暂时不能直接保存 DNS。';
+          if (!top.length) return '当前站点：' + this.schedulerCurrentHost + '。测速完成后可同步单条或 TOP3 到 DNS。';
+          return '当前站点：' + this.schedulerCurrentHost + '。当前符合阈值的 TOP 候选数：' + top.length + '。';
+      },
+
+      isSchedulerTopSaveDisabled() {
+          return this.schedulerSavePending || !this.schedulerCurrentHost || !selectTopCandidatesForDns(this.schedulerCandidates).length;
+      },
+
+      isSchedulerSingleSaveDisabled(candidate) {
+          return this.schedulerSavePending || !this.schedulerCurrentHost || !String(candidate?.ip || '').trim();
+      },
+
+      async probeSchedulerCandidate(ip) {
+          const target = String(ip || '').trim();
+          if (!target) return 9999;
+          const controller = new AbortController();
+          const startedAt = performance.now();
+          let timeoutId = null;
+          try {
+              timeoutId = setTimeout(() => controller.abort(), 2500);
+              await fetch('https://' + target + '/cdn-cgi/trace', {
+                  method: 'GET',
+                  mode: 'no-cors',
+                  cache: 'no-store',
+                  signal: controller.signal
+              });
+              return Math.max(1, Math.round(performance.now() - startedAt));
+          } catch {
+              return 9999;
+          } finally {
+              if (timeoutId !== null) clearTimeout(timeoutId);
+          }
+      },
+
+      async runSchedulerLatencyTests() {
+          const currentProbeSeq = (this.schedulerProbeSeq = Number(this.schedulerProbeSeq || 0) + 1);
+          const sourceItems = Array.isArray(this.schedulerCandidates) ? this.schedulerCandidates.slice() : [];
+          let finished = 0;
+          const concurrency = Math.min(6, Math.max(1, sourceItems.length));
+
+          this.schedulerCandidates = sourceItems.map(item => ({
+              ...item,
+              testing: true,
+              latencyMs: null
+          }));
+          if (!sourceItems.length) {
+              this.schedulerStatusText = '未获取到可测速的候选 IP。';
+              return;
+          }
+          this.schedulerTestingPending = true;
+          this.schedulerStatusText = '正在测速 0/' + sourceItems.length + ' ...';
+
+          let cursor = 0;
+          const runOne = async () => {
+              while (cursor < sourceItems.length) {
+                  const currentIndex = cursor;
+                  cursor += 1;
+                  const latencyMs = await this.probeSchedulerCandidate(sourceItems[currentIndex].ip);
+                  if (currentProbeSeq !== this.schedulerProbeSeq) return;
+                  const nextCandidates = this.schedulerCandidates.slice();
+                  nextCandidates[currentIndex] = {
+                      ...nextCandidates[currentIndex],
+                      testing: false,
+                      latencyMs,
+                      testedAt: new Date().toISOString()
+                  };
+                  this.schedulerCandidates = nextCandidates;
+                  finished += 1;
+                  this.schedulerStatusText = '正在测速 ' + finished + '/' + sourceItems.length + ' ...';
+              }
+          };
+
+          try {
+              await Promise.all(Array.from({ length: concurrency }, () => runOne()));
+              if (currentProbeSeq !== this.schedulerProbeSeq) return;
+              const top = selectTopCandidatesForDns(this.schedulerCandidates);
+              this.schedulerStatusText = top.length
+                ? ('测速完成：已筛出 ' + top.length + ' 个可直接写入 DNS 的候选。')
+                : '测速完成：暂无符合阈值的候选，可稍后重试或切换线路类型。';
+          } finally {
+              if (currentProbeSeq === this.schedulerProbeSeq) {
+                  this.schedulerTestingPending = false;
+                  this.schedulerCandidates = this.schedulerCandidates.map(item => ({ ...item, testing: false }));
+              }
+          }
+      },
+
+      async fetchSchedulerCandidates() {
+          if (this.schedulerFetchPending || this.schedulerTestingPending) return;
+          this.schedulerFetchPending = true;
+          this.schedulerStatusText = '正在拉取远程候选 IP ...';
+          try {
+              await this.loadSchedulerContext();
+              const res = await this.apiCall('listRemoteCandidateIps', { type: this.schedulerType });
+              this.schedulerCandidates = (Array.isArray(res.candidates) ? res.candidates : []).map(item => ({
+                  ...item,
+                  latencyMs: null,
+                  testing: false,
+                  testedAt: ''
+              }));
+              this.schedulerSourceSummary = Array.isArray(res.sourceSummary) ? res.sourceSummary : [];
+              if (!this.schedulerCandidates.length) {
+                  this.schedulerStatusText = '当前线路类型未返回候选 IP，请切换类型或稍后重试。';
+                  return;
+              }
+              this.schedulerStatusText = '已拉取 ' + this.schedulerCandidates.length + ' 个候选，开始浏览器侧测速。';
+              await this.runSchedulerLatencyTests();
+          } catch (e) {
+              this.schedulerCandidates = [];
+              this.schedulerSourceSummary = [];
+              this.schedulerStatusText = '拉取远程候选 IP 失败。';
+              this.showMessage('远程候选 IP 拉取失败: ' + (e?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.schedulerFetchPending = false;
+          }
+      },
+
+      buildSchedulerDnsRecords(candidates = []) {
+          return (Array.isArray(candidates) ? candidates : [])
+              .map(item => String(item?.ip || '').trim())
+              .filter(Boolean)
+              .map(ip => ({
+                  type: ip.includes(':') ? 'AAAA' : 'A',
+                  content: ip.replace(/^\[|\]$/g, '')
+              }));
+      },
+
+      async saveSchedulerCandidates(candidates = [], label = 'DNS') {
+          if (!this.schedulerCurrentHost) {
+              this.showMessage('当前站点未识别，暂时无法直接保存 DNS。', { tone: 'warning', modal: true });
+              return;
+          }
+          const records = this.buildSchedulerDnsRecords(candidates);
+          if (!records.length) {
+              this.showMessage('没有可写入 DNS 的候选记录。', { tone: 'warning' });
+              return;
+          }
+          const contentList = records.map(item => item.content);
+          const confirmText = '确定把当前站点 ' + this.schedulerCurrentHost + ' 更新为以下 ' + contentList.length + ' 条地址吗？\n' + contentList.join('\n');
+          if (!await this.askConfirm(confirmText, { title: '保存优选 DNS', tone: 'warning', confirmText: '保存' })) return;
+
+          this.schedulerSavePending = true;
+          try {
+              const res = await this.apiCall('saveDnsRecords', {
+                  host: this.schedulerCurrentHost,
+                  mode: 'a',
+                  records
+              });
+              this.applyDnsResponse(res);
+              this.applySchedulerDnsContext(res);
+              this.showMessage(label + ' 保存成功', { tone: 'success' });
+          } catch (e) {
+              this.showMessage(label + ' 保存失败: ' + (e?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.schedulerSavePending = false;
+          }
+      },
+
+      async saveSchedulerSingleCandidate(candidate) {
+          await this.saveSchedulerCandidates([candidate], '单条优选 DNS');
+      },
+
+      async saveSchedulerTopCandidates() {
+          const topCandidates = selectTopCandidatesForDns(this.schedulerCandidates);
+          if (!topCandidates.length) {
+              this.showMessage('当前没有符合阈值的 TOP 候选可写入 DNS。', { tone: 'warning' });
+              return;
+          }
+          await this.saveSchedulerCandidates(topCandidates, 'TOP3 优选 DNS');
+      },
+
+      async copySchedulerIpsForItdog() {
+          const ips = this.getSchedulerCandidates().map(item => String(item?.ip || '').replace(/^\[|\]$/g, '')).filter(Boolean);
+          if (!ips.length) {
+              this.showMessage('暂无可复制的候选 IP。', { tone: 'warning' });
+              return;
+          }
+          try {
+              await this.writeClipboard(ips.join('\n'));
+              this.showMessage('候选 IP 已复制，即将打开 ITDog。', { tone: 'success' });
+              window.open('https://www.itdog.cn/batch_tcping/', '_blank', 'noopener');
+          } catch (e) {
+              this.showMessage('复制失败: ' + (e?.message || '未知错误'), { tone: 'error' });
           }
       },
 
