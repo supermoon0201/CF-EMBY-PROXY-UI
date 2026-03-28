@@ -4766,6 +4766,12 @@ const Proxy = {
     if (requestTraits.isWsUpgrade) return "websocket";
     return "api";
   },
+  buildRequestLineStateKey(execution) {
+    const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (!nodeName) return "";
+    const requestCategory = this.classifyProxyLogCategory(execution?.requestTraits || {});
+    return requestCategory ? `${nodeName}|${requestCategory}` : nodeName;
+  },
   isPlaybackInfoRequest(proxyPath) {
     return /\/playbackinfo\b/i.test(String(proxyPath || ""));
   },
@@ -5674,7 +5680,7 @@ const Proxy = {
   async executeUpstreamFlow(execution, transport, buildFetchOptions) {
     const upstream = await this.fetchUpstreamWithRetryLoop({
       retryTargets: transport.retryTargets,
-      lineStateKey: execution.nodeName,
+      lineStateKey: this.buildRequestLineStateKey(execution),
       proxyPath: execution.proxyPath,
       requestUrl: execution.requestUrl,
       buildFetchOptions,

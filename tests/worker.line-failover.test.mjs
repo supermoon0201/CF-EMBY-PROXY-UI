@@ -84,3 +84,64 @@ test('multi-line failover rotates cursor and skips recently banned lines on late
   assert.equal(calls[2], 'https://c.example.com/emby/System/Info/Public');
   assert.equal(calls[3], 'https://b.example.com/emby/System/Info/Public');
 });
+
+test('line cursor does not let prior api requests reroute later image requests onto a different line', async (t) => {
+  const env = {
+    KV: createKvStore({
+      'node:demo-image': JSON.stringify({
+        target: 'https://a.example.com',
+        lines: [
+          { id: 'line-1', name: 'A', target: 'https://a.example.com' },
+          { id: 'line-2', name: 'B', target: 'https://b.example.com' }
+        ],
+        activeLineId: 'line-1'
+      })
+    }),
+    ADMIN_PATH: '/admin',
+    ADMIN_PASS: 'test-pass',
+    JWT_SECRET: 'test-secret',
+    __CONFIG_CACHE_NAMESPACE: `line-failover-image-${Date.now()}-${Math.random()}`
+  };
+  const ctx = { waitUntil() {} };
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    const url = request.url;
+    calls.push(url);
+
+    if (url === 'https://a.example.com/emby/System/Info/Public') {
+      return new Response('a-public-ok', { status: 200 });
+    }
+    if (url === 'https://b.example.com/emby/System/Info/Public') {
+      return new Response('b-public-ok', { status: 200 });
+    }
+    if (url === 'https://a.example.com/emby/Items/123/Images/Primary?tag=abc') {
+      return new Response('a-image-ok', {
+        status: 200,
+        headers: { 'Content-Type': 'image/jpeg' }
+      });
+    }
+    if (url === 'https://b.example.com/emby/Items/123/Images/Primary?tag=abc') {
+      return new Response('b-image-missing', { status: 404 });
+    }
+
+    throw new Error(`unexpected fetch url: ${url}`);
+  };
+
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const apiResponse = await worker.fetch(new Request('https://proxy.example.com/demo-image/emby/System/Info/Public'), env, ctx);
+  const imageResponse = await worker.fetch(new Request('https://proxy.example.com/demo-image/emby/Items/123/Images/Primary?tag=abc'), env, ctx);
+
+  assert.equal(apiResponse.status, 200);
+  assert.equal(imageResponse.status, 200);
+  assert.equal(await imageResponse.text(), 'a-image-ok');
+  assert.deepEqual(calls, [
+    'https://a.example.com/emby/System/Info/Public',
+    'https://a.example.com/emby/Items/123/Images/Primary?tag=abc'
+  ]);
+});
