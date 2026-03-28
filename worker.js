@@ -435,7 +435,11 @@ export function selectNodeCompatAutofixMode({ originalMode = "", stickyMargin = 
 }
 
 function scoreNodeCompatProbeResult(result, weight = 1) {
-  return result?.ok === true ? (Number(weight) || 0) : 0;
+  const safeWeight = Number(weight) || 0;
+  if (result?.ok === true) return safeWeight;
+  const status = Number(result?.status) || 0;
+  if (status === 401) return safeWeight * 0.25;
+  return 0;
 }
 
 async function buildInternalNodeCompatProbeHeaders(env, probeUrl, clientIp = "unknown") {
@@ -462,7 +466,8 @@ async function isTrustedInternalNodeCompatProbeRequest(request, env) {
 }
 
 function isNodeCompatProbeAcceptable(result) {
-  return result?.ok === true;
+  const status = Number(result?.status) || 0;
+  return result?.ok === true || status === 401;
 }
 
 async function probeNodeCompatAutofixPath({ env, ctx, nodeName, node, mode, requestUrl, clientIp, path, search = "" }) {

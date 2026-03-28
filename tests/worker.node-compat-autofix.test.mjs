@@ -69,7 +69,7 @@ function createEnv(kv, overrides = {}) {
   };
 }
 
-test('nodeCompatAutofix picks the mode with a successful media probe instead of treating 401 as usable', async () => {
+test('nodeCompatAutofix prefers a healthy media probe over auth-required-only probes', async () => {
   const kv = createFakeKvStore();
   await kv.put('node:demo', JSON.stringify({
     target: 'https://upstream.example.com',
@@ -141,12 +141,102 @@ test('nodeCompatAutofix picks the mode with a successful media probe instead of 
     assert.equal(payload.bestMode, 'realip_only');
     assert.equal(payload.changed, true);
 
+    const realipOnlyProbe = payload.tried.find(item => item.mode === 'realip_only');
     const offProbe = payload.tried.find(item => item.mode === 'off');
-    assert.equal(offProbe.pass, false);
+    assert.equal(realipOnlyProbe.pass, true);
+    assert.equal(offProbe.pass, true);
+    assert.ok(realipOnlyProbe.score > offProbe.score);
     assert.equal(offProbe.mediaProbe.status, 401);
     assert.equal(offProbe.mediaProbe2.status, 401);
 
     const persistedNode = JSON.parse(kv.dump()['node:demo']);
+    assert.equal(persistedNode.realClientIpMode, 'realip_only');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('nodeCompatAutofix falls back to auth-required media probes when anonymous media checks never return 2xx', async () => {
+  const kv = createFakeKvStore();
+  await kv.put('node:ask', JSON.stringify({
+    target: 'https://upstream.example.com',
+    lines: [
+      { id: 'line-1', name: 'Line 1', target: 'https://upstream.example.com' }
+    ],
+    activeLineId: 'line-1',
+    realClientIpMode: 'smart'
+  }));
+
+  const env = createEnv(kv);
+  const cookie = await loginAndGetCookie(env);
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    const url = new URL(request.url);
+    const xForwardedFor = request.headers.get('X-Forwarded-For');
+    const xRealIp = request.headers.get('X-Real-IP');
+    const mode = xForwardedFor ? 'dual' : (xRealIp ? 'realip_only' : 'off');
+
+    if (url.origin !== 'https://upstream.example.com') {
+      throw new Error(`Unexpected fetch origin: ${url.origin}`);
+    }
+
+    if (url.pathname === '/System/Info/Public') {
+      return new Response(JSON.stringify({ ok: mode !== 'dual', mode }), {
+        status: mode === 'dual' ? 403 : 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (url.pathname === '/Items' && url.search === '?Limit=1&StartIndex=0') {
+      return new Response(JSON.stringify({ ok: false, mode }), {
+        status: mode === 'dual' ? 403 : 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (url.pathname === '/Items/Latest' && url.search === '?Limit=1') {
+      return new Response(JSON.stringify({ ok: false, mode }), {
+        status: mode === 'dual' ? 403 : 404,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    throw new Error(`Unexpected fetch target: ${url.pathname}${url.search}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request('https://example.com/admin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookie
+        },
+        body: JSON.stringify({ action: 'nodeCompatAutofix', name: 'ask' })
+      }),
+      env,
+      { waitUntil() {} }
+    );
+
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.ok, true);
+    assert.equal(payload.mode, 'realip_only');
+    assert.equal(payload.bestMode, 'realip_only');
+    assert.equal(payload.changed, true);
+
+    const realipOnlyProbe = payload.tried.find(item => item.mode === 'realip_only');
+    const offProbe = payload.tried.find(item => item.mode === 'off');
+    const dualProbe = payload.tried.find(item => item.mode === 'dual');
+    assert.equal(realipOnlyProbe.pass, true);
+    assert.equal(offProbe.pass, true);
+    assert.equal(dualProbe.pass, false);
+    assert.equal(realipOnlyProbe.mediaProbe.status, 401);
+    assert.equal(realipOnlyProbe.mediaProbe2.status, 404);
+
+    const persistedNode = JSON.parse(kv.dump()['node:ask']);
     assert.equal(persistedNode.realClientIpMode, 'realip_only');
   } finally {
     globalThis.fetch = originalFetch;
