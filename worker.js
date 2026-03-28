@@ -2113,14 +2113,22 @@ const CacheManager = {
     let nodeNames = GLOBALS.NodesIndexCache?.exp > nowMs() ? GLOBALS.NodesIndexCache.data : null;
     if (!nodeNames) {
       try {
-        nodeNames = await kv.get(Database.NODES_INDEX_KEY, { type: "json" });
-        if (Array.isArray(nodeNames)) GLOBALS.NodesIndexCache = { data: nodeNames, exp: nowMs() + 60000 };
+        const storedIndex = await kv.get(Database.NODES_INDEX_KEY, { type: "json" });
+        if (Array.isArray(storedIndex)) {
+          nodeNames = Database.normalizeNodeIndex(storedIndex);
+          GLOBALS.NodesIndexCache = { data: nodeNames, exp: nowMs() + 60000 };
+          if (nodeNames.length !== storedIndex.length) {
+            const persistTask = kv.put(Database.NODES_INDEX_KEY, JSON.stringify(nodeNames)).catch(() => {});
+            if (ctx) ctx.waitUntil(persistTask);
+            else await persistTask;
+          }
+        }
       } catch (e) {}
     }
     if (!nodeNames || !Array.isArray(nodeNames)) {
       try {
         const list = await kv.list({ prefix: "node:" });
-        nodeNames = list.keys.map(k => k.name.replace("node:", ""));
+        nodeNames = Database.normalizeNodeIndex(list.keys.map(k => k.name.replace("node:", "")));
         if (ctx && nodeNames.length > 0) ctx.waitUntil(kv.put(Database.NODES_INDEX_KEY, JSON.stringify(nodeNames)));
         GLOBALS.NodesIndexCache = { data: nodeNames, exp: nowMs() + 60000 };
       } catch (e) { return []; }
@@ -2141,7 +2149,13 @@ const CacheManager = {
         return { name, ...normalized };
       } catch { return null; }
     });
-    const validNodes = nodes.filter(Boolean);
+    const seenNodeKeys = new Set();
+    const validNodes = nodes.filter(Boolean).filter(node => {
+      const nodeKey = String(node?.name || "").toLowerCase().trim();
+      if (!nodeKey || seenNodeKeys.has(nodeKey)) return false;
+      seenNodeKeys.add(nodeKey);
+      return true;
+    });
     GLOBALS.NodesListCache = { data: validNodes, exp: nowMs() + 60000 };
     return validNodes;
   },
@@ -9366,9 +9380,16 @@ const UI_HTML = `<!DOCTYPE html>
         };
       },
       normalizeNodeCollection(nodes = []) {
+        const seenNodeKeys = new Set();
         return (Array.isArray(nodes) ? nodes : [])
           .map(node => this.hydrateNode(node))
-          .filter(node => node && typeof node === 'object' && this.normalizeNodeKey(node?.name))
+          .filter(node => {
+            if (!node || typeof node !== 'object') return false;
+            const nodeKey = this.normalizeNodeKey(node?.name);
+            if (!nodeKey || seenNodeKeys.has(nodeKey)) return false;
+            seenNodeKeys.add(nodeKey);
+            return true;
+          })
           .sort((left, right) => {
             const leftLabel = String(left?.displayName || left?.name || '');
             const rightLabel = String(right?.displayName || right?.name || '');
@@ -11810,6 +11831,8 @@ const UI_HTML = `<!DOCTYPE html>
     let autoAnimateLoader = null;
     const autoAnimateControllers = new WeakMap();
     const lucideDirectiveTokens = new WeakMap();
+    let lucideIconsSource = null;
+    let lucideIconsLookup = null;
     const trafficChartInstances = new WeakMap();
     const trafficChartSignatures = new WeakMap();
     const nodeLinesDragDirectiveStates = new WeakMap();
@@ -11852,6 +11875,23 @@ const UI_HTML = `<!DOCTYPE html>
         if (lucideDirectiveTokens.get(element) !== token) return;
         uiBrowserBridge.renderLucideIcons({ root: element });
       });
+    }
+
+    function normalizeLucideLookupKey(value = '') {
+      return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    }
+
+    function resolveLucideIconNode(iconName = '') {
+      const iconsSource = window?.lucide?.icons;
+      if (!iconsSource || typeof iconsSource !== 'object') return null;
+      if (lucideIconsSource !== iconsSource || !lucideIconsLookup) {
+        lucideIconsSource = iconsSource;
+        lucideIconsLookup = new Map();
+        Object.entries(iconsSource).forEach(([key, iconNode]) => {
+          lucideIconsLookup.set(normalizeLucideLookupKey(key), iconNode);
+        });
+      }
+      return lucideIconsLookup.get(normalizeLucideLookupKey(iconName)) || null;
     }
 
     function normalizeTrafficChartSeries(series) {
@@ -11975,6 +12015,32 @@ const UI_HTML = `<!DOCTYPE html>
     const uiBrowserBridge = {
       renderLucideIcons(opts = {}) {
         if (typeof window?.lucide === 'undefined') return;
+        const root = opts?.root && typeof opts.root.querySelectorAll === 'function' ? opts.root : document;
+        const createElement = typeof window?.lucide?.createElement === 'function'
+          ? window.lucide.createElement
+          : null;
+        if (createElement) {
+          root.querySelectorAll('[data-lucide]').forEach(element => {
+            if (!element || element.namespaceURI === 'http://www.w3.org/2000/svg') return;
+            const iconName = String(element.getAttribute('data-lucide') || '').trim();
+            const iconNode = resolveLucideIconNode(iconName);
+            if (!iconName || !iconNode) return;
+            try {
+              const svgElement = createElement(iconNode);
+              if (!svgElement) return;
+              svgElement.setAttribute('data-lucide', iconName);
+              svgElement.setAttribute('aria-hidden', 'true');
+              svgElement.setAttribute('focusable', 'false');
+              svgElement.setAttribute('width', '100%');
+              svgElement.setAttribute('height', '100%');
+              svgElement.classList.add('w-full', 'h-full');
+              element.replaceChildren(svgElement);
+            } catch (error) {
+              console.error('lucide.createElement failed', error);
+            }
+          });
+          return;
+        }
         try {
           window.lucide.createIcons(opts);
         } catch (error) {
