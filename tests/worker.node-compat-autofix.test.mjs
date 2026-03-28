@@ -232,11 +232,92 @@ test('nodeCompatAutofix falls back to auth-required media probes when anonymous 
     const dualProbe = payload.tried.find(item => item.mode === 'dual');
     assert.equal(realipOnlyProbe.pass, true);
     assert.equal(offProbe.pass, true);
-    assert.equal(dualProbe.pass, false);
+    assert.equal(dualProbe.pass, true);
     assert.equal(realipOnlyProbe.mediaProbe.status, 401);
     assert.equal(realipOnlyProbe.mediaProbe2.status, 404);
 
     const persistedNode = JSON.parse(kv.dump()['node:ask']);
+    assert.equal(persistedNode.realClientIpMode, 'realip_only');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('nodeCompatAutofix treats non-WAF 403 probes as usable compatibility signals', async () => {
+  const kv = createFakeKvStore();
+  await kv.put('node:acl', JSON.stringify({
+    target: 'https://upstream.example.com',
+    lines: [
+      { id: 'line-1', name: 'Line 1', target: 'https://upstream.example.com' }
+    ],
+    activeLineId: 'line-1',
+    realClientIpMode: 'smart'
+  }));
+
+  const env = createEnv(kv);
+  const cookie = await loginAndGetCookie(env);
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    const url = new URL(request.url);
+    const xForwardedFor = request.headers.get('X-Forwarded-For');
+    const xRealIp = request.headers.get('X-Real-IP');
+    const mode = xForwardedFor ? 'dual' : (xRealIp ? 'realip_only' : 'off');
+
+    if (url.origin !== 'https://upstream.example.com') {
+      throw new Error(`Unexpected fetch origin: ${url.origin}`);
+    }
+
+    if (url.pathname === '/System/Info/Public') {
+      return new Response(JSON.stringify({ ok: false, mode, reason: 'acl-policy' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (url.pathname === '/Items' && url.search === '?Limit=1&StartIndex=0') {
+      return new Response(JSON.stringify({ ok: false, mode, reason: 'acl-policy' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (url.pathname === '/Items/Latest' && url.search === '?Limit=1') {
+      return new Response(JSON.stringify({ ok: false, mode, reason: 'acl-policy' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    throw new Error(`Unexpected fetch target: ${url.pathname}${url.search}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request('https://example.com/admin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: cookie
+        },
+        body: JSON.stringify({ action: 'nodeCompatAutofix', name: 'acl' })
+      }),
+      env,
+      { waitUntil() {} }
+    );
+
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.ok, true);
+    assert.equal(payload.mode, 'realip_only');
+    assert.equal(payload.bestMode, 'realip_only');
+    assert.equal(payload.changed, true);
+    assert.equal(payload.tried.every(item => item.pass === true), true);
+    assert.equal(payload.tried.every(item => item.publicProbe.status === 403), true);
+    assert.equal(payload.tried.every(item => item.publicProbe.wafHit === false), true);
+
+    const persistedNode = JSON.parse(kv.dump()['node:acl']);
     assert.equal(persistedNode.realClientIpMode, 'realip_only');
   } finally {
     globalThis.fetch = originalFetch;

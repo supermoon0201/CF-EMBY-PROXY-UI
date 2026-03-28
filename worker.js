@@ -436,10 +436,29 @@ export function selectNodeCompatAutofixMode({ originalMode = "", stickyMargin = 
 
 function scoreNodeCompatProbeResult(result, weight = 1) {
   const safeWeight = Number(weight) || 0;
-  if (result?.ok === true) return safeWeight;
+  if (result?.wafHit === true) return safeWeight * -4;
   const status = Number(result?.status) || 0;
+  if (status >= 500) return safeWeight * -1.6;
+  if (status === 403 && result?.wafHit !== true) return safeWeight * -0.3;
   if (status === 401) return safeWeight * 0.25;
-  return 0;
+  if (status >= 200 && status < 400) return safeWeight;
+  return safeWeight * -0.6;
+}
+
+const NODE_COMPAT_PROBE_WAF_MARKERS = [
+  "openresty",
+  "cf-chl",
+  "captcha",
+  "/cdn-cgi/challenge",
+  "attention required"
+];
+
+function isLikelyWafBlockedProbeResponse(status = 0, bodyText = "") {
+  const code = Number(status) || 0;
+  if (code !== 403) return false;
+  const sample = String(bodyText || "").slice(0, 1500).toLowerCase();
+  if (!sample) return false;
+  return NODE_COMPAT_PROBE_WAF_MARKERS.some(marker => sample.includes(marker));
 }
 
 async function buildInternalNodeCompatProbeHeaders(env, probeUrl, clientIp = "unknown") {
@@ -484,25 +503,47 @@ async function probeNodeCompatAutofixPath({ env, ctx, nodeName, node, mode, requ
     __NODE_COMPAT_PROBE_MODE: normalizeNodeRealClientIpMode(mode),
     __NODE_COMPAT_PROBE_NAME: encodedName
   };
-  const response = await handleWorkerFetch(
-    new Request(probeUrl.toString(), {
-      method: "GET",
-      headers: {
-        "CF-Connecting-IP": String(clientIp || "unknown"),
-        "Accept": "application/json",
-        ...probeHeaders
-      }
-    }),
-    probeEnv,
-    ctx
-  );
-
-  return {
-    ok: response.ok,
-    status: response.status,
-    url: probeUrl.toString(),
-    path: `${sanitizeProxyPath(path || "/")}${search || ""}`
-  };
+  const startedAt = Date.now();
+  try {
+    const response = await handleWorkerFetch(
+      new Request(probeUrl.toString(), {
+        method: "GET",
+        headers: {
+          "CF-Connecting-IP": String(clientIp || "unknown"),
+          "Accept": "application/json",
+          ...probeHeaders
+        }
+      }),
+      probeEnv,
+      ctx
+    );
+    const status = Number(response.status) || 0;
+    let wafHit = false;
+    if (status === 403) {
+      const sample = await response.clone().text().catch(() => "");
+      wafHit = isLikelyWafBlockedProbeResponse(status, sample);
+    }
+    const acceptable = response.ok === true || status === 401 || (status === 403 && !wafHit);
+    return {
+      ok: acceptable,
+      status,
+      rt: Date.now() - startedAt,
+      wafHit,
+      error: wafHit ? "WAF_BLOCK" : "",
+      url: probeUrl.toString(),
+      path: `${sanitizeProxyPath(path || "/")}${search || ""}`
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      rt: Date.now() - startedAt,
+      wafHit: false,
+      error: error?.name === "AbortError" ? "TIMEOUT" : String(error?.message || "CHECK_FAIL"),
+      url: probeUrl.toString(),
+      path: `${sanitizeProxyPath(path || "/")}${search || ""}`
+    };
+  }
 }
 
 async function probeNodeCompatAutofixMode({ env, ctx, nodeName, node, mode, requestUrl, clientIp }) {
