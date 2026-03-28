@@ -151,6 +151,8 @@ const GLOBALS = {
   LogFlushTask: null,
   LogClearEpochMs: 0,
   LogLastFlushAt: 0,
+  LineCursor: new Map(),
+  LineBan: new Map(),
   OpsStatusWriteChain: Promise.resolve(),
   OpsStatusDbReady: new WeakMap(),
   InitCheckWarnedFingerprints: new Set(),
@@ -173,7 +175,8 @@ const GLOBALS = {
   DropRequestHeaders: new Set([
     "host", "x-real-ip", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded",
     "connection", "upgrade", "transfer-encoding", "te", "keep-alive",
-    "proxy-authorization", "proxy-authenticate", "trailer", "expect"
+    "proxy-authorization", "proxy-authenticate", "trailer", "expect",
+    "x-internal-node-compat-probe", "x-internal-node-compat-probe-signature"
   ]),
   DropResponseHeaders: new Set([
     "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-allow-credentials",
@@ -181,6 +184,10 @@ const GLOBALS = {
     "x-powered-by", "server" 
   ])
 };
+
+const INTERNAL_NODE_COMPAT_PROBE_SCOPE = "node-compat-autofix";
+const INTERNAL_NODE_COMPAT_PROBE_HEADER = "x-internal-node-compat-probe";
+const INTERNAL_NODE_COMPAT_PROBE_SIGNATURE_HEADER = "x-internal-node-compat-probe-signature";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -242,6 +249,14 @@ function sanitizeProxyPath(path) {
   if (!raw.startsWith("/")) raw = "/" + raw;
   raw = raw.replace(/^\/+/, "/");
   return raw;
+}
+
+function getRequestClientIp(request) {
+  const forwarded = String(request?.headers?.get("x-forwarded-for") || "").split(",")[0].trim();
+  return request?.headers?.get("cf-connecting-ip")
+    || request?.headers?.get("x-real-ip")
+    || forwarded
+    || "unknown";
 }
 
 function normalizeAdminPath(value) {
@@ -419,6 +434,122 @@ export function selectNodeCompatAutofixMode({ originalMode = "", stickyMargin = 
   return { mode: best.mode, bestMode: best.mode, changed: best.mode !== normalizedOriginal };
 }
 
+function scoreNodeCompatProbeResult(result, weight = 1) {
+  return result?.ok === true ? (Number(weight) || 0) : 0;
+}
+
+async function buildInternalNodeCompatProbeHeaders(env, probeUrl, clientIp = "unknown") {
+  const url = probeUrl instanceof URL ? probeUrl : new URL(String(probeUrl || ""));
+  const normalizedClientIp = String(clientIp || "unknown").trim() || "unknown";
+  const payload = `${INTERNAL_NODE_COMPAT_PROBE_SCOPE}:${url.pathname}:${url.search}:${normalizedClientIp}`;
+  const signature = env?.JWT_SECRET
+    ? await Auth.sign(env.JWT_SECRET, payload)
+    : "";
+  return {
+    [INTERNAL_NODE_COMPAT_PROBE_HEADER]: INTERNAL_NODE_COMPAT_PROBE_SCOPE,
+    [INTERNAL_NODE_COMPAT_PROBE_SIGNATURE_HEADER]: signature
+  };
+}
+
+async function isTrustedInternalNodeCompatProbeRequest(request, env) {
+  const scope = String(request?.headers?.get(INTERNAL_NODE_COMPAT_PROBE_HEADER) || "").trim();
+  const signature = String(request?.headers?.get(INTERNAL_NODE_COMPAT_PROBE_SIGNATURE_HEADER) || "").trim();
+  if (scope !== INTERNAL_NODE_COMPAT_PROBE_SCOPE || !signature || !env?.JWT_SECRET) return false;
+  const requestUrl = new URL(request.url);
+  const clientIp = getRequestClientIp(request);
+  const payload = `${INTERNAL_NODE_COMPAT_PROBE_SCOPE}:${requestUrl.pathname}:${requestUrl.search}:${clientIp}`;
+  return signature === await Auth.sign(env.JWT_SECRET, payload);
+}
+
+function isNodeCompatProbeAcceptable(result) {
+  return result?.ok === true;
+}
+
+async function probeNodeCompatAutofixPath({ env, ctx, nodeName, node, mode, requestUrl, clientIp, path, search = "" }) {
+  const probeUrl = new URL(requestUrl.origin);
+  const encodedName = encodeURIComponent(String(nodeName || "").trim().toLowerCase());
+  const encodedSecret = node?.secret ? `${encodeURIComponent(String(node.secret))}/` : "";
+  probeUrl.pathname = `/${encodedName}/${encodedSecret}`;
+  probeUrl.pathname += String(path || "").replace(/^\/+/, "");
+  probeUrl.search = String(search || "");
+
+  const probeHeaders = await buildInternalNodeCompatProbeHeaders(env, probeUrl, clientIp);
+  const probeEnv = {
+    ...env,
+    __NODE_COMPAT_PROBE_MODE: normalizeNodeRealClientIpMode(mode),
+    __NODE_COMPAT_PROBE_NAME: encodedName
+  };
+  const response = await handleWorkerFetch(
+    new Request(probeUrl.toString(), {
+      method: "GET",
+      headers: {
+        "CF-Connecting-IP": String(clientIp || "unknown"),
+        "Accept": "application/json",
+        ...probeHeaders
+      }
+    }),
+    probeEnv,
+    ctx
+  );
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    url: probeUrl.toString(),
+    path: `${sanitizeProxyPath(path || "/")}${search || ""}`
+  };
+}
+
+async function probeNodeCompatAutofixMode({ env, ctx, nodeName, node, mode, requestUrl, clientIp }) {
+  const publicProbe = await probeNodeCompatAutofixPath({
+    env,
+    ctx,
+    nodeName,
+    node,
+    mode,
+    requestUrl,
+    clientIp,
+    path: "/System/Info/Public"
+  });
+  const mediaProbe = await probeNodeCompatAutofixPath({
+    env,
+    ctx,
+    nodeName,
+    node,
+    mode,
+    requestUrl,
+    clientIp,
+    path: "/Items",
+    search: "?Limit=1&StartIndex=0"
+  });
+  const mediaProbe2 = await probeNodeCompatAutofixPath({
+    env,
+    ctx,
+    nodeName,
+    node,
+    mode,
+    requestUrl,
+    clientIp,
+    path: "/Items/Latest",
+    search: "?Limit=1"
+  });
+  const pass = publicProbe.ok === true && (
+    isNodeCompatProbeAcceptable(mediaProbe)
+    || isNodeCompatProbeAcceptable(mediaProbe2)
+  );
+  const score = scoreNodeCompatProbeResult(publicProbe, 1)
+    + scoreNodeCompatProbeResult(mediaProbe, 2)
+    + scoreNodeCompatProbeResult(mediaProbe2, 2);
+
+  return {
+    mode: normalizeNodeRealClientIpMode(mode),
+    pass,
+    score,
+    publicProbe,
+    mediaProbe,
+    mediaProbe2
+  };
+}
 export function shouldBanUpstreamLine(status = 0, error = null) {
   if (error) return true;
   const code = Number(status) || 0;
@@ -439,6 +570,54 @@ export function advanceLineCursor(currentIndex = 0, total = 0) {
   return ((safeCurrent + 1) % safeTotal + safeTotal) % safeTotal;
 }
 
+function buildLineStateKey(nodeName = "") {
+  return String(nodeName || "").trim().toLowerCase();
+}
+
+function buildLineBanKey(lineStateKey = "", targetBase = "") {
+  return `${buildLineStateKey(lineStateKey)}|${String(targetBase || "").trim()}`;
+}
+
+function getRetryTargetKey(targetBase = "") {
+  return targetBase instanceof URL ? targetBase.toString() : String(targetBase || "").trim();
+}
+
+function readLineCursor(lineStateKey = "", total = 0) {
+  const safeTotal = Math.floor(Number(total) || 0);
+  if (safeTotal <= 0) return 0;
+  const current = Math.floor(Number(GLOBALS.LineCursor.get(buildLineStateKey(lineStateKey))) || 0);
+  return ((current % safeTotal) + safeTotal) % safeTotal;
+}
+
+function isLineCurrentlyBanned(lineStateKey = "", targetBase = "", nowValue = Date.now()) {
+  const banKey = buildLineBanKey(lineStateKey, getRetryTargetKey(targetBase));
+  const entry = GLOBALS.LineBan.get(banKey);
+  const exp = Number(entry?.exp ?? entry ?? 0);
+  if (!exp || exp <= Number(nowValue) || 0) {
+    if (entry) GLOBALS.LineBan.delete(banKey);
+    return false;
+  }
+  return true;
+}
+
+function banLineTarget(lineStateKey = "", targetBase = "", ttlMs = 60000, nowValue = Date.now()) {
+  const safeKey = buildLineStateKey(lineStateKey);
+  const targetKey = getRetryTargetKey(targetBase);
+  if (!safeKey || !targetKey) return;
+  GLOBALS.LineBan.set(buildLineBanKey(safeKey, targetKey), {
+    exp: (Number(nowValue) || Date.now()) + Math.max(1000, Number(ttlMs) || 60000)
+  });
+}
+
+function orderRetryTargetsWithLineState(lineStateKey = "", retryTargets = [], nowValue = Date.now()) {
+  const targets = Array.isArray(retryTargets) ? retryTargets.slice() : [];
+  if (targets.length <= 1) return targets;
+  const safeLineStateKey = buildLineStateKey(lineStateKey);
+  if (!safeLineStateKey) return targets;
+  const rotatedTargets = buildRotatedRetryTargets(targets, readLineCursor(safeLineStateKey, targets.length));
+  const allowedTargets = rotatedTargets.filter(targetBase => !isLineCurrentlyBanned(safeLineStateKey, targetBase, nowValue));
+  return allowedTargets.length ? allowedTargets : rotatedTargets;
+}
 // 保留节点 target 自带的子路径，避免 /node/foo 被错误拼到源站根目录。
 function buildUpstreamProxyUrl(targetBase, proxyPath = "/") {
   const baseUrl = targetBase instanceof URL ? new URL(targetBase.toString()) : new URL(String(targetBase || ""));
@@ -3927,9 +4106,9 @@ const Database = {
     },
 
     async pingNode(data, { env, ctx }) {
-        const currentConfig = await getRuntimeConfig(env);
-        const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? Config.Defaults.PingTimeoutMs, 1000, 180000);
-        const forceRefresh = data.forceRefresh === true;
+      const currentConfig = await getRuntimeConfig(env);
+      const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? Config.Defaults.PingTimeoutMs, 1000, 180000);
+      const forceRefresh = data.forceRefresh === true;
 
         if (data.target) {
           const normalizedTarget = Database.normalizeSingleTarget(data.target);
@@ -4009,6 +4188,64 @@ const Database = {
           line: matchedLine || null,
           node: { name: nodeName.toLowerCase(), ...normalizedNode }
         });
+    },
+
+    async nodeCompatAutofix(data, { env, ctx, kv, request }) {
+      const nodeName = String(data?.name || "").trim().toLowerCase();
+      if (!nodeName) return jsonError("MISSING_PARAMS", "name 不能为空");
+
+      const node = await Database.getNode(nodeName, env, ctx);
+      if (!node) return jsonError("NOT_FOUND", "节点不存在", 404, { name: nodeName });
+
+      const originalMode = normalizeNodeRealClientIpMode(node.realClientIpMode);
+      const routeRequestUrl = new URL(request.url);
+      const clientIp = getRequestClientIp(request);
+      const tried = [];
+      for (const mode of buildNodeCompatAutofixCandidateModes(originalMode)) {
+        tried.push(await probeNodeCompatAutofixMode({
+          env,
+          ctx,
+          nodeName,
+          node,
+          mode,
+          requestUrl: routeRequestUrl,
+          clientIp
+        }));
+      }
+
+      const selected = selectNodeCompatAutofixMode({
+        originalMode,
+        stickyMargin: 0.15,
+        tried
+      });
+      if (!selected.bestMode) {
+        return jsonError("NODE_COMPAT_AUTOFIX_FAILED", "自动修复未找到可用兼容模式", 400, { tried });
+      }
+
+      const bestScore = tried
+        .filter(item => normalizeNodeRealClientIpMode(item?.mode) === selected.bestMode)
+        .reduce((max, item) => Math.max(max, Number(item?.score) || 0), Number.NEGATIVE_INFINITY);
+
+      if (selected.changed) {
+        const updatedNode = Database.normalizeNode(nodeName, {
+          ...node,
+          realClientIpMode: selected.mode,
+          updatedAt: new Date().toISOString()
+        }).data;
+        await kv.put(`${Database.PREFIX}${nodeName}`, JSON.stringify(updatedNode));
+        Database.invalidateNodeCaches(nodeName, { invalidateList: true });
+      }
+
+      return jsonResponse({
+        ok: true,
+        name: nodeName,
+        mode: selected.mode,
+        bestMode: selected.bestMode,
+        bestScore: Number.isFinite(bestScore) ? bestScore : 0,
+        originalMode,
+        changed: selected.changed,
+        tried
+      });
     },
 
     async getLogs(data, { db, env }) {
@@ -4803,14 +5040,15 @@ const Proxy = {
   async fetchUpstreamWithRetryLoop(state) {
     let lastError = null;
     let lastResponse = null;
-    let lastBase = state.retryTargets[0];
+    const orderedTargets = orderRetryTargetsWithLineState(state.lineStateKey, state.retryTargets, Date.now());
+    let lastBase = orderedTargets[0];
     let lastFinalUrl = buildUpstreamProxyUrl(lastBase, state.proxyPath);
     lastFinalUrl.search = state.requestUrl.search;
 
     const totalPasses = Math.max(1, clampIntegerConfig(state.maxExtraAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3) + 1);
     for (let pass = 0; pass < totalPasses; pass++) {
-      for (let index = 0; index < state.retryTargets.length; index++) {
-        const targetBase = state.retryTargets[index];
+      for (let index = 0; index < orderedTargets.length; index++) {
+        const targetBase = orderedTargets[index];
         lastBase = targetBase;
         const effectiveRetry = state.isRetry === true || pass > 0;
         try {
@@ -4825,6 +5063,12 @@ const Proxy = {
           const response = upstream.response;
 
           if (response.status === 101) {
+            if (state.lineStateKey && state.retryTargets?.length > 1) {
+              const originalIndex = state.retryTargets.findIndex(item => getRetryTargetKey(item) === getRetryTargetKey(targetBase));
+              if (originalIndex >= 0) {
+                GLOBALS.LineCursor.set(buildLineStateKey(state.lineStateKey), advanceLineCursor(originalIndex, state.retryTargets.length));
+              }
+            }
             return upstream;
           }
 
@@ -4833,8 +5077,16 @@ const Proxy = {
             return await this.fetchUpstreamWithRetryLoop({ ...state, isRetry: true, protocolFallbackRetry: true });
           }
 
-          const isLastTarget = index === state.retryTargets.length - 1;
+          const isLastTarget = index === orderedTargets.length - 1;
           const isLastPass = pass === totalPasses - 1;
+          if (response.ok && state.lineStateKey && state.retryTargets?.length > 1) {
+            const originalIndex = state.retryTargets.findIndex(item => getRetryTargetKey(item) === getRetryTargetKey(targetBase));
+            if (originalIndex >= 0) {
+              GLOBALS.LineCursor.set(buildLineStateKey(state.lineStateKey), advanceLineCursor(originalIndex, state.retryTargets.length));
+            }
+          } else if (shouldBanUpstreamLine(response.status, null)) {
+            banLineTarget(state.lineStateKey, targetBase, 60000, Date.now());
+          }
           if (state.allowAutomaticRetry !== true || !state.retryableStatuses.has(response.status) || (isLastTarget && isLastPass)) {
             return upstream;
           }
@@ -4845,7 +5097,8 @@ const Proxy = {
           lastResponse = response;
         } catch (error) {
           lastError = error;
-          const isLastTarget = index === state.retryTargets.length - 1;
+          banLineTarget(state.lineStateKey, targetBase, 60000, Date.now());
+          const isLastTarget = index === orderedTargets.length - 1;
           const isLastPass = pass === totalPasses - 1;
           if (isLastTarget && isLastPass) throw error;
         }
@@ -4856,6 +5109,7 @@ const Proxy = {
     throw lastError || new Error("upstream_fetch_failed");
   },
   recordAccessLog(execution, payload = {}) {
+    if (execution.internalCompatProbe === true) return;
     Logger.record(execution.env, execution.ctx, {
       nodeName: execution.nodeName,
       requestPath: execution.proxyPath,
@@ -4885,8 +5139,9 @@ const Proxy = {
     const currentConfig = await getRuntimeConfig(env);
     const requestUrl = options.requestUrl || new URL(request.url);
     const proxyPath = sanitizeProxyPath(path);
-    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
+    const clientIp = getRequestClientIp(request);
     const country = request.cf?.country || "UNKNOWN";
+    const internalCompatProbe = await isTrustedInternalNodeCompatProbeRequest(request, env);
     const finalOrigin = this.resolveCorsOrigin(currentConfig, request);
     const dynamicCors = getCorsHeadersForResponse(env, request, finalOrigin);
     const nodeDirectSource = isNodeDirectSourceEnabled(node, currentConfig);
@@ -4922,6 +5177,7 @@ const Proxy = {
       proxyPath,
       clientIp,
       country,
+      internalCompatProbe,
       finalOrigin,
       dynamicCors,
       requestTraits,
@@ -4971,22 +5227,24 @@ const Proxy = {
       return this.buildOptionsResponse(execution);
     }
 
-    const blockedResponse = this.evaluateFirewall(
-      execution.currentConfig,
-      execution.clientIp,
-      execution.country,
-      execution.finalOrigin
-    );
-    if (blockedResponse) return blockedResponse;
+    if (execution.internalCompatProbe !== true) {
+      const blockedResponse = this.evaluateFirewall(
+        execution.currentConfig,
+        execution.clientIp,
+        execution.country,
+        execution.finalOrigin
+      );
+      if (blockedResponse) return blockedResponse;
 
-    const rateLimitResponse = this.applyRateLimit(
-      execution.currentConfig,
-      execution.clientIp,
-      execution.requestTraits,
-      execution.startTime,
-      execution.finalOrigin
-    );
-    if (rateLimitResponse) return rateLimitResponse;
+      const rateLimitResponse = this.applyRateLimit(
+        execution.currentConfig,
+        execution.clientIp,
+        execution.requestTraits,
+        execution.startTime,
+        execution.finalOrigin
+      );
+      if (rateLimitResponse) return rateLimitResponse;
+    }
 
     return await this.tryServeMetadataCache(execution);
   },
@@ -5416,6 +5674,7 @@ const Proxy = {
   async executeUpstreamFlow(execution, transport, buildFetchOptions) {
     const upstream = await this.fetchUpstreamWithRetryLoop({
       retryTargets: transport.retryTargets,
+      lineStateKey: execution.nodeName,
       proxyPath: execution.proxyPath,
       requestUrl: execution.requestUrl,
       buildFetchOptions,
@@ -6180,6 +6439,10 @@ const UI_HTML = `<!DOCTYPE html>
         <div class="flex gap-2">
           <button type="button" :disabled="pingPending" class="px-3 border border-emerald-200 dark:border-emerald-800/50 text-emerald-600 dark:text-emerald-400 rounded-xl hover:bg-emerald-50 dark:hover:bg-emerald-900/30 transition flex items-center justify-center flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed" title="测试当前启用线路" @click="pingNode">
             <i v-if="!pingPending" data-lucide="activity" class="w-4 h-4"></i>
+            <i v-else data-lucide="loader" class="w-4 h-4 animate-spin"></i>
+          </button>
+          <button type="button" :disabled="compatAutofixPending" class="px-3 border border-amber-200 dark:border-amber-800/50 text-amber-600 dark:text-amber-400 rounded-xl hover:bg-amber-50 dark:hover:bg-amber-900/30 transition flex items-center justify-center flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed" title="自动修复兼容模式" @click="autofixCompat">
+            <i v-if="!compatAutofixPending" data-lucide="wand-sparkles" class="w-4 h-4"></i>
             <i v-else data-lucide="loader" class="w-4 h-4 animate-spin"></i>
           </button>
           <copy-button :text="link" label="复制"></copy-button>
@@ -7842,6 +8105,7 @@ const UI_HTML = `<!DOCTYPE html>
         nodeHealth: {},
         nodesHealthCheckPending: false,
         nodePingPending: {},
+        nodeCompatAutofixPending: {},
         nodeMutationSeq: 0,
         nodeMutationVersion: {},
         pageLoadSeq: 0,
@@ -10062,11 +10326,25 @@ const UI_HTML = `<!DOCTYPE html>
           return this.nodePingPending?.[key] === true;
       },
 
+      isNodeCompatAutofixPending(name) {
+          const key = this.normalizeNodeKey(name);
+          return this.nodeCompatAutofixPending?.[key] === true;
+      },
+
       setNodePingPending(name, pending) {
           const key = this.normalizeNodeKey(name);
           if (!key) return;
           this.nodePingPending = {
             ...(this.nodePingPending || {}),
+            [key]: pending === true
+          };
+      },
+
+      setNodeCompatAutofixPending(name, pending) {
+          const key = this.normalizeNodeKey(name);
+          if (!key) return;
+          this.nodeCompatAutofixPending = {
+            ...(this.nodeCompatAutofixPending || {}),
             [key]: pending === true
           };
       },
@@ -10092,6 +10370,21 @@ const UI_HTML = `<!DOCTYPE html>
              this.updateNodeCardStatus(name, 9999);
           } finally {
              this.setNodePingPending(name, false);
+          }
+      },
+
+      async autofixNodeCompat(name) {
+          const normalizedName = this.normalizeNodeKey(name);
+          if (!normalizedName || this.isNodeCompatAutofixPending(normalizedName)) return;
+          this.setNodeCompatAutofixPending(normalizedName, true);
+          try {
+              const res = await this.apiCall('nodeCompatAutofix', { name: normalizedName });
+              await this.loadNodes();
+              this.showMessage('兼容模式已' + (res?.changed ? '修复' : '确认') + '为 ' + (res?.mode || '未知'), { tone: 'success' });
+          } catch (error) {
+              this.showMessage('自动修复兼容模式失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.setNodeCompatAutofixPending(normalizedName, false);
           }
       },
 
@@ -12173,6 +12466,9 @@ const UI_HTML = `<!DOCTYPE html>
         pingPending() {
           return this.app.isNodePingPending(this.hydratedNode.name);
         },
+        compatAutofixPending() {
+          return this.app.isNodeCompatAutofixPending(this.hydratedNode.name);
+        },
         latencyTitle() {
           return this.activeLine?.latencyUpdatedAt ? ('最近测速：' + this.app.formatLocalDateTime(this.activeLine.latencyUpdatedAt)) : '尚未测速';
         }
@@ -12185,6 +12481,11 @@ const UI_HTML = `<!DOCTYPE html>
           const nodeName = String(this.hydratedNode.name || '').trim();
           if (!nodeName) return;
           await this.app.checkSingleNodeHealth(nodeName);
+        },
+        async autofixCompat() {
+          const nodeName = String(this.hydratedNode.name || '').trim();
+          if (!nodeName) return;
+          await this.app.autofixNodeCompat(nodeName);
         },
         editNode() {
           const nodeName = String(this.hydratedNode.name || '').trim();
@@ -12422,7 +12723,7 @@ function buildFetchRouteContext(request, env) {
 
 async function resolveProxyRouteContext(routeContext, env, ctx, request) {
   if (!routeContext.root) return null;
-  const nodeData = await Database.getNode(routeContext.root, env, ctx);
+  let nodeData = await Database.getNode(routeContext.root, env, ctx);
   if (!nodeData) return null;
 
   const secret = nodeData.secret;
@@ -12454,6 +12755,15 @@ async function resolveProxyRouteContext(routeContext, env, ctx, request) {
     };
   }
   if (remaining === "") remaining = "/";
+  if (
+    String(env?.__NODE_COMPAT_PROBE_NAME || "").trim().toLowerCase() === routeContext.root
+    && await isTrustedInternalNodeCompatProbeRequest(request, env)
+  ) {
+    nodeData = {
+      ...nodeData,
+      realClientIpMode: normalizeNodeRealClientIpMode(env?.__NODE_COMPAT_PROBE_MODE)
+    };
+  }
   return {
     nodeData,
     secret,

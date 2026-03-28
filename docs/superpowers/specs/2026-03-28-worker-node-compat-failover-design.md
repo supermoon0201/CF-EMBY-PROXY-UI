@@ -113,8 +113,8 @@ Each candidate mode is evaluated by three probe responses:
 ### Probe Interpretation
 
 - `2xx` or `3xx` counts as healthy
-- `401` is acceptable and counts as relatively healthy
-- `403` without an obvious WAF/challenge signature is weakly acceptable
+- `401` does not count as a healthy media probe for autofix selection
+- `403` without an obvious WAF/challenge signature still counts as a failed probe in this initial implementation
 - `5xx`, timeout, and explicit WAF/challenge signals are unhealthy
 
 ### Pass Rule

@@ -92,7 +92,9 @@
 - 支持 WebSocket 透明转发
 - 支持 Emby / Jellyfin 媒体授权头兼容与安全同步，并可按节点显式指定上游类型
 - 支持节点级真实客户端 IP 透传控制，便于兼容按来源 IP 风控的特殊上游
+- 支持节点级手动“自动修复兼容模式”，会通过当前 Worker 路径探测并在 `realip_only / off / dual` 中选择更稳的模式
 - 支持媒体 `403` 兼容梯子回退，以及 `bytes=0-...` 异常响应时的单次无 `Range` 降级
+- 支持多线路节点在请求间做轻量轮转；明显失败的线路会被短暂跳过，降低持续撞坏线的概率
 - 支持解析非 Emby 原生 `.strm` 文本，并将解析出的真实 URL 继续交给现有直连 / 反代规则处理
 
 ### 4) 安全与可观测性
@@ -735,6 +737,7 @@ https://你的域名/hk/123
 - `realip_only`（界面显示为“严格（仅 X-Real-IP）”）：强制仅保留 `X-Real-IP`，适合明确不接受 `X-Forwarded-For` 的上游
 - `off`（界面显示为“保守（不透传）”）：对当前节点强制不透传 `X-Real-IP` 和 `X-Forwarded-For`
 - `dual`（界面显示为“最大兼容（X-Real-IP + X-Forwarded-For）”）：对当前节点同时透传 `X-Real-IP` 和 `X-Forwarded-For`
+- 节点卡片提供“自动修复兼容模式”按钮，会通过当前 Worker 路径探测节点的公共接口和媒体接口，只在确认存在更稳妥的模式时才回写节点配置
 
 ### 媒体兼容回退
 
@@ -742,6 +745,7 @@ https://你的域名/hk/123
 - Phase 1 的兼容梯子顺序为：`Origin/Referer` 修复 -> `off` -> `dual` -> `realip_only`
 - 梯子回退会保留原始 `Range / If-Range` 语义，只针对媒体链路、清单和分片类请求触发
 - 如果 `bytes=0-...` 请求没有拿到正常的 `206 / Content-Range`，或上游直接返回 `416`，Worker 会额外做一次去掉 `Range / If-Range` 的无 `Range` 降级，并强制 `Accept-Encoding: identity`
+- 对于配置了多条线路的节点，Worker 还会在请求之间做轻量轮转；若某条线路连续返回 `403 / 404 / 416 / 5xx` 或直接抛出网络错误，会被 isolate 内短暂标记为坏线，并在后续请求里优先跳过
 
 ### `.strm` 解析规则
 
