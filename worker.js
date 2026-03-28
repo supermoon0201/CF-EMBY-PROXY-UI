@@ -12045,6 +12045,10 @@ const UI_HTML = `<!DOCTYPE html>
             try {
               const svgElement = createElement(iconNode);
               if (!svgElement) return;
+              element.style.display = 'inline-flex';
+              element.style.alignItems = 'center';
+              element.style.justifyContent = 'center';
+              element.style.lineHeight = '0';
               svgElement.setAttribute('data-lucide', iconName);
               svgElement.setAttribute('aria-hidden', 'true');
               svgElement.setAttribute('focusable', 'false');
