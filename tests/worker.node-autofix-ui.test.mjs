@@ -167,6 +167,7 @@ test('nodeCompatAutofix does not crash Vue when node cards rerender after the ac
     await page.waitForTimeout(1200);
 
     await page.getByTitle('自动修复兼容模式').first().click();
+    await page.getByText('真实客户端 IP 透传已自动调整为：严格（仅保留 X-Real-IP）').waitFor();
     await page.waitForTimeout(1800);
 
     assert.deepEqual(

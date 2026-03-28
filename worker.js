@@ -7991,6 +7991,17 @@ const UI_HTML = `<!DOCTYPE html>
       return 'smart';
     }
 
+    function getNodeRealClientIpModeLabel(value = '') {
+      const raw = String(value || '').trim();
+      if (!raw) return '未知模式';
+      const normalized = normalizeNodeRealClientIpMode(raw);
+      if (normalized === 'smart') return '自动（推荐，仅 X-Real-IP）';
+      if (normalized === 'realip_only') return '严格（仅保留 X-Real-IP）';
+      if (normalized === 'off') return '保守（不透传）';
+      if (normalized === 'dual') return '最大兼容（X-Real-IP + X-Forwarded-For）';
+      return '未知模式';
+    }
+
     function selectTopCandidatesForDns(candidates = [], options = {}) {
       const thresholdMs = Math.max(1, Number(options.thresholdMs) || 2000);
       const limit = Math.max(1, Math.floor(Number(options.limit) || 3));
@@ -10412,7 +10423,13 @@ const UI_HTML = `<!DOCTYPE html>
           try {
               const res = await this.apiCall('nodeCompatAutofix', { name: normalizedName });
               await this.loadNodes();
-              this.showMessage('兼容模式已' + (res?.changed ? '修复' : '确认') + '为 ' + (res?.mode || '未知'), { tone: 'success' });
+              const modeLabel = res?.mode ? getNodeRealClientIpModeLabel(res.mode) : '未知模式';
+              this.showMessage(
+                res?.changed
+                  ? ('真实客户端 IP 透传已自动调整为：' + modeLabel)
+                  : ('真实客户端 IP 透传无需调整，当前为：' + modeLabel),
+                { tone: 'success' }
+              );
           } catch (error) {
               this.showMessage('自动修复兼容模式失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
           } finally {
