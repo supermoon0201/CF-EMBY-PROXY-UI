@@ -97,6 +97,14 @@ const Config = {
     LogBatchRetryBackoffMs: 75,
     ScheduledLeaseMinMs: 30 * 1000,
     ScheduledLeaseMs: 5 * 60 * 1000,
+    ScheduledMaintenanceIntervalMinutes: 60,
+    AutoDnsEnabled: false,
+    AutoDnsType: "all",
+    AutoDnsIntervalMinutes: 60,
+    AutoDnsTopCount: 3,
+    AutoDnsLatencyThresholdMs: 2000,
+    AutoDnsProbeTimeoutMs: 2500,
+    AutoDnsHistoryLimit: 10,
     UiRadiusPx: 10,
     CacheTtlImagesDays: 30,
     PingTimeoutMs: 5000,
@@ -1195,6 +1203,277 @@ async function probeRemoteCandidateIpLatency(ip = "", options = {}) {
   }
 }
 
+function normalizeDesiredDnsRecords(mode = "a", records = []) {
+  const normalizedMode = normalizeDnsEditModeValue(mode);
+  const rawDesiredRecords = Array.isArray(records) ? records : [];
+  /** @type {{ type: string, content: string }[]} */
+  const desiredRecords = [];
+  if (normalizedMode === "cname") {
+    const content = String(rawDesiredRecords[0]?.content || "").trim();
+    const validationError = getDnsContentValidationError("CNAME", content);
+    if (validationError) throw new Error(validationError);
+    desiredRecords.push({ type: "CNAME", content });
+    return { mode: normalizedMode, desiredRecords };
+  }
+
+  const normalizedDesiredRecords = rawDesiredRecords
+    .map(item => ({
+      type: String(item?.type || "").trim().toUpperCase(),
+      content: String(item?.content || "").trim()
+    }))
+    .filter(item => item.type || item.content);
+  if (!normalizedDesiredRecords.length) {
+    throw new Error("A 模式至少保留 1 条 A / AAAA 记录");
+  }
+  for (const record of normalizedDesiredRecords) {
+    if (!["A", "AAAA"].includes(record.type)) {
+      throw new Error("A 模式仅允许 A / AAAA");
+    }
+    const validationError = getDnsContentValidationError(record.type, record.content, { allowCname: false });
+    if (validationError) throw new Error(validationError);
+    desiredRecords.push(record);
+  }
+  return { mode: normalizedMode, desiredRecords };
+}
+
+async function performCloudflareDnsSave(env, kv, options = {}) {
+  const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfig(env));
+  const cfZoneId = String(config.cfZoneId || "").trim();
+  const cfApiToken = String(config.cfApiToken || "").trim();
+  if (!cfZoneId || !cfApiToken) {
+    const error = new Error("请在账号设置中完善 Zone ID 和 API 令牌");
+    error.code = "CF_API_ERROR";
+    throw error;
+  }
+
+  const actor = String(options.actor || "admin").trim() || "admin";
+  const source = String(options.source || "ui").trim() || "ui";
+  const requestHost = normalizeHostnameText(options.requestHost || "");
+  const host = normalizeHostnameText(options.host || "");
+  if (!host) {
+    const error = new Error("host 不能为空");
+    error.code = "MISSING_PARAMS";
+    throw error;
+  }
+
+  const { mode, desiredRecords } = normalizeDesiredDnsRecords(options.mode, options.records);
+  const zone = await fetchCloudflareZoneDetails(cfZoneId, cfApiToken).catch(() => null);
+  const zoneName = String(zone?.name || "").trim() || "";
+  if (zoneName && !isHostnameInsideZone(host, zoneName)) {
+    const error = new Error("当前站点不在该 Zone 下");
+    error.code = "INVALID_HOST";
+    throw error;
+  }
+
+  const existingRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
+  const hostRecords = existingRecords.filter(record => normalizeHostnameText(record.name) === host && isEditableDnsRecordType(record.type));
+  const baseRecord = hostRecords[0] || { name: host, ttl: 1, proxied: false };
+  const zoneRecordsUrl = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records`;
+
+  const deleteRecord = async (record) => {
+    if (!record?.id) return;
+    await fetchCloudflareApiJson(`${zoneRecordsUrl}/${encodeURIComponent(record.id)}`, cfApiToken, { method: "DELETE" });
+  };
+
+  const updateRecord = async (record, nextType, nextContent) => {
+    const body = buildCloudflareDnsRecordBody(record, { host, type: nextType, content: nextContent });
+    const payload = await fetchCloudflareApiJson(`${zoneRecordsUrl}/${encodeURIComponent(record.id)}`, cfApiToken, {
+      method: "PUT",
+      body: JSON.stringify(body)
+    });
+    return normalizeEditableDnsRecord(payload?.result || { id: record.id, ...body });
+  };
+
+  const createRecord = async (nextType, nextContent, seedRecord = baseRecord) => {
+    const body = buildCloudflareDnsRecordBody(seedRecord, { host, type: nextType, content: nextContent });
+    const payload = await fetchCloudflareApiJson(zoneRecordsUrl, cfApiToken, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    return normalizeEditableDnsRecord(payload?.result || body);
+  };
+
+  const syncRecordsByType = async (type, nextRecords, currentRecords) => {
+    for (let index = nextRecords.length; index < currentRecords.length; index += 1) {
+      await deleteRecord(currentRecords[index]);
+    }
+    for (let index = 0; index < nextRecords.length; index += 1) {
+      const desired = nextRecords[index];
+      const existing = currentRecords[index];
+      if (existing) {
+        if (String(existing.content || "").trim() !== desired.content || String(existing.type || "").toUpperCase() !== type) {
+          await updateRecord(existing, type, desired.content);
+        }
+        continue;
+      }
+      await createRecord(type, desired.content, currentRecords[0] || baseRecord);
+    }
+  };
+
+  if (mode === "cname") {
+    const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
+    const currentAddressRecords = hostRecords.filter(record => record.type === "A" || record.type === "AAAA");
+    for (const record of currentAddressRecords) await deleteRecord(record);
+    for (let index = 1; index < currentCnameRecords.length; index += 1) {
+      await deleteRecord(currentCnameRecords[index]);
+    }
+    const primaryCname = currentCnameRecords[0] || null;
+    const desiredCname = desiredRecords[0];
+    if (primaryCname) {
+      if (String(primaryCname.content || "").trim() !== desiredCname.content) {
+        await updateRecord(primaryCname, "CNAME", desiredCname.content);
+      }
+    } else {
+      await createRecord("CNAME", desiredCname.content, baseRecord);
+    }
+    await Database.recordDnsHostHistory(kv, cfZoneId, host, {
+      name: host,
+      type: "CNAME",
+      content: desiredCname.content,
+      actor,
+      source,
+      requestHost,
+      savedAt: new Date().toISOString()
+    });
+  } else {
+    const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
+    for (const record of currentCnameRecords) await deleteRecord(record);
+    await syncRecordsByType("A", desiredRecords.filter(record => record.type === "A"), hostRecords.filter(record => record.type === "A"));
+    await syncRecordsByType("AAAA", desiredRecords.filter(record => record.type === "AAAA"), hostRecords.filter(record => record.type === "AAAA"));
+  }
+
+  const refreshedRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
+  const filteredRecords = refreshedRecords.filter(record => normalizeHostnameText(record.name) === host && isEditableDnsRecordType(record.type));
+  const history = await Database.getDnsHostHistory(kv, cfZoneId, host);
+
+  return {
+    ok: true,
+    zoneId: cfZoneId,
+    zoneName,
+    currentHost: host,
+    totalRecords: refreshedRecords.length,
+    filteredCount: filteredRecords.length,
+    records: filteredRecords,
+    history,
+    mode
+  };
+}
+
+async function runScheduledAutoDnsUpdate(env, kv, runtimeConfig = {}) {
+  const config = sanitizeRuntimeConfig(runtimeConfig);
+  const type = normalizeAutoDnsScheduleType(config.autoDnsType);
+  const zoneNameFallback = String(config.cfZoneId || "").trim() ? "" : "";
+  let host = normalizeHostnameText(config.autoDnsTargetHost || "");
+  if (!host) {
+    host = normalizeHostnameText(await resolveCloudflareBoundHostname({
+      cfAccountId: config.cfAccountId,
+      cfZoneId: config.cfZoneId,
+      cfApiToken: config.cfApiToken,
+      zoneNameFallback
+    }));
+  }
+  if (!host || host.includes("未知域名")) {
+    throw new Error("自动优选无法确定目标域名，请先填写自动优选目标域名");
+  }
+
+  const sourceResult = await listRemoteCandidateIpsByType(type);
+  const sourceCandidates = Array.isArray(sourceResult?.candidates) ? sourceResult.candidates : [];
+  if (!sourceCandidates.length) throw new Error("远程候选 IP 为空");
+
+  const probeTimeoutMs = clampIntegerConfig(config.autoDnsProbeTimeoutMs, Config.Defaults.AutoDnsProbeTimeoutMs, 500, 10000);
+  const thresholdMs = clampIntegerConfig(config.autoDnsLatencyThresholdMs, Config.Defaults.AutoDnsLatencyThresholdMs, 200, 10000);
+  const topCount = clampIntegerConfig(config.autoDnsTopCount, Config.Defaults.AutoDnsTopCount, 1, 3);
+  const probeCandidates = sourceCandidates.slice(0, Math.max(topCount, Math.min(sourceCandidates.length, 12)));
+  const probedCandidates = await runWithConcurrency(probeCandidates, 4, async (item) => {
+    const probe = await probeRemoteCandidateIpLatency(item?.ip, { timeoutMs: probeTimeoutMs });
+    return {
+      ...item,
+      latencyMs: probe.latencyMs,
+      probeOk: probe.ok,
+      probeStatus: probe.status,
+      probeError: probe.error
+    };
+  });
+  const topCandidates = selectTopCandidatesForDns(probedCandidates, { thresholdMs, limit: topCount });
+  if (!topCandidates.length) {
+    throw new Error(`没有候选通过延迟阈值（${thresholdMs} ms）`);
+  }
+
+  const records = topCandidates.map(item => ({
+    type: String(item?.ip || "").includes(":") ? "AAAA" : "A",
+    content: String(item?.ip || "").trim().replace(/^\[|\]$/g, "")
+  })).filter(item => item.content);
+  if (!records.length) throw new Error("没有可写入 DNS 的候选记录");
+
+  const saved = await performCloudflareDnsSave(env, kv, {
+    config,
+    host,
+    mode: "a",
+    records,
+    actor: "scheduled",
+    source: "auto_dns",
+    requestHost: host
+  });
+
+  return {
+    status: "success",
+    type,
+    host,
+    sourceSummary: Array.isArray(sourceResult?.sourceSummary) ? sourceResult.sourceSummary : [],
+    totalCandidates: sourceCandidates.length,
+    probedCount: probedCandidates.length,
+    selectedCount: records.length,
+    thresholdMs,
+    probeTimeoutMs,
+    topCount,
+    records,
+    topCandidates: topCandidates.map(item => ({
+      ip: String(item?.ip || "").trim(),
+      latencyMs: Number(item?.latencyMs) || 0,
+      lineType: String(item?.lineType || item?.source || "")
+    })),
+    dns: saved
+  };
+}
+
+function shouldRunIntervalGate(lastRunAt = "", intervalMinutes = 0, fallback = true) {
+  const intervalMs = Math.max(0, Number(intervalMinutes) || 0) * 60 * 1000;
+  if (intervalMs <= 0) return fallback;
+  const parsed = typeof lastRunAt === "string" ? new Date(lastRunAt).getTime() : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return true;
+  return (nowMs() - parsed) >= intervalMs;
+}
+
+function normalizeAutoDnsHistoryEntry(entry = {}) {
+  const item = entry && typeof entry === "object" ? entry : {};
+  return {
+    id: String(item.id || (`auto-dns-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)),
+    trigger: String(item.trigger || "scheduled"),
+    status: String(item.status || "idle"),
+    startedAt: String(item.startedAt || ""),
+    finishedAt: String(item.finishedAt || ""),
+    host: String(item.host || ""),
+    type: String(item.type || ""),
+    selectedCount: Number(item.selectedCount) || 0,
+    thresholdMs: Number(item.thresholdMs) || 0,
+    error: String(item.error || ""),
+    records: (Array.isArray(item.records) ? item.records : []).map(record => ({
+      type: String(record?.type || ""),
+      content: String(record?.content || "")
+    })),
+    topCandidates: (Array.isArray(item.topCandidates) ? item.topCandidates : []).map(candidate => ({
+      ip: String(candidate?.ip || ""),
+      latencyMs: Number(candidate?.latencyMs) || 0
+    }))
+  };
+}
+
+function pushAutoDnsHistoryEntry(existingEntries = [], entry = {}, limit = Config.Defaults.AutoDnsHistoryLimit) {
+  const normalizedEntry = normalizeAutoDnsHistoryEntry(entry);
+  const next = [normalizedEntry, ...(Array.isArray(existingEntries) ? existingEntries : []).map(item => normalizeAutoDnsHistoryEntry(item))];
+  return next.slice(0, Math.max(1, Number(limit) || Config.Defaults.AutoDnsHistoryLimit));
+}
+
 function parseKeywordTerms(raw = "") {
   return String(raw || "")
     .split(/[\n\r,，;；|]+/)
@@ -1655,11 +1934,23 @@ async function resolveCloudflareBoundHostname({ cfAccountId, cfZoneId, cfApiToke
   return zoneNameFallback || "未知域名 (请配置 CF 联动)";
 }
 
+function normalizeAutoDnsScheduleType(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return Config.Defaults.AutoDnsType;
+  const normalized = raw.toLowerCase();
+  if (["all", "电信", "联通", "移动", "多线", "ipv6", "优选"].includes(raw)) return raw;
+  if (normalized === "all") return "all";
+  if (normalized === "ipv6") return "ipv6";
+  return Config.Defaults.AutoDnsType;
+}
+
 function sanitizeRuntimeConfig(input = {}) {
   const sanitized = sanitizeConfigWithRules(input, CONFIG_SANITIZE_RULES, { normalizeNodeNameList });
   sanitized.prewarmDepth = normalizePrewarmDepth(sanitized.prewarmDepth);
   sanitized.settingsExperienceMode = String(sanitized.settingsExperienceMode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
   sanitized.logSearchMode = normalizeLogSearchMode(sanitized.logSearchMode);
+  sanitized.autoDnsType = normalizeAutoDnsScheduleType(sanitized.autoDnsType);
+  sanitized.autoDnsTargetHost = normalizeHostnameText(sanitized.autoDnsTargetHost || "");
   return sanitized;
 }
 
@@ -1925,6 +2216,14 @@ const CONFIG_ALLOWED_FIELDS = [
   "logBatchRetryCount",
   "logBatchRetryBackoffMs",
   "scheduledLeaseMs",
+  "scheduledMaintenanceIntervalMinutes",
+  "autoDnsEnabled",
+  "autoDnsType",
+  "autoDnsTargetHost",
+  "autoDnsIntervalMinutes",
+  "autoDnsTopCount",
+  "autoDnsLatencyThresholdMs",
+  "autoDnsProbeTimeoutMs",
   "tgBotToken",
   "tgChatId",
   "tgAlertDroppedBatchThreshold",
@@ -1953,6 +2252,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
   "enableH2",
   "enableH3",
   "tgAlertOnScheduledFailure",
+  "autoDnsEnabled",
   "directStaticAssets",
   "directHlsDash",
   "disablePrewarmPrefetch",
@@ -1962,7 +2262,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: CONFIG_ALIAS_FIELDS,
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode", "autoDnsType", "autoDnsTargetHost"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList"
   },
@@ -1973,6 +2273,11 @@ const CONFIG_SANITIZE_RULES = {
     logBatchRetryCount: { fallback: Config.Defaults.LogBatchRetryCount, min: 0, max: 5 },
     logBatchRetryBackoffMs: { fallback: Config.Defaults.LogBatchRetryBackoffMs, min: 0, max: 5000 },
     scheduledLeaseMs: { fallback: Config.Defaults.ScheduledLeaseMs, min: Config.Defaults.ScheduledLeaseMinMs, max: 15 * 60 * 1000 },
+    scheduledMaintenanceIntervalMinutes: { fallback: Config.Defaults.ScheduledMaintenanceIntervalMinutes, min: 5, max: 1440 },
+    autoDnsIntervalMinutes: { fallback: Config.Defaults.AutoDnsIntervalMinutes, min: 5, max: 1440 },
+    autoDnsTopCount: { fallback: Config.Defaults.AutoDnsTopCount, min: 1, max: 3 },
+    autoDnsLatencyThresholdMs: { fallback: Config.Defaults.AutoDnsLatencyThresholdMs, min: 200, max: 10000 },
+    autoDnsProbeTimeoutMs: { fallback: Config.Defaults.AutoDnsProbeTimeoutMs, min: 500, max: 10000 },
     uiRadiusPx: { fallback: Config.Defaults.UiRadiusPx, min: 0, max: 48 },
     tgAlertDroppedBatchThreshold: { fallback: Config.Defaults.TgAlertDroppedBatchThreshold, min: 0, max: 5000 },
     tgAlertFlushRetryThreshold: { fallback: Config.Defaults.TgAlertFlushRetryThreshold, min: 0, max: 10 },
@@ -3597,6 +3902,85 @@ const Database = {
       return jsonResponse({ status: await Database.getOpsStatus(env) });
     },
 
+    async runAutoDnsNow(data, { env, kv }) {
+      const runtimeConfig = await getRuntimeConfig(env);
+      const startedAt = new Date().toISOString();
+      const previousScheduled = await Database.getOpsStatusSection(env, "scheduled").catch(() => ({}));
+      const previousAutoDns = previousScheduled?.autoDns && typeof previousScheduled.autoDns === "object" ? previousScheduled.autoDns : {};
+      try {
+        const result = await runScheduledAutoDnsUpdate(env, kv, runtimeConfig);
+        const finishedAt = new Date().toISOString();
+        const history = pushAutoDnsHistoryEntry(previousAutoDns.history, {
+          trigger: "manual",
+          status: "success",
+          startedAt,
+          finishedAt,
+          host: result.host,
+          type: result.type,
+          selectedCount: result.selectedCount,
+          thresholdMs: result.thresholdMs,
+          records: result.records,
+          topCandidates: result.topCandidates
+        });
+        await Database.patchOpsStatus(env, {
+          scheduled: {
+            autoDns: {
+              status: "success",
+              lastStartedAt: startedAt,
+              lastFinishedAt: finishedAt,
+              lastSuccessAt: finishedAt,
+              host: result.host,
+              type: result.type,
+              totalCandidates: result.totalCandidates,
+              probedCount: result.probedCount,
+              selectedCount: result.selectedCount,
+              thresholdMs: result.thresholdMs,
+              records: result.records,
+              topCandidates: result.topCandidates,
+              trigger: "manual",
+              history,
+              lastAutoSkipAt: "",
+              autoSkipReason: ""
+            }
+          }
+        }).catch(() => {});
+        return jsonResponse({
+          success: true,
+          result,
+          status: await Database.getOpsStatus(env)
+        });
+      } catch (error) {
+        const finishedAt = new Date().toISOString();
+        const history = pushAutoDnsHistoryEntry(previousAutoDns.history, {
+          trigger: "manual",
+          status: "failed",
+          startedAt,
+          finishedAt,
+          host: String(runtimeConfig?.autoDnsTargetHost || ""),
+          type: String(runtimeConfig?.autoDnsType || ""),
+          error: error?.message || String(error)
+        });
+        await Database.patchOpsStatus(env, {
+          scheduled: {
+            autoDns: {
+              status: "failed",
+              lastStartedAt: startedAt,
+              lastFinishedAt: finishedAt,
+              lastErrorAt: finishedAt,
+              lastError: error?.message || String(error),
+              trigger: "manual",
+              history,
+              lastAutoSkipAt: "",
+              autoSkipReason: ""
+            }
+          }
+        }).catch(() => {});
+        return jsonError("AUTO_DNS_RUN_FAILED", error?.message || "立即执行自动优选失败", 500, {
+          status: await Database.getOpsStatus(env).catch(() => null)
+        });
+      }
+    },
+
     async saveConfig(data, { env, ctx, kv, meta }) {
       const savedConfig = data.config
         ? await Database.persistRuntimeConfig(data.config, {
@@ -3996,145 +4380,27 @@ const Database = {
             return jsonError("CONFIRMATION_REQUIRED", "敏感 DNS 操作需要显式确认头", 428);
         }
 
-        const mode = normalizeDnsEditModeValue(data?.mode);
-        const host = normalizeHostnameText(data?.host || "");
-        const rawDesiredRecords = Array.isArray(data?.records) ? data.records : [];
-        if (!host) return jsonError("MISSING_PARAMS", "host 不能为空");
-
-        /** @type {{ type: string, content: string }[]} */
-        const desiredRecords = [];
-        if (mode === "cname") {
-            const content = String(rawDesiredRecords[0]?.content || "").trim();
-            const validationError = getDnsContentValidationError("CNAME", content);
-            if (validationError) return jsonError("INVALID_CONTENT", validationError);
-            desiredRecords.push({ type: "CNAME", content });
-        } else {
-            const normalizedDesiredRecords = rawDesiredRecords
-              .map(item => ({
-                type: String(item?.type || "").trim().toUpperCase(),
-                content: String(item?.content || "").trim()
-              }))
-              .filter(item => item.type || item.content);
-            if (!normalizedDesiredRecords.length) {
-                return jsonError("INVALID_CONTENT", "A 模式至少保留 1 条 A / AAAA 记录");
-            }
-            for (const record of normalizedDesiredRecords) {
-                if (!["A", "AAAA"].includes(record.type)) {
-                    return jsonError("INVALID_TYPE", "A 模式仅允许 A / AAAA");
-                }
-                const validationError = getDnsContentValidationError(record.type, record.content, { allowCname: false });
-                if (validationError) return jsonError("INVALID_CONTENT", validationError);
-                desiredRecords.push(record);
-            }
-        }
-
         const config = sanitizeRuntimeConfig(await getRuntimeConfig(env));
-        const cfZoneId = String(config.cfZoneId || "").trim();
-        const cfApiToken = String(config.cfApiToken || "").trim();
-        if (!cfZoneId || !cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
-
         try {
-            const zone = await fetchCloudflareZoneDetails(cfZoneId, cfApiToken).catch(() => null);
-            const zoneName = String(zone?.name || "").trim() || "";
-            if (zoneName && !isHostnameInsideZone(host, zoneName)) {
-                return jsonError("INVALID_HOST", "当前站点不在该 Zone 下");
-            }
-
-            const requestHost = normalizeHostnameText(new URL(request.url).hostname);
-            const existingRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
-            const hostRecords = existingRecords.filter(record => normalizeHostnameText(record.name) === host && isEditableDnsRecordType(record.type));
-            const baseRecord = hostRecords[0] || { name: host, ttl: 1, proxied: false };
-            const zoneRecordsUrl = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records`;
-
-            const deleteRecord = async (record) => {
-                if (!record?.id) return;
-                await fetchCloudflareApiJson(`${zoneRecordsUrl}/${encodeURIComponent(record.id)}`, cfApiToken, { method: "DELETE" });
-            };
-
-            const updateRecord = async (record, nextType, nextContent) => {
-                const body = buildCloudflareDnsRecordBody(record, { host, type: nextType, content: nextContent });
-                const payload = await fetchCloudflareApiJson(`${zoneRecordsUrl}/${encodeURIComponent(record.id)}`, cfApiToken, {
-                    method: "PUT",
-                    body: JSON.stringify(body)
-                });
-                return normalizeEditableDnsRecord(payload?.result || { id: record.id, ...body });
-            };
-
-            const createRecord = async (nextType, nextContent, seedRecord = baseRecord) => {
-                const body = buildCloudflareDnsRecordBody(seedRecord, { host, type: nextType, content: nextContent });
-                const payload = await fetchCloudflareApiJson(zoneRecordsUrl, cfApiToken, {
-                    method: "POST",
-                    body: JSON.stringify(body)
-                });
-                return normalizeEditableDnsRecord(payload?.result || body);
-            };
-
-            const syncRecordsByType = async (type, nextRecords, currentRecords) => {
-                for (let index = nextRecords.length; index < currentRecords.length; index += 1) {
-                    await deleteRecord(currentRecords[index]);
-                }
-                for (let index = 0; index < nextRecords.length; index += 1) {
-                    const desired = nextRecords[index];
-                    const existing = currentRecords[index];
-                    if (existing) {
-                        if (String(existing.content || "").trim() !== desired.content || String(existing.type || "").toUpperCase() !== type) {
-                            await updateRecord(existing, type, desired.content);
-                        }
-                        continue;
-                    }
-                    await createRecord(type, desired.content, currentRecords[0] || baseRecord);
-                }
-            };
-
-            if (mode === "cname") {
-                const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
-                const currentAddressRecords = hostRecords.filter(record => record.type === "A" || record.type === "AAAA");
-                for (const record of currentAddressRecords) await deleteRecord(record);
-                for (let index = 1; index < currentCnameRecords.length; index += 1) {
-                    await deleteRecord(currentCnameRecords[index]);
-                }
-                const primaryCname = currentCnameRecords[0] || null;
-                const desiredCname = desiredRecords[0];
-                if (primaryCname) {
-                    if (String(primaryCname.content || "").trim() !== desiredCname.content) {
-                        await updateRecord(primaryCname, "CNAME", desiredCname.content);
-                    }
-                } else {
-                    await createRecord("CNAME", desiredCname.content, baseRecord);
-                }
-                await Database.recordDnsHostHistory(kv, cfZoneId, host, {
-                    name: host,
-                    type: "CNAME",
-                    content: desiredCname.content,
-                    actor: "admin",
-                    source: "ui",
-                    requestHost,
-                    savedAt: new Date().toISOString()
-                });
-            } else {
-                const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
-                for (const record of currentCnameRecords) await deleteRecord(record);
-                await syncRecordsByType("A", desiredRecords.filter(record => record.type === "A"), hostRecords.filter(record => record.type === "A"));
-                await syncRecordsByType("AAAA", desiredRecords.filter(record => record.type === "AAAA"), hostRecords.filter(record => record.type === "AAAA"));
-            }
-
-            const refreshedRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken);
-            const filteredRecords = refreshedRecords.filter(record => normalizeHostnameText(record.name) === host && isEditableDnsRecordType(record.type));
-            const history = await Database.getDnsHostHistory(kv, cfZoneId, host);
-
-            return jsonResponse({
-                ok: true,
-                zoneId: cfZoneId,
-                zoneName,
-                currentHost: host,
-                totalRecords: refreshedRecords.length,
-                filteredCount: filteredRecords.length,
-                records: filteredRecords,
-                history,
-                mode
+            const result = await performCloudflareDnsSave(env, kv, {
+                config,
+                host: data?.host,
+                mode: data?.mode,
+                records: data?.records,
+                actor: "admin",
+                source: "ui",
+                requestHost: normalizeHostnameText(new URL(request.url).hostname)
             });
+            return jsonResponse(result);
         } catch (e) {
             const msg = String(e?.message || e || "unknown_error");
+            if (e?.code === "CF_API_ERROR") return jsonError("CF_API_ERROR", msg);
+            if (e?.code === "MISSING_PARAMS") return jsonError("MISSING_PARAMS", msg);
+            if (e?.code === "INVALID_HOST") return jsonError("INVALID_HOST", msg);
+            if (e?.code === "INVALID_TYPE") return jsonError("INVALID_TYPE", msg);
+            if (msg.includes("A 模式至少保留 1 条 A / AAAA 记录") || msg.includes("A 模式仅允许 A / AAAA") || msg.includes("无效") || msg.includes("不能为空")) {
+              return jsonError("INVALID_CONTENT", msg);
+            }
             const hint = msg.includes("cf_api_http_403")
               ? "Cloudflare DNS 保存失败：API 令牌权限不足（需要 Zone.DNS:Edit）"
               : msg.includes("cf_api_http_401")
@@ -6967,6 +7233,9 @@ const UI_HTML = `<!DOCTYPE html>
                     <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('monitoring')" @click="App.switchSetTab('monitoring')" role="tab" aria-controls="set-monitoring" :aria-selected="App.activeSettingsTab === 'monitoring'">
                       <span class="block font-semibold">监控告警</span>
                     </button>
+                    <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('dnsOps')" @click="App.switchSetTab('dnsOps')" role="tab" aria-controls="set-dns-ops" :aria-selected="App.activeSettingsTab === 'dnsOps'">
+                      <span class="block font-semibold">DNS 运维</span>
+                    </button>
                     <button class="set-tab min-w-[8.75rem] md:min-w-0 md:w-full flex-shrink-0 text-left px-3 py-2 rounded-xl border text-[13px] transition" :class="App.getSettingsTabClass('account')" @click="App.switchSetTab('account')" role="tab" aria-controls="set-account" :aria-selected="App.activeSettingsTab === 'account'">
                       <span class="block font-semibold">账号设置</span>
                     </button>
@@ -7344,6 +7613,14 @@ const UI_HTML = `<!DOCTYPE html>
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
                         </div>
                       </div>
+                      <div class="md:col-span-2">
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务执行周期</label>
+                        <div class="relative">
+                          <input type="number" min="5" max="1440" step="5" id="cfg-scheduled-maintenance-interval-minutes" v-model="App.settingsForm.scheduledMaintenanceIntervalMinutes" class="w-full p-2 pr-16 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="60">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">分钟</span>
+                        </div>
+                        <p class="text-xs text-slate-500 mt-2">用于控制日志清理、Telegram 日报和异常告警在单个 Cloudflare Cron 下的内部执行节奏；设置为 60 表示即使 Cron 更频繁触发，这一组任务也最多每小时真正执行一次。</p>
+                      </div>
                     </div>
                     <p class="text-xs text-slate-500 mt-3">内存日志队列满足“达到延迟分钟”或“累计达到条数阈值”任一条件即写入 D1。Cloudflare 官方文档说明 Cron Trigger 单次执行最长 15 分钟，因此租约上限固定为 900000 毫秒；D1 单批切片也限制为最多 100 条，避免单次批量过大。</p>
                   </div>
@@ -7438,6 +7715,119 @@ const UI_HTML = `<!DOCTYPE html>
                     <button @click="App.saveSettings('logs', 'monitoring')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存监控设置</button>
                     <button @click="App.testTelegram()" class="px-4 py-2 border border-blue-200 text-blue-600 rounded-xl text-sm transition hover:bg-blue-50 dark:border-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/20 flex items-center justify-center"><i data-lucide="send" class="w-4 h-4 mr-1"></i> 发送测试通知</button>
                     <button @click="App.sendDailyReport()" class="px-4 py-2 border border-emerald-200 text-emerald-600 rounded-xl text-sm transition hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20 flex items-center justify-center"><i data-lucide="file-bar-chart" class="w-4 h-4 mr-1"></i> 手动发送日报</button>
+                </div>
+              </div>
+
+              <div id="set-dns-ops" v-show="App.activeSettingsTab === 'dnsOps'" class="space-y-4">
+                <div class="grid gap-4">
+                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
+                    <div class="flex items-start justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Runtime</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">最近执行摘要</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-semibold whitespace-nowrap" :class="App.getRuntimeStatusMeta(App.getAutoDnsRuntimeState().status).badgeClass">{{ App.getRuntimeStatusMeta(App.getAutoDnsRuntimeState().status).label }}</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300">{{ App.getAutoDnsRuntimeSummary() }}</p>
+                    <ul class="space-y-2 mt-4">
+                      <li v-for="(line, lineIndex) in App.getAutoDnsRuntimeLines()" :key="'dns-ops-runtime-line-' + lineIndex" class="text-sm text-slate-600 dark:text-slate-300 break-all">{{ line }}</li>
+                    </ul>
+                    <p v-if="App.getAutoDnsRuntimeDetail()" class="text-xs text-red-500 dark:text-red-300 break-all mt-4">{{ App.getAutoDnsRuntimeDetail() }}</p>
+                    <div class="flex flex-wrap gap-2 mt-4">
+                      <button @click="App.refreshDnsOpsRuntimeStatus()" :disabled="App.dnsOpsRefreshPending || App.dnsOpsRunPending" class="px-4 py-2 border border-slate-200 text-slate-700 rounded-xl text-sm transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800 disabled:opacity-50 disabled:pointer-events-none">
+                        {{ App.dnsOpsRefreshPending ? '刷新中...' : '刷新执行状态' }}
+                      </button>
+                      <button @click="App.runAutoDnsNow()" :disabled="App.dnsOpsRunPending || App.dnsOpsRefreshPending" class="px-4 py-2 border border-sky-200 text-sky-600 rounded-xl text-sm transition hover:bg-sky-50 dark:border-sky-900/30 dark:text-sky-400 dark:hover:bg-sky-900/20 disabled:opacity-50 disabled:pointer-events-none">
+                        {{ App.dnsOpsRunPending ? '执行中...' : '立即执行一次自动优选' }}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-sky-500 dark:text-sky-300">Auto DNS</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">定时自动优选 DNS</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">Cloudflare 运维</span>
+                    </div>
+                    <label class="flex items-center text-sm font-medium mb-3 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-auto-dns-enabled" v-model="App.settingsForm.autoDnsEnabled" class="mr-2 w-4 h-4 rounded"> 启用 Cron 自动测速并写回 DNS</label>
+                    <div class="grid gap-3 md:grid-cols-2">
+                      <div>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">自动优选目标域名</label>
+                        <input type="text" id="cfg-auto-dns-target-host" v-model="App.settingsForm.autoDnsTargetHost" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" placeholder="留空则自动推断当前 Worker 绑定域名">
+                      </div>
+                      <div>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">候选源类型</label>
+                        <select id="cfg-auto-dns-type" v-model="App.settingsForm.autoDnsType" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white">
+                          <option value="all">全部候选</option>
+                          <option value="优选">优选库</option>
+                          <option value="电信">电信</option>
+                          <option value="联通">联通</option>
+                          <option value="移动">移动</option>
+                          <option value="多线">多线</option>
+                          <option value="ipv6">IPv6</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">自动优选执行周期</label>
+                        <div class="relative">
+                          <input type="number" min="5" max="1440" step="5" id="cfg-auto-dns-interval-minutes" v-model="App.settingsForm.autoDnsIntervalMinutes" class="w-full p-2 pr-16 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="60">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">分钟</span>
+                        </div>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">写入数量</label>
+                        <div class="relative">
+                          <input type="number" min="1" max="3" step="1" id="cfg-auto-dns-top-count" v-model="App.settingsForm.autoDnsTopCount" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="3">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">条</span>
+                        </div>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">延迟阈值</label>
+                        <div class="relative">
+                          <input type="number" min="200" max="10000" step="100" id="cfg-auto-dns-threshold-ms" v-model="App.settingsForm.autoDnsLatencyThresholdMs" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="2000">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
+                        </div>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">测速超时</label>
+                        <div class="relative">
+                          <input type="number" min="500" max="10000" step="100" id="cfg-auto-dns-timeout-ms" v-model="App.settingsForm.autoDnsProbeTimeoutMs" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="2500">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
+                        </div>
+                      </div>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-3">定时任务会沿用当前项目已有的远程候选拉取、Worker 侧测速和 Cloudflare DNS 保存链路。目标域名留空时，系统会尝试从当前 Zone 的 Worker 绑定或 Route 中自动推断；如果你的 Zone 下有多个绑定域名，建议显式填写，避免写错站点。执行周期用于在单个 Cloudflare Cron 下实现与日志类任务不同的内部运行节奏。</p>
+                  </div>
+                </div>
+
+                <div v-if="(App.getAutoDnsRuntimeState().history || []).length" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block">
+                  <div class="flex items-start justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                    <div>
+                      <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">History</div>
+                      <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">最近执行历史</div>
+                    </div>
+                    <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">最多 10 条</span>
+                  </div>
+                  <div class="space-y-3">
+                    <div v-for="entry in App.getAutoDnsRuntimeHistory()" :key="entry.id" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/60 p-4">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="text-sm font-semibold text-slate-900 dark:text-white">{{ entry.host || '未记录目标域名' }}</div>
+                        <span class="inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-semibold whitespace-nowrap" :class="App.getRuntimeStatusMeta(entry.status).badgeClass">{{ App.getRuntimeStatusMeta(entry.status).label }}</span>
+                      </div>
+                      <div class="text-xs text-slate-500 mt-2">{{ (entry.trigger === 'manual' ? '手动执行' : '定时执行') + ' · ' + (entry.finishedAt ? App.formatLocalDateTime(entry.finishedAt) : '未完成') }}</div>
+                      <div class="text-sm text-slate-600 dark:text-slate-300 mt-3">
+                        {{ '候选源：' + (entry.type || '-') + ' · 写入数量：' + (entry.selectedCount || 0) + ' · 阈值：' + ((entry.thresholdMs || 0) ? (entry.thresholdMs + ' ms') : '-') }}
+                      </div>
+                      <div v-if="entry.topCandidates.length" class="text-xs text-slate-500 mt-2 break-all">{{ '命中：' + entry.topCandidates.map(item => item.ip + (item.latencyMs ? (' (' + item.latencyMs + ' ms)') : '')).join(' | ') }}</div>
+                      <div v-if="entry.error" class="text-xs text-red-500 dark:text-red-300 mt-2 break-all">{{ entry.error }}</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="flex flex-wrap gap-2">
+                  <button @click="App.saveSettings('dnsOps')" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition">保存 DNS 运维设置</button>
                 </div>
               </div>
               
@@ -7754,6 +8144,14 @@ const UI_HTML = `<!DOCTYPE html>
       logBatchRetryCount: 2,
       logBatchRetryBackoffMs: 75,
       scheduledLeaseMs: 300000,
+      scheduledMaintenanceIntervalMinutes: 60,
+      autoDnsEnabled: false,
+      autoDnsType: 'all',
+      autoDnsTargetHost: '',
+      autoDnsIntervalMinutes: 60,
+      autoDnsTopCount: 3,
+      autoDnsLatencyThresholdMs: 2000,
+      autoDnsProbeTimeoutMs: 2500,
       tgAlertDroppedBatchThreshold: 0,
       tgAlertFlushRetryThreshold: 0,
       tgAlertCooldownMinutes: 30,
@@ -7811,6 +8209,26 @@ const UI_HTML = `<!DOCTYPE html>
 	      return String(value || '').trim().toLowerCase() === 'fts' ? 'fts' : UI_DEFAULTS.logSearchMode;
 	    }
 
+      function normalizeUiAutoDnsHistoryEntry(entry = {}) {
+        const item = entry && typeof entry === 'object' ? entry : {};
+        return {
+          id: String(item.id || ('ui-auto-dns-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8))),
+          trigger: String(item.trigger || 'scheduled'),
+          status: String(item.status || 'idle'),
+          startedAt: String(item.startedAt || ''),
+          finishedAt: String(item.finishedAt || ''),
+          host: String(item.host || ''),
+          type: String(item.type || ''),
+          selectedCount: Number(item.selectedCount) || 0,
+          thresholdMs: Number(item.thresholdMs) || 0,
+          error: String(item.error || ''),
+          topCandidates: (Array.isArray(item.topCandidates) ? item.topCandidates : []).map(candidate => ({
+            ip: String(candidate?.ip || ''),
+            latencyMs: Number(candidate?.latencyMs) || 0
+          }))
+        };
+      }
+
 	    const CONFIG_PREVIEW_SANITIZE_RULES = ${JSON.stringify(CONFIG_SANITIZE_RULES)};
 
     const CONFIG_FORM_BINDINGS = {
@@ -7854,12 +8272,22 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'logBatchRetryCount', id: 'cfg-log-retry-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryCount },
         { key: 'logBatchRetryBackoffMs', id: 'cfg-log-retry-backoff', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryBackoffMs },
         { key: 'scheduledLeaseMs', id: 'cfg-scheduled-lease-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledLeaseMs },
+        { key: 'scheduledMaintenanceIntervalMinutes', id: 'cfg-scheduled-maintenance-interval-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledMaintenanceIntervalMinutes },
         { key: 'tgBotToken', id: 'cfg-tg-token', kind: 'trim', defaultValue: '' },
         { key: 'tgChatId', id: 'cfg-tg-chatid', kind: 'trim', defaultValue: '' },
         { key: 'tgAlertDroppedBatchThreshold', id: 'cfg-tg-alert-drop-threshold', kind: 'int-finite', defaultValue: UI_DEFAULTS.tgAlertDroppedBatchThreshold },
         { key: 'tgAlertFlushRetryThreshold', id: 'cfg-tg-alert-retry-threshold', kind: 'int-finite', defaultValue: UI_DEFAULTS.tgAlertFlushRetryThreshold },
         { key: 'tgAlertOnScheduledFailure', id: 'cfg-tg-alert-scheduled-failure', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'tgAlertCooldownMinutes', id: 'cfg-tg-alert-cooldown-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.tgAlertCooldownMinutes }
+      ],
+      dnsOps: [
+        { key: 'autoDnsEnabled', id: 'cfg-auto-dns-enabled', kind: 'checkbox', checkboxMode: 'strictTrue' },
+        { key: 'autoDnsType', id: 'cfg-auto-dns-type', kind: 'or-default', defaultValue: UI_DEFAULTS.autoDnsType },
+        { key: 'autoDnsTargetHost', id: 'cfg-auto-dns-target-host', kind: 'trim', defaultValue: UI_DEFAULTS.autoDnsTargetHost },
+        { key: 'autoDnsIntervalMinutes', id: 'cfg-auto-dns-interval-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsIntervalMinutes },
+        { key: 'autoDnsTopCount', id: 'cfg-auto-dns-top-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsTopCount },
+        { key: 'autoDnsLatencyThresholdMs', id: 'cfg-auto-dns-threshold-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsLatencyThresholdMs },
+        { key: 'autoDnsProbeTimeoutMs', id: 'cfg-auto-dns-timeout-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsProbeTimeoutMs }
       ],
       account: [
         { key: 'jwtExpiryDays', id: 'cfg-jwt-days', kind: 'int-or-default', defaultValue: 30 },
@@ -7874,6 +8302,7 @@ const UI_HTML = `<!DOCTYPE html>
       proxy: [...CONFIG_FORM_BINDINGS.proxy.map(item => item.key), 'sourceDirectNodes'],
       security: CONFIG_FORM_BINDINGS.security.map(item => item.key),
       logs: CONFIG_FORM_BINDINGS.logs.map(item => item.key),
+      dnsOps: CONFIG_FORM_BINDINGS.dnsOps.map(item => item.key),
       account: CONFIG_FORM_BINDINGS.account.map(item => item.key)
     };
 
@@ -7882,8 +8311,9 @@ const UI_HTML = `<!DOCTYPE html>
       proxy: CONFIG_SECTION_FIELDS.proxy,
       cache: ['cacheTtlImages', 'corsOrigins'],
       security: ['geoAllowlist', 'geoBlocklist', 'ipBlacklist', 'rateLimitRpm'],
-      logs: ['logSearchMode', 'logRetentionDays', 'logWriteDelayMinutes', 'logFlushCountThreshold', 'logBatchChunkSize', 'logBatchRetryCount', 'logBatchRetryBackoffMs', 'scheduledLeaseMs'],
+      logs: ['logSearchMode', 'logRetentionDays', 'logWriteDelayMinutes', 'logFlushCountThreshold', 'logBatchChunkSize', 'logBatchRetryCount', 'logBatchRetryBackoffMs', 'scheduledLeaseMs', 'scheduledMaintenanceIntervalMinutes'],
       monitoring: ['tgBotToken', 'tgChatId', 'tgAlertDroppedBatchThreshold', 'tgAlertFlushRetryThreshold', 'tgAlertOnScheduledFailure', 'tgAlertCooldownMinutes'],
+      dnsOps: CONFIG_SECTION_FIELDS.dnsOps,
       account: CONFIG_SECTION_FIELDS.account,
       backup: []
     };
@@ -7923,6 +8353,14 @@ const UI_HTML = `<!DOCTYPE html>
       logBatchRetryCount: 'D1 重试次数',
       logBatchRetryBackoffMs: 'D1 退避毫秒',
       scheduledLeaseMs: '定时任务租约时长',
+      scheduledMaintenanceIntervalMinutes: '日志类任务执行周期',
+      autoDnsEnabled: '定时自动优选 DNS',
+      autoDnsType: '自动优选候选源',
+      autoDnsTargetHost: '自动优选目标域名',
+      autoDnsIntervalMinutes: '自动优选执行周期',
+      autoDnsTopCount: '自动优选写入数量',
+      autoDnsLatencyThresholdMs: '自动优选延迟阈值',
+      autoDnsProbeTimeoutMs: '自动优选测速超时',
       tgBotToken: 'Telegram Bot Token',
       tgChatId: 'Telegram Chat ID',
       tgAlertDroppedBatchThreshold: '日志丢弃批次阈值',
@@ -7971,6 +8409,14 @@ const UI_HTML = `<!DOCTYPE html>
         logBatchRetryCount: 2,
         logBatchRetryBackoffMs: 75,
         scheduledLeaseMs: 300000,
+        scheduledMaintenanceIntervalMinutes: 60,
+        autoDnsEnabled: false,
+        autoDnsType: 'all',
+        autoDnsTargetHost: '',
+        autoDnsIntervalMinutes: 60,
+        autoDnsTopCount: 3,
+        autoDnsLatencyThresholdMs: 2000,
+        autoDnsProbeTimeoutMs: 2500,
         tgAlertDroppedBatchThreshold: 1,
         tgAlertFlushRetryThreshold: 2,
         tgAlertOnScheduledFailure: true,
@@ -8221,6 +8667,8 @@ const UI_HTML = `<!DOCTYPE html>
         schedulerSavePending: false,
         schedulerLoadSeq: 0,
         schedulerProbeSeq: 0,
+        dnsOpsRunPending: false,
+        dnsOpsRefreshPending: false,
         runtimeConfig: {},
         configSnapshots: [],
         runtimeStatus: {},
@@ -8720,6 +9168,7 @@ const UI_HTML = `<!DOCTYPE html>
             security: '安全防护',
             logs: '日志设置',
             monitoring: '监控告警',
+            dnsOps: 'DNS 运维',
             account: '账号设置',
             backup: '备份与恢复',
             all: '全部分区'
@@ -8924,6 +9373,18 @@ const UI_HTML = `<!DOCTYPE html>
           }
           if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledLeaseMs) > 0 && Number(nextConfig.scheduledLeaseMs) < 60000) {
             hints.push('定时任务租约低于 60 秒，慢清理或网络抖动时更容易出现并发重入。');
+          }
+          if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledMaintenanceIntervalMinutes) > 0 && Number(nextConfig.scheduledMaintenanceIntervalMinutes) < 15) {
+            hints.push('日志类任务执行周期低于 15 分钟时，清理、日报与告警会更频繁触发。');
+          }
+          if ((section === 'dnsOps' || section === 'all') && nextConfig.autoDnsEnabled === true && (!String(nextConfig.cfZoneId || '').trim() || !String(nextConfig.cfApiToken || '').trim())) {
+            hints.push('已启用定时自动优选 DNS，但 Cloudflare Zone ID / API 令牌未完整配置。');
+          }
+          if ((section === 'dnsOps' || section === 'all') && nextConfig.autoDnsEnabled === true && !String(nextConfig.autoDnsTargetHost || '').trim()) {
+            hints.push('自动优选目标域名留空时会尝试自动推断 Worker 绑定域名；若 Zone 内绑定复杂，建议显式填写。');
+          }
+          if ((section === 'dnsOps' || section === 'all') && nextConfig.autoDnsEnabled === true && Number(nextConfig.autoDnsIntervalMinutes) > 0 && Number(nextConfig.autoDnsIntervalMinutes) < 15) {
+            hints.push('自动优选执行周期低于 15 分钟时，会更频繁地测速并写入 DNS，请确认上游候选源和 Cloudflare 配额能承受。');
           }
           if ((section === 'monitoring' || section === 'all') && nextConfig.tgAlertOnScheduledFailure === true && (!String(nextConfig.tgBotToken || '').trim() || !String(nextConfig.tgChatId || '').trim())) {
             hints.push('已启用 Telegram 异常告警，但 Bot Token / Chat ID 还未完整配置。');
@@ -10027,6 +10488,75 @@ const UI_HTML = `<!DOCTYPE html>
         };
       },
 
+      getAutoDnsRuntimeState() {
+        const scheduled = this.runtimeStatus?.scheduled && typeof this.runtimeStatus.scheduled === 'object' ? this.runtimeStatus.scheduled : {};
+        return scheduled.autoDns && typeof scheduled.autoDns === 'object' ? scheduled.autoDns : {};
+      },
+
+      getAutoDnsRuntimeSummary() {
+        const state = this.getAutoDnsRuntimeState();
+        const status = String(state.status || 'idle').toLowerCase();
+        const autoSkipReason = String(state.autoSkipReason || '').trim();
+        if (autoSkipReason === 'interval_not_reached' && state.lastAutoSkipAt) return '本轮定时触发已跳过，原因是尚未到自动优选执行周期。';
+        if (autoSkipReason === 'auto_dns_disabled') return '自动优选当前处于关闭状态。';
+        if (status === 'success') {
+          const host = String(state.host || '').trim() || '未记录目标域名';
+          const selectedCount = Number(state.selectedCount) || 0;
+          return '最近一次成功执行已写入 ' + host + '，共 ' + selectedCount + ' 条记录。';
+        }
+        if (status === 'failed') return '最近一次立即执行或定时执行失败，请查看下方错误详情。';
+        if (status === 'running') return '自动优选正在执行中，请稍后刷新状态。';
+        if (status === 'skipped') return '最近一次执行被跳过。';
+        return '暂无自动优选执行记录。';
+      },
+
+      getAutoDnsRuntimeLines() {
+        const state = this.getAutoDnsRuntimeState();
+        const lines = [
+          state.lastStartedAt ? ('最近开始：' + this.formatLocalDateTime(state.lastStartedAt)) : '',
+          state.lastFinishedAt ? ('最近结束：' + this.formatLocalDateTime(state.lastFinishedAt)) : '',
+          state.lastSuccessAt ? ('最近成功：' + this.formatLocalDateTime(state.lastSuccessAt)) : '',
+          state.lastAutoSkipAt ? ('最近跳过：' + this.formatLocalDateTime(state.lastAutoSkipAt)) : '',
+          state.host ? ('目标域名：' + state.host) : '',
+          state.type ? ('候选源：' + state.type) : '',
+          Number.isFinite(Number(state.intervalMinutes)) ? ('执行周期：' + Number(state.intervalMinutes) + ' 分钟') : '',
+          Number.isFinite(Number(state.totalCandidates)) ? ('候选数量：' + Number(state.totalCandidates)) : '',
+          Number.isFinite(Number(state.probedCount)) ? ('测速数量：' + Number(state.probedCount)) : '',
+          Number.isFinite(Number(state.selectedCount)) ? ('写入数量：' + Number(state.selectedCount)) : '',
+          Number.isFinite(Number(state.thresholdMs)) ? ('延迟阈值：' + Number(state.thresholdMs) + ' ms') : ''
+        ].filter(Boolean);
+        const topCandidates = Array.isArray(state.topCandidates) ? state.topCandidates.slice(0, 3) : [];
+        if (topCandidates.length) {
+          lines.push('最近命中：' + topCandidates.map(item => {
+            const ip = String(item?.ip || '').trim();
+            const latencyMs = Number(item?.latencyMs);
+            if (!ip) return '';
+            return Number.isFinite(latencyMs) && latencyMs > 0 ? (ip + ' (' + latencyMs + ' ms)') : ip;
+          }).filter(Boolean).join(' | '));
+        }
+        if (String(state.autoSkipReason || '').trim() === 'interval_not_reached') lines.push('最近跳过原因：未到自动优选执行周期');
+        if (String(state.autoSkipReason || '').trim() === 'auto_dns_disabled') lines.push('最近跳过原因：自动优选当前已关闭');
+        return lines;
+      },
+
+      getAutoDnsRuntimeDetail() {
+        const state = this.getAutoDnsRuntimeState();
+        return String(state.lastError || '').trim();
+      },
+
+      getAutoDnsRuntimeHistory() {
+        const state = this.getAutoDnsRuntimeState();
+        return (Array.isArray(state.history) ? state.history : []).map(item => normalizeUiAutoDnsHistoryEntry(item));
+      },
+
+      async loadRuntimeStatus(options = {}) {
+        const silent = options?.silent === true;
+        const statusRes = await this.apiCall('getRuntimeStatus');
+        this.applyRuntimeStatusState(statusRes.status || {});
+        if (!silent) this.showMessage('运行状态已刷新', { tone: 'success' });
+        return statusRes.status || {};
+      },
+
       applyRuntimeStatusState(statusPayload) {
         const status = statusPayload && typeof statusPayload === 'object' ? statusPayload : {};
         this.runtimeStatus = status;
@@ -10044,19 +10574,23 @@ const UI_HTML = `<!DOCTYPE html>
         this.dashboardRuntimeView.logCard = this.buildRuntimeStatusCard('日志写入', log.lastFlushStatus || (log.lastOverflowAt ? 'partial_failure' : 'idle'), logSummary, logLines, logDetail);
 
         const scheduled = status.scheduled && typeof status.scheduled === 'object' ? status.scheduled : {};
+        const maintenance = scheduled.maintenance && typeof scheduled.maintenance === 'object' ? scheduled.maintenance : {};
         const cleanup = scheduled.cleanup && typeof scheduled.cleanup === 'object' ? scheduled.cleanup : {};
+        const autoDns = scheduled.autoDns && typeof scheduled.autoDns === 'object' ? scheduled.autoDns : {};
         const report = scheduled.report && typeof scheduled.report === 'object' ? scheduled.report : {};
         const alerts = scheduled.alerts && typeof scheduled.alerts === 'object' ? scheduled.alerts : {};
         const scheduledSummary = this.summarizeRuntimeTimestamp(scheduled.lastFinishedAt || scheduled.lastStartedAt || scheduled.lastErrorAt, '最近调度：');
         const scheduledLines = [
           scheduled.lastStartedAt ? ('最近开始：' + this.formatLocalDateTime(scheduled.lastStartedAt)) : '',
           scheduled.lastFinishedAt ? ('最近结束：' + this.formatLocalDateTime(scheduled.lastFinishedAt)) : '',
+          this.formatRuntimeSectionLine('日志类任务：', maintenance),
           this.formatRuntimeSectionLine('日志清理：', cleanup),
+          this.formatRuntimeSectionLine('自动优选：', autoDns),
           this.formatRuntimeSectionLine('日报发送：', report),
           this.formatRuntimeSectionLine('异常告警：', alerts)
         ].filter(Boolean);
-        const scheduledDetail = scheduled.lastError || cleanup.lastError || report.lastError || alerts.lastError
-          ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || report.lastError || alerts.lastError))
+        const scheduledDetail = scheduled.lastError || cleanup.lastError || autoDns.lastError || report.lastError || alerts.lastError
+          ? ('最近调度错误：' + (scheduled.lastError || cleanup.lastError || autoDns.lastError || report.lastError || alerts.lastError))
           : '';
         this.dashboardRuntimeView.scheduledCard = this.buildRuntimeStatusCard('定时任务', scheduled.status || 'idle', scheduledSummary, scheduledLines, scheduledDetail);
       },
@@ -10088,6 +10622,7 @@ const UI_HTML = `<!DOCTYPE html>
               const error = new Error(data.error?.message || ('HTTP ' + res.status));
               error.code = data.error?.code || null;
               error.status = res.status;
+              error.details = data.error?.details ?? data.details ?? null;
               throw error;
           }
           return data;
@@ -10260,7 +10795,14 @@ const UI_HTML = `<!DOCTYPE html>
           this.syncSourceDirectNodesSelection(cfg.sourceDirectNodes || cfg.directSourceNodes || cfg.nodeDirectList || []);
           this.applyConfigSectionToForm('security', cfg);
           this.applyConfigSectionToForm('logs', cfg);
+          this.applyConfigSectionToForm('dnsOps', cfg);
           this.applyConfigSectionToForm('account', cfg);
+          try {
+            const statusRes = await this.apiCall('getRuntimeStatus');
+            this.applyRuntimeStatusState(statusRes.status || {});
+          } catch (statusErr) {
+            console.warn('getRuntimeStatus during loadSettings failed', statusErr);
+          }
           return cfg;
       },
 
@@ -10310,6 +10852,43 @@ const UI_HTML = `<!DOCTYPE html>
           } catch (err) {
               console.error('saveSettings failed', err);
               this.showMessage('设置保存失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+          }
+      },
+
+      async refreshDnsOpsRuntimeStatus() {
+          if (this.dnsOpsRefreshPending) return;
+          this.dnsOpsRefreshPending = true;
+          try {
+              await this.loadRuntimeStatus();
+          } catch (err) {
+              this.showMessage('运行状态刷新失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.dnsOpsRefreshPending = false;
+          }
+      },
+
+      async runAutoDnsNow() {
+          if (this.dnsOpsRunPending) return;
+          if (!await this.askConfirm('立即执行会使用当前已保存的 DNS 运维配置拉取候选、测速并直接写回 Cloudflare DNS。未保存的表单修改不会参与本次执行，是否继续？', { title: '立即执行自动优选', tone: 'warning', confirmText: '立即执行' })) return;
+          this.dnsOpsRunPending = true;
+          try {
+              const res = await this.apiCall('runAutoDnsNow');
+              this.applyRuntimeStatusState(res.status || {});
+              const result = res.result && typeof res.result === 'object' ? res.result : {};
+              const host = String(result.host || '').trim() || '目标域名';
+              const selectedCount = Number(result.selectedCount) || 0;
+              this.showMessage('自动优选已执行完成：' + host + ' 已写入 ' + selectedCount + ' 条记录。', { tone: 'success', modal: true });
+          } catch (err) {
+              if (err?.details?.status && typeof err.details.status === 'object') {
+                  this.applyRuntimeStatusState(err.details.status);
+              } else {
+                  try {
+                      await this.loadRuntimeStatus({ silent: true });
+                  } catch {}
+              }
+              this.showMessage('立即执行失败: ' + (err?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.dnsOpsRunPending = false;
           }
       },
       
@@ -13044,7 +13623,9 @@ export default {
         lastSuccessAt: null,
         lastErrorAt: null,
         lastError: null,
+        maintenance: {},
         cleanup: {},
+        autoDns: {},
         kvTidy: {},
         report: {},
         alerts: {}
@@ -13053,7 +13634,21 @@ export default {
       try {
         const config = runtimeConfig || {};
         const previousScheduledStatus = await Database.getOpsStatusSection(env, "scheduled").catch(() => ({}));
-        
+        const previousMaintenanceState = previousScheduledStatus?.maintenance && typeof previousScheduledStatus.maintenance === "object"
+          ? previousScheduledStatus.maintenance
+          : {};
+        const previousAutoDnsState = previousScheduledStatus?.autoDns && typeof previousScheduledStatus.autoDns === "object"
+          ? previousScheduledStatus.autoDns
+          : {};
+        const maintenanceIntervalMinutes = clampIntegerConfig(config.scheduledMaintenanceIntervalMinutes, Config.Defaults.ScheduledMaintenanceIntervalMinutes, 5, 1440);
+        const autoDnsIntervalMinutes = clampIntegerConfig(config.autoDnsIntervalMinutes, Config.Defaults.AutoDnsIntervalMinutes, 5, 1440);
+        const maintenanceLastRunAt = String(previousMaintenanceState.lastFinishedAt || previousMaintenanceState.lastSuccessAt || previousMaintenanceState.lastStartedAt || "").trim();
+        const autoDnsLastRunAt = String(previousAutoDnsState.lastFinishedAt || previousAutoDnsState.lastSuccessAt || previousAutoDnsState.lastStartedAt || "").trim();
+        const shouldRunMaintenance = shouldRunIntervalGate(maintenanceLastRunAt, maintenanceIntervalMinutes, true);
+        const shouldRunAutoDns = config.autoDnsEnabled === true && shouldRunIntervalGate(autoDnsLastRunAt, autoDnsIntervalMinutes, true);
+        const nowIso = new Date().toISOString();
+
+        if (shouldRunMaintenance) {
 	        if (db) {
 	          try {
 	            await ensureLeaseActive();
@@ -13166,7 +13761,96 @@ export default {
           lastAutoSkipAt: new Date().toISOString(),
           autoSkipReason: "manual_only"
         };
-        
+
+        scheduledState.maintenance = {
+          status: scheduledState.status === "success" ? "success" : "partial_failure",
+          lastStartedAt: startedAt,
+          lastFinishedAt: new Date().toISOString(),
+          lastSuccessAt: scheduledState.status === "success" ? new Date().toISOString() : "",
+          intervalMinutes: maintenanceIntervalMinutes,
+          trigger: "scheduled"
+        };
+
+        if (config.autoDnsEnabled === true) {
+          if (shouldRunAutoDns) {
+            try {
+              await ensureLeaseActive();
+              const autoDnsResult = await runScheduledAutoDnsUpdate(env, kv, config);
+              const autoDnsFinishedAt = new Date().toISOString();
+              scheduledState.autoDns = {
+                status: "success",
+                lastStartedAt: startedAt,
+                lastFinishedAt: autoDnsFinishedAt,
+                lastSuccessAt: autoDnsFinishedAt,
+                host: autoDnsResult.host,
+                type: autoDnsResult.type,
+                totalCandidates: autoDnsResult.totalCandidates,
+                probedCount: autoDnsResult.probedCount,
+                selectedCount: autoDnsResult.selectedCount,
+                thresholdMs: autoDnsResult.thresholdMs,
+                intervalMinutes: autoDnsIntervalMinutes,
+                records: autoDnsResult.records,
+                topCandidates: autoDnsResult.topCandidates,
+                trigger: "scheduled",
+                history: pushAutoDnsHistoryEntry(previousAutoDnsState.history, {
+                  trigger: "scheduled",
+                  status: "success",
+                  startedAt,
+                  finishedAt: autoDnsFinishedAt,
+                  host: autoDnsResult.host,
+                  type: autoDnsResult.type,
+                  selectedCount: autoDnsResult.selectedCount,
+                  thresholdMs: autoDnsResult.thresholdMs,
+                  records: autoDnsResult.records,
+                  topCandidates: autoDnsResult.topCandidates
+                }),
+                lastAutoSkipAt: "",
+                autoSkipReason: ""
+              };
+            } catch (autoDnsErr) {
+              const autoDnsFinishedAt = new Date().toISOString();
+              scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
+              scheduledState.autoDns = {
+                status: "failed",
+                lastStartedAt: startedAt,
+                lastFinishedAt: autoDnsFinishedAt,
+                lastErrorAt: autoDnsFinishedAt,
+                lastError: autoDnsErr?.message || String(autoDnsErr),
+                type: String(config.autoDnsType || ""),
+                host: String(config.autoDnsTargetHost || ""),
+                intervalMinutes: autoDnsIntervalMinutes,
+                trigger: "scheduled",
+                history: pushAutoDnsHistoryEntry(previousAutoDnsState.history, {
+                  trigger: "scheduled",
+                  status: "failed",
+                  startedAt,
+                  finishedAt: autoDnsFinishedAt,
+                  host: String(config.autoDnsTargetHost || ""),
+                  type: String(config.autoDnsType || ""),
+                  error: autoDnsErr?.message || String(autoDnsErr)
+                }),
+                lastAutoSkipAt: "",
+                autoSkipReason: ""
+              };
+              console.error("Scheduled Auto DNS Error: ", autoDnsErr);
+            }
+          } else {
+            scheduledState.autoDns = {
+              ...previousAutoDnsState,
+              intervalMinutes: autoDnsIntervalMinutes,
+              lastAutoSkipAt: nowIso,
+              autoSkipReason: "interval_not_reached"
+            };
+          }
+        } else {
+          scheduledState.autoDns = {
+            ...previousAutoDnsState,
+            intervalMinutes: autoDnsIntervalMinutes,
+            lastAutoSkipAt: nowIso,
+            autoSkipReason: "auto_dns_disabled"
+          };
+        }
+
         const { tgBotToken, tgChatId } = config;
         if (tgBotToken && tgChatId) {
             try {
@@ -13215,6 +13899,16 @@ export default {
             lastError: alertErr?.message || String(alertErr)
           };
           console.error("Scheduled Alert Error: ", alertErr);
+        }
+        } else {
+          scheduledState.maintenance = {
+            ...previousMaintenanceState,
+            status: "skipped",
+            lastSkippedAt: nowIso,
+            reason: "interval_not_reached",
+            intervalMinutes: maintenanceIntervalMinutes,
+            trigger: "scheduled"
+          };
         }
       } catch (err) {
           scheduledState.status = "failed";
