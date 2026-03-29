@@ -97,11 +97,15 @@ const Config = {
     LogBatchRetryBackoffMs: 75,
     ScheduledLeaseMinMs: 30 * 1000,
     ScheduledLeaseMs: 5 * 60 * 1000,
+    ScheduleUtcOffsetMinutes: 8 * 60,
     ScheduledMaintenanceIntervalMinutes: 60,
     ScheduledMaintenanceMode: "interval",
     ScheduledMaintenanceTime: "08:30",
     AutoDnsEnabled: false,
     AutoDnsType: "all",
+    DnsAutoUploadTopN: 3,
+    DnsAutoUploadCountryCodes: [],
+    DnsAutoUploadRecordTypes: ["A"],
     AutoDnsIntervalMinutes: 60,
     AutoDnsTopCount: 3,
     AutoDnsLatencyThresholdMs: 2000,
@@ -213,6 +217,57 @@ const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-Emby-Client, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Client-Version, X-MediaBrowser-Authorization, X-MediaBrowser-Token, X-MediaBrowser-Client, X-MediaBrowser-Device-Id, X-MediaBrowser-Device-Name, X-MediaBrowser-Client-Version"
+};
+
+const CF_COLO_META = {
+  AKL: { cityName: "Auckland", countryCode: "NZ", countryName: "新西兰" },
+  AMS: { cityName: "Amsterdam", countryCode: "NL", countryName: "荷兰" },
+  ARN: { cityName: "Stockholm", countryCode: "SE", countryName: "瑞典" },
+  ATL: { cityName: "Atlanta", countryCode: "US", countryName: "美国" },
+  BKK: { cityName: "Bangkok", countryCode: "TH", countryName: "泰国" },
+  BOM: { cityName: "Mumbai", countryCode: "IN", countryName: "印度" },
+  CDG: { cityName: "Paris", countryCode: "FR", countryName: "法国" },
+  CGK: { cityName: "Jakarta", countryCode: "ID", countryName: "印度尼西亚" },
+  CPH: { cityName: "Copenhagen", countryCode: "DK", countryName: "丹麦" },
+  DEL: { cityName: "Delhi", countryCode: "IN", countryName: "印度" },
+  DFW: { cityName: "Dallas", countryCode: "US", countryName: "美国" },
+  DOH: { cityName: "Doha", countryCode: "QA", countryName: "卡塔尔" },
+  DXB: { cityName: "Dubai", countryCode: "AE", countryName: "阿联酋" },
+  EWR: { cityName: "Newark", countryCode: "US", countryName: "美国" },
+  FRA: { cityName: "Frankfurt", countryCode: "DE", countryName: "德国" },
+  GRU: { cityName: "Sao Paulo", countryCode: "BR", countryName: "巴西" },
+  HKG: { cityName: "Hong Kong", countryCode: "HK", countryName: "中国香港" },
+  HND: { cityName: "Tokyo", countryCode: "JP", countryName: "日本" },
+  IAD: { cityName: "Ashburn", countryCode: "US", countryName: "美国" },
+  ICN: { cityName: "Seoul", countryCode: "KR", countryName: "韩国" },
+  JNB: { cityName: "Johannesburg", countryCode: "ZA", countryName: "南非" },
+  KIX: { cityName: "Osaka", countryCode: "JP", countryName: "日本" },
+  KUL: { cityName: "Kuala Lumpur", countryCode: "MY", countryName: "马来西亚" },
+  LAX: { cityName: "Los Angeles", countryCode: "US", countryName: "美国" },
+  LHR: { cityName: "London", countryCode: "GB", countryName: "英国" },
+  MAD: { cityName: "Madrid", countryCode: "ES", countryName: "西班牙" },
+  MEL: { cityName: "Melbourne", countryCode: "AU", countryName: "澳大利亚" },
+  MIA: { cityName: "Miami", countryCode: "US", countryName: "美国" },
+  MNL: { cityName: "Manila", countryCode: "PH", countryName: "菲律宾" },
+  MXP: { cityName: "Milan", countryCode: "IT", countryName: "意大利" },
+  NRT: { cityName: "Tokyo", countryCode: "JP", countryName: "日本" },
+  ORD: { cityName: "Chicago", countryCode: "US", countryName: "美国" },
+  OSL: { cityName: "Oslo", countryCode: "NO", countryName: "挪威" },
+  PHX: { cityName: "Phoenix", countryCode: "US", countryName: "美国" },
+  PRG: { cityName: "Prague", countryCode: "CZ", countryName: "捷克" },
+  SAN: { cityName: "San Diego", countryCode: "US", countryName: "美国" },
+  SCL: { cityName: "Santiago", countryCode: "CL", countryName: "智利" },
+  SEA: { cityName: "Seattle", countryCode: "US", countryName: "美国" },
+  SFO: { cityName: "San Francisco", countryCode: "US", countryName: "美国" },
+  SIN: { cityName: "Singapore", countryCode: "SG", countryName: "新加坡" },
+  SJC: { cityName: "San Jose", countryCode: "US", countryName: "美国" },
+  SYD: { cityName: "Sydney", countryCode: "AU", countryName: "澳大利亚" },
+  TPE: { cityName: "Taipei", countryCode: "TW", countryName: "中国台湾" },
+  VIE: { cityName: "Vienna", countryCode: "AT", countryName: "奥地利" },
+  WAW: { cityName: "Warsaw", countryCode: "PL", countryName: "波兰" },
+  YUL: { cityName: "Montreal", countryCode: "CA", countryName: "加拿大" },
+  YVR: { cityName: "Vancouver", countryCode: "CA", countryName: "加拿大" },
+  YYZ: { cityName: "Toronto", countryCode: "CA", countryName: "加拿大" }
 };
 
 function mergeVaryHeader(headers, value) {
@@ -380,6 +435,33 @@ function isLikelyIpAddress(value) {
   if (!text) return false;
   if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(text)) return true;
   return /^[0-9a-f:]+$/i.test(text) && text.includes(":");
+}
+
+function normalizeCfColoMeta(code = "") {
+  const normalizedCode = String(code || "").trim().toUpperCase();
+  const meta = CF_COLO_META[normalizedCode];
+  if (!normalizedCode) {
+    return {
+      coloCode: "",
+      cityName: "",
+      countryCode: "UNKNOWN",
+      countryName: "未知"
+    };
+  }
+  if (!meta) {
+    return {
+      coloCode: normalizedCode,
+      cityName: normalizedCode,
+      countryCode: "UNKNOWN",
+      countryName: "未知"
+    };
+  }
+  return {
+    coloCode: normalizedCode,
+    cityName: String(meta.cityName || normalizedCode),
+    countryCode: String(meta.countryCode || "UNKNOWN"),
+    countryName: String(meta.countryName || "未知")
+  };
 }
 
 function normalizeTargetBasePath(pathname = "/") {
@@ -1449,7 +1531,7 @@ async function probeRemoteCandidateIpLatency(ip = "", options = {}) {
   const probeUrl = buildRemoteCandidateProbeUrl(ip);
   const timeoutMs = clampIntegerConfig(options.timeoutMs, 2500, 500, 10000);
   if (!probeUrl) {
-    return { ok: false, latencyMs: 9999, url: "", status: 0, error: "invalid_ip" };
+    return { ok: false, latencyMs: 9999, url: "", status: 0, error: "invalid_ip", coloCode: "", cityName: "", countryCode: "UNKNOWN", countryName: "未知" };
   }
 
   const controller = new AbortController();
@@ -1464,12 +1546,19 @@ async function probeRemoteCandidateIpLatency(ip = "", options = {}) {
       headers: { "User-Agent": "Mozilla/5.0" },
       signal: controller.signal
     });
+    const traceText = await response.text().catch(() => "");
+    const trace = parseCfTraceText(traceText);
+    const coloMeta = normalizeCfColoMeta(trace.colo || "");
     return {
       ok: true,
       latencyMs: Math.max(1, nowMs() - startedAt),
       url: probeUrl,
       status: Number(response?.status) || 0,
-      error: ""
+      error: "",
+      coloCode: coloMeta.coloCode,
+      cityName: coloMeta.cityName,
+      countryCode: coloMeta.countryCode,
+      countryName: coloMeta.countryName
     };
   } catch (error) {
     return {
@@ -1477,7 +1566,11 @@ async function probeRemoteCandidateIpLatency(ip = "", options = {}) {
       latencyMs: 9999,
       url: probeUrl,
       status: 0,
-      error: error?.name === "AbortError" ? "timeout" : String(error?.message || error || "probe_failed")
+      error: error?.name === "AbortError" ? "timeout" : String(error?.message || error || "probe_failed"),
+      coloCode: "",
+      cityName: "",
+      countryCode: "UNKNOWN",
+      countryName: "未知"
     };
   } finally {
     if (timeoutId !== null) clearTimeout(timeoutId);
@@ -1663,7 +1756,14 @@ async function runScheduledAutoDnsUpdate(env, kv, runtimeConfig = {}) {
 
   const probeTimeoutMs = clampIntegerConfig(config.autoDnsProbeTimeoutMs, Config.Defaults.AutoDnsProbeTimeoutMs, 500, 10000);
   const thresholdMs = clampIntegerConfig(config.autoDnsLatencyThresholdMs, Config.Defaults.AutoDnsLatencyThresholdMs, 200, 10000);
-  const topCount = clampIntegerConfig(config.autoDnsTopCount, Config.Defaults.AutoDnsTopCount, 1, 3);
+  const topCount = clampIntegerConfig(
+    config.dnsAutoUploadTopN,
+    clampIntegerConfig(config.autoDnsTopCount, Config.Defaults.AutoDnsTopCount, 1, 3),
+    1,
+    3
+  );
+  const allowedRecordTypes = new Set(normalizeDnsAutoUploadRecordTypes(config.dnsAutoUploadRecordTypes));
+  const allowedCountryCodes = normalizeDnsAutoUploadCountryCodes(config.dnsAutoUploadCountryCodes);
   const probeCandidates = sourceCandidates.slice(0, Math.max(topCount, Math.min(sourceCandidates.length, 12)));
   const probedCandidates = await runWithConcurrency(probeCandidates, 4, async (item) => {
     const probe = await probeRemoteCandidateIpLatency(item?.ip, { timeoutMs: probeTimeoutMs });
@@ -1672,18 +1772,28 @@ async function runScheduledAutoDnsUpdate(env, kv, runtimeConfig = {}) {
       latencyMs: probe.latencyMs,
       probeOk: probe.ok,
       probeStatus: probe.status,
-      probeError: probe.error
+      probeError: probe.error,
+      coloCode: probe.coloCode,
+      cityName: probe.cityName,
+      countryCode: probe.countryCode,
+      countryName: probe.countryName
     };
   });
-  const topCandidates = selectTopCandidatesForDns(probedCandidates, { thresholdMs, limit: topCount });
+  const filteredCandidates = allowedCountryCodes.length
+    ? probedCandidates.filter(item => allowedCountryCodes.includes(String(item?.countryCode || "").trim().toUpperCase()))
+    : probedCandidates;
+  const topCandidates = selectTopCandidatesForDns(filteredCandidates, { thresholdMs, limit: topCount });
   if (!topCandidates.length) {
+    if (allowedCountryCodes.length) {
+      throw new Error(`国家筛选后没有候选通过延迟阈值（${thresholdMs} ms）`);
+    }
     throw new Error(`没有候选通过延迟阈值（${thresholdMs} ms）`);
   }
 
   const records = topCandidates.map(item => ({
     type: String(item?.ip || "").includes(":") ? "AAAA" : "A",
     content: String(item?.ip || "").trim().replace(/^\[|\]$/g, "")
-  })).filter(item => item.content);
+  })).filter(item => item.content && allowedRecordTypes.has(item.type));
   if (!records.length) throw new Error("没有可写入 DNS 的候选记录");
 
   const saved = await performCloudflareDnsSave(env, kv, {
@@ -1707,11 +1817,15 @@ async function runScheduledAutoDnsUpdate(env, kv, runtimeConfig = {}) {
     thresholdMs,
     probeTimeoutMs,
     topCount,
+    countryCodes: allowedCountryCodes,
+    recordTypes: [...allowedRecordTypes],
     records,
     topCandidates: topCandidates.map(item => ({
       ip: String(item?.ip || "").trim(),
       latencyMs: Number(item?.latencyMs) || 0,
-      lineType: String(item?.lineType || item?.source || "")
+      lineType: String(item?.lineType || item?.source || ""),
+      countryCode: String(item?.countryCode || "").trim().toUpperCase(),
+      countryName: String(item?.countryName || "")
     })),
     dns: saved
   };
@@ -1725,19 +1839,44 @@ function shouldRunIntervalGate(lastRunAt = "", intervalMinutes = 0, fallback = t
   return (nowMs() - parsed) >= intervalMs;
 }
 
+function resolveEffectiveScheduledLeaseMs(config = {}) {
+  const configuredLeaseMs = clampIntegerConfig(
+    config?.scheduledLeaseMs,
+    Config.Defaults.ScheduledLeaseMs,
+    Config.Defaults.ScheduledLeaseMinMs,
+    15 * 60 * 1000
+  );
+  if (config?.autoDnsEnabled !== true) return configuredLeaseMs;
+  const autoDnsIntervalMinutes = clampIntegerConfig(
+    config?.autoDnsIntervalMinutes,
+    Config.Defaults.AutoDnsIntervalMinutes,
+    5,
+    1440
+  );
+  const autoDnsIntervalMs = autoDnsIntervalMinutes * 60 * 1000;
+  if (autoDnsIntervalMs <= Config.Defaults.ScheduledLeaseMinMs) return configuredLeaseMs;
+  // Keep the lease shorter than the next auto-DNS window so a 5-minute cron
+  // does not get blocked by a full 5-minute lock held by the previous run.
+  const safetyBufferMs = Math.min(30000, Math.max(5000, Math.floor(autoDnsIntervalMs * 0.1)));
+  const safeLeaseCeilingMs = Math.max(Config.Defaults.ScheduledLeaseMinMs, autoDnsIntervalMs - safetyBufferMs);
+  return Math.min(configuredLeaseMs, safeLeaseCeilingMs);
+}
+
 function resolveScheduledMaintenanceGate(config = {}, previousState = {}) {
   const mode = normalizeScheduledMaintenanceMode(config.scheduledMaintenanceMode);
   const intervalMinutes = clampIntegerConfig(config.scheduledMaintenanceIntervalMinutes, Config.Defaults.ScheduledMaintenanceIntervalMinutes, 5, 1440);
   const dailyTime = normalizeScheduledClockTime(config.scheduledMaintenanceTime, Config.Defaults.ScheduledMaintenanceTime);
+  const utcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(config.scheduleUtcOffsetMinutes);
   const lastRunAt = String(previousState.lastFinishedAt || previousState.lastSuccessAt || previousState.lastStartedAt || "").trim();
   if (mode === "daily") {
-    const dailyGate = shouldRunDailyClockGate(lastRunAt, dailyTime);
+    const dailyGate = shouldRunDailyClockGate(lastRunAt, dailyTime, utcOffsetMinutes);
     return {
       shouldRun: dailyGate.shouldRun,
       reason: dailyGate.reason,
       mode,
       intervalMinutes,
-      dailyTime
+      dailyTime,
+      utcOffsetMinutes
     };
   }
   return {
@@ -1745,7 +1884,8 @@ function resolveScheduledMaintenanceGate(config = {}, previousState = {}) {
     reason: shouldRunIntervalGate(lastRunAt, intervalMinutes, true) ? "due" : "interval_not_reached",
     mode,
     intervalMinutes,
-    dailyTime
+    dailyTime,
+    utcOffsetMinutes
   };
 }
 
@@ -2262,23 +2402,84 @@ function normalizeScheduledClockTime(value = "", fallback = Config.Defaults.Sche
   return fallback;
 }
 
-function getShanghaiClockParts(now = new Date()) {
-  const shanghaiMs = now.getTime() + 8 * 60 * 60 * 1000;
-  const d = new Date(shanghaiMs);
+export function normalizeScheduleUtcOffsetMinutes(value) {
+  return clampIntegerConfig(value, Config.Defaults.ScheduleUtcOffsetMinutes, -12 * 60, 14 * 60);
+}
+
+export function normalizeDnsAutoUploadRecordTypes(value = []) {
+  const rawList = Array.isArray(value)
+    ? value
+    : String(value || "")
+      .split(",")
+      .map(item => item.trim())
+      .filter(Boolean);
+  const normalized = [...new Set(rawList
+    .map(item => String(item || "").trim().toUpperCase())
+    .filter(item => item === "A" || item === "AAAA"))];
+  return normalized.length ? normalized : Config.Defaults.DnsAutoUploadRecordTypes.slice();
+}
+
+export function normalizeDnsAutoUploadCountryCodes(value = []) {
+  const rawList = Array.isArray(value)
+    ? value
+    : String(value || "")
+      .split(",")
+      .map(item => item.trim())
+      .filter(Boolean);
+  const allowedCodes = new Set(
+    Object.values(CF_COLO_META)
+      .map(meta => String(meta?.countryCode || "").trim().toUpperCase())
+      .filter(Boolean)
+  );
+  return [...new Set(rawList
+    .map(item => String(item || "").trim().toUpperCase())
+    .filter(item => item && allowedCodes.has(item)))];
+}
+
+function parseCfTraceText(text = "") {
+  const parsed = {};
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const separatorIndex = line.indexOf("=");
+    if (separatorIndex <= 0) continue;
+    const key = line.slice(0, separatorIndex).trim();
+    const value = line.slice(separatorIndex + 1).trim();
+    if (!key) continue;
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
+function formatScheduledUtcOffsetLabel(offsetMinutes = Config.Defaults.ScheduleUtcOffsetMinutes) {
+  const minutes = normalizeScheduleUtcOffsetMinutes(offsetMinutes);
+  const sign = minutes >= 0 ? "+" : "-";
+  const absoluteMinutes = Math.abs(minutes);
+  const hour = String(Math.floor(absoluteMinutes / 60)).padStart(2, "0");
+  const minute = String(absoluteMinutes % 60).padStart(2, "0");
+  return `UTC${sign}${hour}:${minute}`;
+}
+
+function getScheduledClockParts(now = new Date(), utcOffsetMinutes = Config.Defaults.ScheduleUtcOffsetMinutes) {
+  const offsetMinutes = normalizeScheduleUtcOffsetMinutes(utcOffsetMinutes);
+  const shiftedMs = now.getTime() + offsetMinutes * 60 * 1000;
+  const d = new Date(shiftedMs);
   return {
     year: d.getUTCFullYear(),
     month: d.getUTCMonth(),
     date: d.getUTCDate(),
     dayKey: `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`,
-    nowMs: now.getTime()
+    nowMs: now.getTime(),
+    utcOffsetMinutes: offsetMinutes,
+    offsetLabel: formatScheduledUtcOffsetLabel(offsetMinutes)
   };
 }
 
-function shouldRunDailyClockGate(lastRunAt = "", dailyTime = Config.Defaults.ScheduledMaintenanceTime) {
+function shouldRunDailyClockGate(lastRunAt = "", dailyTime = Config.Defaults.ScheduledMaintenanceTime, utcOffsetMinutes = Config.Defaults.ScheduleUtcOffsetMinutes) {
   const normalizedTime = normalizeScheduledClockTime(dailyTime);
   const [hourText, minuteText] = normalizedTime.split(":");
-  const parts = getShanghaiClockParts(new Date());
-  const targetUtcMs = Date.UTC(parts.year, parts.month, parts.date, Number(hourText) - 8, Number(minuteText), 0, 0);
+  const parts = getScheduledClockParts(new Date(), utcOffsetMinutes);
+  const offsetHours = Math.trunc(parts.utcOffsetMinutes / 60);
+  const offsetRemainingMinutes = parts.utcOffsetMinutes % 60;
+  const targetUtcMs = Date.UTC(parts.year, parts.month, parts.date, Number(hourText) - offsetHours, Number(minuteText) - offsetRemainingMinutes, 0, 0);
   if (parts.nowMs < targetUtcMs) {
     return { shouldRun: false, reason: "before_daily_time", normalizedTime, targetUtcMs };
   }
@@ -2295,10 +2496,26 @@ function sanitizeRuntimeConfig(input = {}) {
   sanitized.defaultMediaAuthMode = normalizeDefaultMediaAuthMode(sanitized.defaultMediaAuthMode);
   sanitized.settingsExperienceMode = String(sanitized.settingsExperienceMode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
   sanitized.logSearchMode = normalizeLogSearchMode(sanitized.logSearchMode);
+  sanitized.scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(sanitized.scheduleUtcOffsetMinutes);
   sanitized.scheduledMaintenanceMode = normalizeScheduledMaintenanceMode(sanitized.scheduledMaintenanceMode);
   sanitized.scheduledMaintenanceTime = normalizeScheduledClockTime(sanitized.scheduledMaintenanceTime);
   sanitized.autoDnsType = normalizeAutoDnsScheduleType(sanitized.autoDnsType);
   sanitized.autoDnsTargetHost = normalizeHostnameText(sanitized.autoDnsTargetHost || "");
+  sanitized.dnsAutoUploadCountryCodes = normalizeDnsAutoUploadCountryCodes(
+    sanitized.dnsAutoUploadCountryCodes
+  );
+  sanitized.dnsAutoUploadRecordTypes = normalizeDnsAutoUploadRecordTypes(
+    sanitized.dnsAutoUploadRecordTypes
+  );
+  sanitized.dnsAutoUploadTopN = clampIntegerConfig(
+    sanitized.dnsAutoUploadTopN,
+    sanitized.autoDnsTopCount,
+    1,
+    3
+  );
+  if (!Number.isFinite(Number(sanitized.dnsAutoUploadTopN))) sanitized.dnsAutoUploadTopN = Config.Defaults.DnsAutoUploadTopN;
+  if (!sanitized.dnsAutoUploadTopN) sanitized.dnsAutoUploadTopN = Config.Defaults.DnsAutoUploadTopN;
+  sanitized.autoDnsTopCount = sanitized.dnsAutoUploadTopN;
   return sanitized;
 }
 
@@ -2578,12 +2795,16 @@ const CONFIG_ALLOWED_FIELDS = [
   "logBatchRetryCount",
   "logBatchRetryBackoffMs",
   "scheduledLeaseMs",
+  "scheduleUtcOffsetMinutes",
   "scheduledMaintenanceIntervalMinutes",
   "scheduledMaintenanceMode",
   "scheduledMaintenanceTime",
   "autoDnsEnabled",
   "autoDnsType",
   "autoDnsTargetHost",
+  "dnsAutoUploadTopN",
+  "dnsAutoUploadCountryCodes",
+  "dnsAutoUploadRecordTypes",
   "autoDnsIntervalMinutes",
   "autoDnsTopCount",
   "autoDnsLatencyThresholdMs",
@@ -2601,7 +2822,9 @@ const CONFIG_ALLOWED_FIELDS = [
 ];
 
 const CONFIG_ALIAS_FIELDS = {
-  sourceDirectNodes: ["directSourceNodes", "nodeDirectList"]
+  sourceDirectNodes: ["directSourceNodes", "nodeDirectList"],
+  dnsAutoUploadTopN: ["autoDnsWriteCount"],
+  dnsAutoUploadRecordTypes: ["autoDnsRecordTypes"]
 };
 
 const CONFIG_DEFAULT_TRUE_FIELDS = [
@@ -2628,7 +2851,9 @@ const CONFIG_SANITIZE_RULES = {
   aliasFields: CONFIG_ALIAS_FIELDS,
   trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode", "scheduledMaintenanceMode", "scheduledMaintenanceTime", "autoDnsType", "autoDnsTargetHost", "defaultMediaAuthMode"],
   arrayNormalizers: {
-    sourceDirectNodes: "nodeNameList"
+    sourceDirectNodes: "nodeNameList",
+    dnsAutoUploadCountryCodes: normalizeDnsAutoUploadCountryCodes,
+    dnsAutoUploadRecordTypes: normalizeDnsAutoUploadRecordTypes
   },
   integerFields: {
     logRetentionDays: { fallback: Config.Defaults.LogRetentionDays, min: 1, max: Config.Defaults.LogRetentionDaysMax },
@@ -2637,7 +2862,9 @@ const CONFIG_SANITIZE_RULES = {
     logBatchRetryCount: { fallback: Config.Defaults.LogBatchRetryCount, min: 0, max: 5 },
     logBatchRetryBackoffMs: { fallback: Config.Defaults.LogBatchRetryBackoffMs, min: 0, max: 5000 },
     scheduledLeaseMs: { fallback: Config.Defaults.ScheduledLeaseMs, min: Config.Defaults.ScheduledLeaseMinMs, max: 15 * 60 * 1000 },
+    scheduleUtcOffsetMinutes: { fallback: Config.Defaults.ScheduleUtcOffsetMinutes, min: -12 * 60, max: 14 * 60 },
     scheduledMaintenanceIntervalMinutes: { fallback: Config.Defaults.ScheduledMaintenanceIntervalMinutes, min: 5, max: 1440 },
+    dnsAutoUploadTopN: { fallback: Config.Defaults.DnsAutoUploadTopN, min: 1, max: 3 },
     autoDnsIntervalMinutes: { fallback: Config.Defaults.AutoDnsIntervalMinutes, min: 5, max: 1440 },
     autoDnsTopCount: { fallback: Config.Defaults.AutoDnsTopCount, min: 1, max: 3 },
     autoDnsLatencyThresholdMs: { fallback: Config.Defaults.AutoDnsLatencyThresholdMs, min: 200, max: 10000 },
@@ -3683,6 +3910,7 @@ const Database = {
       if (!db || !kv) throw new Error("Database or KV not configured");
 
       const config = await kv.get(this.CONFIG_KEY, { type: "json" }) || {};
+      const runtimeConfig = sanitizeRuntimeConfig(config);
       const tgBotToken = String(config.tgBotToken || "").trim();
       const tgChatId = String(config.tgChatId || "").trim();
       const cfAccountId = String(config.cfAccountId || "").trim();
@@ -3691,15 +3919,16 @@ const Database = {
       if (!tgBotToken || !tgChatId) throw new Error("请先完善 Telegram Bot Token 和 Chat ID 配置");
 
       const now = new Date();
-      const utc8Ms = now.getTime() + 8 * 3600 * 1000;
-      const d = new Date(utc8Ms);
+      const scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(runtimeConfig.scheduleUtcOffsetMinutes);
+      const shiftedMs = now.getTime() + scheduleUtcOffsetMinutes * 60 * 1000;
+      const d = new Date(shiftedMs);
       const yyyy = d.getUTCFullYear();
       const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
       const dd = String(d.getUTCDate()).padStart(2, '0');
       const todayStr = `${mm}-${dd}`;
       const dateString = `${yyyy}-${mm}-${dd}`;
 
-      const startOfDayTs = Date.UTC(yyyy, d.getUTCMonth(), d.getUTCDate()) - 8 * 3600 * 1000;
+      const startOfDayTs = Date.UTC(yyyy, d.getUTCMonth(), d.getUTCDate()) - scheduleUtcOffsetMinutes * 60 * 1000;
       const endOfDayTs = startOfDayTs + 86400000 - 1;
       const videoWhereClause = getVideoRequestWhereClause();
 
@@ -3735,7 +3964,7 @@ const Database = {
       let reqStr = reqDisplay;
       if (reqStr === "0" && reqTotal > 1000) reqStr = (reqTotal / 1000).toFixed(2) + "k";
 
-      const msgText = `📊 Cloudflare Zone 每日报表 (UTC+8)\n域名: ${domainName}\n\n📅 今天 (${todayStr})\n请求数: ${reqStr}\n视频流量 (CF 总计): ${cfTrafficStatus}\n请求: 播放请求 ${playCount} 次 | 获取播放信息 ${infoCount} 次\n#Cloudflare #Emby #日报`;
+      const msgText = `📊 Cloudflare Zone 每日报表 (${formatScheduledUtcOffsetLabel(scheduleUtcOffsetMinutes)})\n域名: ${domainName}\n\n📅 今天 (${todayStr})\n请求数: ${reqStr}\n视频流量 (CF 总计): ${cfTrafficStatus}\n请求: 播放请求 ${playCount} 次 | 获取播放信息 ${infoCount} 次\n#Cloudflare #Emby #日报`;
       await this.sendTelegramMessage({ tgBotToken, tgChatId, text: msgText });
       return true;
   },
@@ -4307,6 +4536,9 @@ const Database = {
               probedCount: result.probedCount,
               selectedCount: result.selectedCount,
               thresholdMs: result.thresholdMs,
+              intervalMinutes: clampIntegerConfig(runtimeConfig.autoDnsIntervalMinutes, Config.Defaults.AutoDnsIntervalMinutes, 5, 1440),
+              countryCodes: Array.isArray(result.countryCodes) ? result.countryCodes : normalizeDnsAutoUploadCountryCodes(runtimeConfig.dnsAutoUploadCountryCodes),
+              recordTypes: Array.isArray(result.recordTypes) ? result.recordTypes : normalizeDnsAutoUploadRecordTypes(runtimeConfig.dnsAutoUploadRecordTypes),
               records: result.records,
               topCandidates: result.topCandidates,
               trigger: "manual",
@@ -4340,6 +4572,9 @@ const Database = {
               lastFinishedAt: finishedAt,
               lastErrorAt: finishedAt,
               lastError: error?.message || String(error),
+              intervalMinutes: clampIntegerConfig(runtimeConfig.autoDnsIntervalMinutes, Config.Defaults.AutoDnsIntervalMinutes, 5, 1440),
+              countryCodes: normalizeDnsAutoUploadCountryCodes(runtimeConfig.dnsAutoUploadCountryCodes),
+              recordTypes: normalizeDnsAutoUploadRecordTypes(runtimeConfig.dnsAutoUploadRecordTypes),
               trigger: "manual",
               history,
               lastAutoSkipAt: "",
@@ -5738,7 +5973,8 @@ const Proxy = {
       category: this.classifyProxyLogCategory(execution.requestTraits),
       errorDetail: `PlaybackInfoCache=hit; TTL=${execution.playbackInfoCacheTtlSec}s`,
       redirectMode: "playback_info_cache",
-      decisionReason: "playback_info_cache_hit"
+      decisionReason: "playback_info_cache_hit",
+      upstreamResponse: cachedResponse
     });
     return new Response(execution.request.method === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
       status: cachedResponse.status,
@@ -6058,6 +6294,12 @@ const Proxy = {
     if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
     return hints.length > 0 ? hints.join(" | ") : response.statusText;
   },
+  extractColoCodeFromRay(rayValue) {
+    const ray = String(rayValue || "").trim();
+    if (!ray) return null;
+    const match = /-([A-Z0-9]{3,8})$/i.exec(ray);
+    return match ? match[1].toUpperCase() : null;
+  },
   buildStructuredLogDetail(execution, payload = {}, options = {}) {
     const deliveryMode = String(options.deliveryMode || "").trim().toLowerCase() === "direct" ? "direct" : "proxy";
     const redirectMode = String(options.redirectMode || "").trim() || null;
@@ -6065,6 +6307,18 @@ const Proxy = {
     const protocolFailureReason = String(options.protocolFailureReason || "").trim() || null;
     const strmResolution = String(options.strmResolution || execution?.strmResolutionState || "").trim() || null;
     const strmError = String(options.strmError || execution?.strmErrorReason || "").trim() || null;
+    const ingressColo = String(
+      options.ingressColo
+      || execution?.request?.cf?.colo
+      || execution?.colo
+      || ""
+    ).trim().toUpperCase() || null;
+    const egressColo = String(
+      options.egressColo
+      || this.extractColoCodeFromRay(options.upstreamResponse?.headers?.get?.("CF-Ray"))
+      || this.extractColoCodeFromRay(options.responseHeaders?.get?.("CF-Ray"))
+      || ""
+    ).trim().toUpperCase() || null;
     return {
       deliveryMode,
       redirectDecision: {
@@ -6080,6 +6334,8 @@ const Proxy = {
       progressIntervalSec: Math.max(0, Math.trunc(Number(options.progressIntervalSec ?? execution?.videoProgressForwardIntervalSec) || 0)),
       strmResolution,
       strmError,
+      ingressColo,
+      egressColo,
       upstreamHost: String(options.upstreamHost || options.finalUrl?.hostname || "").trim() || null,
       upstreamStatus: Number(options.upstreamStatus || payload.statusCode || 0) || 0
     };
@@ -6589,7 +6845,8 @@ const Proxy = {
       errorDetail: redirectAuthPolicy.canDirect === true ? null : "Direct auth guard bypassed to proxy",
       deliveryMode: "direct",
       redirectMode: "entry_307",
-      decisionReason: execution.requestTraits.isManifest ? "entry_direct_manifest" : execution.requestTraits.isSegment ? "entry_direct_segment" : execution.requestTraits.isBigStream ? "entry_direct_stream" : "entry_direct"
+      decisionReason: execution.requestTraits.isManifest ? "entry_direct_manifest" : execution.requestTraits.isSegment ? "entry_direct_segment" : execution.requestTraits.isBigStream ? "entry_direct_stream" : "entry_direct",
+      responseHeaders: modifiedHeaders
     });
     return new Response(null, {
       status: 307,
@@ -7138,7 +7395,9 @@ const Proxy = {
       decisionReason: directRedirectUrl ? "client_redirect" : (upstreamState.proxiedExternalRedirect ? "proxied_follow" : "upstream_response"),
       protocolFailureReason: finalStatus >= 500 ? "upstream_5xx" : (finalStatus >= 400 ? "upstream_4xx" : ""),
       upstreamHost: upstreamState.finalUrl?.hostname || upstreamState.activeTargetBase?.hostname || "",
-      upstreamStatus: finalStatus
+      upstreamStatus: finalStatus,
+      upstreamResponse: upstreamState.response,
+      responseHeaders: modifiedHeaders
     });
 
     if (execution.requestTraits.isPlaybackInfoRequest === true) {
@@ -8023,22 +8282,41 @@ const UI_HTML = `<!DOCTYPE html>
 	            </div>
 	          </div>
 	          <p class="text-xs text-slate-500 mb-4">{{ App.getRuntimeLogSearchModeHint() }}</p>
-	          <div class="overflow-x-auto min-h-0 w-full mb-4">
-            <table class="w-full text-left border-collapse table-fixed min-w-[900px]">
-              <thead><tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800"><th class="py-3 px-4 w-24 md:w-28">节点</th><th class="py-3 px-4 w-28 md:w-32">资源类别</th><th class="py-3 px-4 w-16 md:w-20">状态</th><th class="py-3 px-4 w-32">IP</th><th class="py-3 px-4">UA</th><th class="py-3 px-4 w-28">时间锥</th></tr></thead>
+          <div class="overflow-x-auto min-h-0 w-full mb-4 rounded-2xl border border-slate-200/80 dark:border-slate-800 bg-white/80 dark:bg-slate-950/30 shadow-sm">
+            <table class="w-full text-left table-fixed min-w-[1320px] border-separate border-spacing-0">
+              <thead>
+                <tr class="text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-500 dark:text-slate-400 bg-slate-50/90 dark:bg-slate-900/90">
+                  <th class="py-3 px-4 w-28 border-b border-slate-200 dark:border-slate-800">节点</th>
+                  <th class="py-3 px-4 w-[22rem] border-b border-slate-200 dark:border-slate-800">资源类别</th>
+                  <th class="py-3 px-4 w-20 border-b border-slate-200 dark:border-slate-800">状态</th>
+                  <th class="py-3 px-4 w-36 border-b border-slate-200 dark:border-slate-800">IP</th>
+                  <th class="py-3 px-4 w-24 border-b border-slate-200 dark:border-slate-800">入站机房(COLO)</th>
+                  <th class="py-3 px-4 w-24 border-b border-slate-200 dark:border-slate-800">出站机房(COLO)</th>
+                  <th class="py-3 px-4 w-[26rem] border-b border-slate-200 dark:border-slate-800">UA</th>
+                  <th class="py-3 px-4 w-32 border-b border-slate-200 dark:border-slate-800">时间锥</th>
+                </tr>
+              </thead>
               <tbody id="logs-tbody" class="text-sm">
                 <tr v-if="!App.logRows.length">
-                  <td colspan="6" class="py-6 text-center text-slate-500">暂无匹配日志记录</td>
+                  <td colspan="8" class="py-10 text-center text-slate-500 dark:text-slate-400">暂无匹配日志记录</td>
                 </tr>
-                <tr v-for="(log, index) in App.logRows" v-else :key="log.id || (String(log.timestamp) + '-' + index)" class="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
-                  <td class="py-3 px-4 font-medium truncate" :title="log.node_name">{{ log.node_name }}</td>
-                  <td class="py-3 px-4 text-xs cursor-pointer truncate" :title="App.getLogPathTitle(log)">
+                <tr v-for="(log, index) in App.logRows" v-else :key="log.id || (String(log.timestamp) + '-' + index)" class="group transition">
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60 font-medium text-slate-900 dark:text-slate-100">
+                    <div class="inline-flex max-w-full items-center rounded-xl bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-700 dark:bg-slate-800 dark:text-slate-200" :title="log.node_name">{{ log.node_name }}</div>
+                  </td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60 text-xs cursor-pointer" :title="App.getLogPathTitle(log)">
                     <div class="flex flex-wrap items-center gap-1"><span v-for="(badge, badgeIndex) in App.getLogCategoryBadges(log)" :key="(log.id || index) + '-badge-' + badgeIndex + '-' + badge.label" :class="badge.className">{{ badge.label }}</span></div>
                   </td>
-                  <td class="py-3 px-4 font-bold truncate" :class="log.status_code >= 400 ? 'text-red-500' : 'text-emerald-500'"><span :class="App.getLogStatusMeta(log).className" :title="App.getLogStatusMeta(log).title">{{ App.getLogStatusMeta(log).text }}</span></td>
-                  <td class="py-3 px-4 font-mono text-xs truncate" :title="log.client_ip">{{ log.client_ip }}</td>
-                  <td class="py-3 px-4 text-xs text-slate-400 truncate" :title="log.user_agent || '-'">{{ log.user_agent || '-' }}</td>
-                  <td class="py-3 px-4 text-xs font-mono text-slate-500 truncate log-time-cell" :data-timestamp="log.timestamp" :title="App.formatUtc8ExactTime(log.timestamp)" :aria-label="App.formatUtc8ExactTime(log.timestamp)" tabindex="0">{{ App.getLogRelativeTime(log.timestamp, App.logTimeTick) }}</td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60 font-bold whitespace-nowrap" :class="log.status_code >= 400 ? 'text-red-500' : 'text-emerald-500'"><span :class="App.getLogStatusMeta(log).className" :title="App.getLogStatusMeta(log).title">{{ App.getLogStatusMeta(log).text }}</span></td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60 font-mono text-xs text-slate-700 dark:text-slate-200 break-all" :title="log.client_ip">{{ log.client_ip }}</td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60">
+                    <span class="inline-flex min-w-[4.5rem] justify-center rounded-lg border border-sky-200 bg-sky-50 px-2 py-1 font-mono text-[11px] font-semibold text-sky-700 dark:border-sky-900/80 dark:bg-sky-950/40 dark:text-sky-300" :title="App.getLogColoTitle(log, 'ingress')">{{ App.getLogColoValue(log, 'ingress') }}</span>
+                  </td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60">
+                    <span class="inline-flex min-w-[4.5rem] justify-center rounded-lg border border-violet-200 bg-violet-50 px-2 py-1 font-mono text-[11px] font-semibold text-violet-700 dark:border-violet-900/80 dark:bg-violet-950/40 dark:text-violet-300" :title="App.getLogColoTitle(log, 'egress')">{{ App.getLogColoValue(log, 'egress') }}</span>
+                  </td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60 text-xs text-slate-500 dark:text-slate-400 break-all leading-5" :title="log.user_agent || '-'">{{ log.user_agent || '-' }}</td>
+                  <td class="py-3 px-4 align-top border-b border-slate-100 dark:border-slate-800/60 text-xs font-mono text-slate-500 whitespace-nowrap log-time-cell" :data-timestamp="log.timestamp" :title="App.formatUtc8ExactTime(log.timestamp)" :aria-label="App.formatUtc8ExactTime(log.timestamp)" tabindex="0">{{ App.getLogRelativeTime(log.timestamp, App.logTimeTick) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -8747,6 +9025,14 @@ const UI_HTML = `<!DOCTYPE html>
                         </div>
                       </div>
                       <div class="md:col-span-2">
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">全局调度时区</label>
+                        <div class="relative">
+                          <input type="number" min="-720" max="840" step="60" id="cfg-schedule-utc-offset-minutes" v-model="App.settingsForm.scheduleUtcOffsetMinutes" class="w-full p-2 pr-16 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="480">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">分钟</span>
+                        </div>
+                        <p class="text-xs text-slate-500 mt-2">默认 480 表示北京时间（{{ App.getScheduledTimezoneLabel() }}）。日志类任务的“每日定时执行”会按这里的时区理解执行时间。</p>
+                      </div>
+                      <div class="md:col-span-2">
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务调度模式</label>
                         <select id="cfg-scheduled-maintenance-mode" v-model="App.settingsForm.scheduledMaintenanceMode" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white">
                           <option value="interval">按周期执行</option>
@@ -8755,11 +9041,11 @@ const UI_HTML = `<!DOCTYPE html>
                       </div>
                       <div class="md:col-span-2" v-if="App.settingsForm.scheduledMaintenanceMode === 'daily'">
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务执行时间</label>
-                        <div class="relative">
-                          <input type="time" id="cfg-scheduled-maintenance-time" v-model="App.settingsForm.scheduledMaintenanceTime" class="w-full p-2 pr-16 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="08:30">
-                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">UTC+8</span>
+                        <div class="flex items-center gap-3">
+                          <input type="time" id="cfg-scheduled-maintenance-time" v-model="App.settingsForm.scheduledMaintenanceTime" class="min-w-0 flex-1 w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="08:30">
+                          <span class="pointer-events-none shrink-0 inline-flex items-center rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-300">{{ App.getScheduledTimezoneLabel() }}</span>
                         </div>
-                        <p class="text-xs text-slate-500 mt-2">例如 08:30 表示每天北京时间 08:30 执行一次日志清理、Telegram 日报和异常告警检查。Cloudflare Cron 仍可保持更高频率，真正执行由 Worker 内部按北京时间门控。</p>
+                        <p class="text-xs text-slate-500 mt-2">例如 08:30 表示每天按当前全局调度时区的 08:30 执行一次日志清理、Telegram 日报和异常告警检查。Cloudflare Cron 仍可保持更高频率，真正执行由 Worker 内部按这里的时区门控。</p>
                       </div>
                       <div class="md:col-span-2" v-else>
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务执行周期</label>
@@ -8925,9 +9211,9 @@ const UI_HTML = `<!DOCTYPE html>
                         </div>
                       </div>
                       <div>
-                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">写入数量</label>
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">每族群写入上限</label>
                         <div class="relative">
-                          <input type="number" min="1" max="3" step="1" id="cfg-auto-dns-top-count" v-model="App.settingsForm.autoDnsTopCount" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="3">
+                          <input type="number" min="1" max="3" step="1" id="cfg-dns-auto-upload-top-n" v-model="App.settingsForm.dnsAutoUploadTopN" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="3">
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">条</span>
                         </div>
                       </div>
@@ -8945,8 +9231,24 @@ const UI_HTML = `<!DOCTYPE html>
                           <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
                         </div>
                       </div>
+                      <div class="md:col-span-2">
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-2">国家筛选</label>
+                        <div class="flex flex-wrap gap-2">
+                          <label v-for="country in App.getDnsAutoUploadCountryOptions()" :key="'auto-upload-country-' + country.code" class="inline-flex items-center gap-2 rounded-full border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200">
+                            <input type="checkbox" :id="'cfg-dns-auto-upload-country-' + country.code" :value="country.code" v-model="App.settingsForm.dnsAutoUploadCountryCodes" class="w-4 h-4 rounded">
+                            <span>{{ country.code }}</span>
+                            <span class="opacity-70">{{ country.name }}</span>
+                          </label>
+                        </div>
+                        <p class="text-xs text-slate-500 mt-2">不勾选任何国家时，表示自动上传不限制国家。</p>
+                      </div>
+                      <div class="md:col-span-2">
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">记录类型</label>
+                        <input type="text" id="cfg-dns-auto-upload-record-types" v-model="App.settingsForm.dnsAutoUploadRecordTypes" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" placeholder="A 或 A,AAAA">
+                        <p class="text-xs text-slate-500 mt-2">使用逗号分隔，支持 A、AAAA。写入时会按候选 IP 类型过滤。</p>
+                      </div>
                     </div>
-                    <p class="text-xs text-slate-500 mt-3">定时任务会沿用当前项目已有的远程候选拉取、Worker 侧测速和 Cloudflare DNS 保存链路。目标域名留空时，系统会尝试从当前 Zone 的 Worker 绑定或 Route 中自动推断；如果你的 Zone 下有多个绑定域名，建议显式填写，避免写错站点。执行周期用于在单个 Cloudflare Cron 下实现与日志类任务不同的内部运行节奏。</p>
+                    <p class="text-xs text-slate-500 mt-3">定时任务会沿用当前项目已有的远程候选拉取、Worker 侧测速和 Cloudflare DNS 保存链路。目标域名留空时，系统会尝试从当前 Zone 的 Worker 绑定或 Route 中自动推断；如果你的 Zone 下有多个绑定域名，建议显式填写，避免写错站点。当前是否执行主要由“自动优选执行周期”决定，建议不要设置得过短。</p>
                   </div>
                 </div>
 
@@ -8966,7 +9268,7 @@ const UI_HTML = `<!DOCTYPE html>
                       </div>
                       <div class="text-xs text-slate-500 mt-2">{{ (entry.trigger === 'manual' ? '手动执行' : '定时执行') + ' · ' + (entry.finishedAt ? App.formatLocalDateTime(entry.finishedAt) : '未完成') }}</div>
                       <div class="text-sm text-slate-600 dark:text-slate-300 mt-3">
-                        {{ '候选源：' + (entry.type || '-') + ' · 写入数量：' + (entry.selectedCount || 0) + ' · 阈值：' + ((entry.thresholdMs || 0) ? (entry.thresholdMs + ' ms') : '-') }}
+                        {{ '候选源：' + (entry.type || '-') + ' · 实际写入：' + (entry.selectedCount || 0) + ' 条 · 阈值：' + ((entry.thresholdMs || 0) ? (entry.thresholdMs + ' ms') : '-') }}
                       </div>
                       <div v-if="entry.topCandidates.length" class="text-xs text-slate-500 mt-2 break-all">{{ '命中：' + entry.topCandidates.map(item => item.ip + (item.latencyMs ? (' (' + item.latencyMs + ' ms)') : '')).join(' | ') }}</div>
                       <div v-if="entry.error" class="text-xs text-red-500 dark:text-red-300 mt-2 break-all">{{ entry.error }}</div>
@@ -9297,12 +9599,16 @@ const UI_HTML = `<!DOCTYPE html>
       logBatchRetryCount: 2,
       logBatchRetryBackoffMs: 75,
       scheduledLeaseMs: 300000,
+      scheduleUtcOffsetMinutes: 480,
       scheduledMaintenanceIntervalMinutes: 60,
       scheduledMaintenanceMode: 'interval',
       scheduledMaintenanceTime: '08:30',
       autoDnsEnabled: false,
       autoDnsType: 'all',
       autoDnsTargetHost: '',
+      dnsAutoUploadTopN: 3,
+      dnsAutoUploadCountryCodes: [],
+      dnsAutoUploadRecordTypes: ['A'],
       autoDnsIntervalMinutes: 60,
       autoDnsTopCount: 3,
       autoDnsLatencyThresholdMs: 2000,
@@ -9323,6 +9629,19 @@ const UI_HTML = `<!DOCTYPE html>
       'mfa.gov.ua',
       'www.shopify.com'
     ];
+
+    const DNS_AUTO_UPLOAD_COUNTRY_OPTIONS = ${JSON.stringify((() => {
+      const countryMap = new Map();
+      for (const meta of Object.values(CF_COLO_META)) {
+        const code = String(meta?.countryCode || '').trim().toUpperCase();
+        if (!code) continue;
+        countryMap.set(code, {
+          code,
+          name: String(meta?.countryName || '').trim() || code
+        });
+      }
+      return [...countryMap.values()].sort((left, right) => String(left.code || '').localeCompare(String(right.code || '')));
+    })())};
 
     function normalizeDnsEditorMode(value = '') {
       return String(value || '').trim().toLowerCase() === 'a' ? 'a' : 'cname';
@@ -9362,6 +9681,44 @@ const UI_HTML = `<!DOCTYPE html>
 
 	    function normalizeLogSearchMode(value = '') {
 	      return String(value || '').trim().toLowerCase() === 'fts' ? 'fts' : UI_DEFAULTS.logSearchMode;
+	    }
+
+	    function normalizeDnsAutoUploadRecordTypes(value = []) {
+	      const rawList = Array.isArray(value)
+	        ? value
+	        : String(value || '')
+	            .split(',')
+	            .map(item => item.trim())
+	            .filter(Boolean);
+	      const normalized = [...new Set(rawList
+	        .map(item => String(item || '').trim().toUpperCase())
+	        .filter(item => item === 'A' || item === 'AAAA'))];
+	      return normalized.length ? normalized : ['A'];
+	    }
+
+	    function normalizeDnsAutoUploadCountryCodes(value = []) {
+	      const rawValues = Array.isArray(value)
+	        ? value
+	        : String(value || '').split(',');
+	      const allowedCodes = new Set(
+	        (Array.isArray(DNS_AUTO_UPLOAD_COUNTRY_OPTIONS) ? DNS_AUTO_UPLOAD_COUNTRY_OPTIONS : [])
+	          .map(item => String(item?.code || '').trim().toUpperCase())
+	          .filter(Boolean)
+	      );
+	      return [...new Set(
+	        rawValues
+	          .map(item => String(item || '').trim().toUpperCase())
+	          .filter(code => code && allowedCodes.has(code))
+	      )];
+	    }
+
+	    function formatScheduledUtcOffsetLabel(value = 480) {
+	      const minutes = Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 480;
+	      const sign = minutes >= 0 ? '+' : '-';
+	      const absoluteMinutes = Math.abs(minutes);
+	      const hour = String(Math.floor(absoluteMinutes / 60)).padStart(2, '0');
+	      const minute = String(absoluteMinutes % 60).padStart(2, '0');
+	      return 'UTC' + sign + hour + ':' + minute;
 	    }
 
 	    function normalizeLogRequestGroupFilter(value = '') {
@@ -9441,6 +9798,7 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'logBatchRetryCount', id: 'cfg-log-retry-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryCount },
         { key: 'logBatchRetryBackoffMs', id: 'cfg-log-retry-backoff', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryBackoffMs },
         { key: 'scheduledLeaseMs', id: 'cfg-scheduled-lease-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledLeaseMs },
+        { key: 'scheduleUtcOffsetMinutes', id: 'cfg-schedule-utc-offset-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduleUtcOffsetMinutes },
         { key: 'scheduledMaintenanceMode', id: 'cfg-scheduled-maintenance-mode', kind: 'or-default', defaultValue: UI_DEFAULTS.scheduledMaintenanceMode },
         { key: 'scheduledMaintenanceTime', id: 'cfg-scheduled-maintenance-time', kind: 'trim', defaultValue: UI_DEFAULTS.scheduledMaintenanceTime },
         { key: 'scheduledMaintenanceIntervalMinutes', id: 'cfg-scheduled-maintenance-interval-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledMaintenanceIntervalMinutes },
@@ -9455,8 +9813,10 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'autoDnsEnabled', id: 'cfg-auto-dns-enabled', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'autoDnsType', id: 'cfg-auto-dns-type', kind: 'or-default', defaultValue: UI_DEFAULTS.autoDnsType },
         { key: 'autoDnsTargetHost', id: 'cfg-auto-dns-target-host', kind: 'trim', defaultValue: UI_DEFAULTS.autoDnsTargetHost },
+        { key: 'dnsAutoUploadTopN', id: 'cfg-dns-auto-upload-top-n', kind: 'int-finite', defaultValue: UI_DEFAULTS.dnsAutoUploadTopN },
+        { key: 'dnsAutoUploadCountryCodes', id: 'cfg-dns-auto-upload-country-codes', kind: 'array', defaultValue: UI_DEFAULTS.dnsAutoUploadCountryCodes },
+        { key: 'dnsAutoUploadRecordTypes', id: 'cfg-dns-auto-upload-record-types', kind: 'text', defaultValue: 'A' },
         { key: 'autoDnsIntervalMinutes', id: 'cfg-auto-dns-interval-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsIntervalMinutes },
-        { key: 'autoDnsTopCount', id: 'cfg-auto-dns-top-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsTopCount },
         { key: 'autoDnsLatencyThresholdMs', id: 'cfg-auto-dns-threshold-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsLatencyThresholdMs },
         { key: 'autoDnsProbeTimeoutMs', id: 'cfg-auto-dns-timeout-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.autoDnsProbeTimeoutMs }
       ],
@@ -9529,14 +9889,18 @@ const UI_HTML = `<!DOCTYPE html>
       logBatchRetryCount: 'D1 重试次数',
       logBatchRetryBackoffMs: 'D1 退避毫秒',
       scheduledLeaseMs: '定时任务租约时长',
+      scheduleUtcOffsetMinutes: '全局调度时区偏移',
       scheduledMaintenanceMode: '日志类任务调度模式',
       scheduledMaintenanceTime: '日志类任务执行时间',
       scheduledMaintenanceIntervalMinutes: '日志类任务执行周期',
       autoDnsEnabled: '定时自动优选 DNS',
       autoDnsType: '自动优选候选源',
       autoDnsTargetHost: '自动优选目标域名',
+      dnsAutoUploadTopN: '自动优选写入上限',
+      dnsAutoUploadCountryCodes: '自动优选国家筛选',
+      dnsAutoUploadRecordTypes: '自动优选记录类型',
       autoDnsIntervalMinutes: '自动优选执行周期',
-      autoDnsTopCount: '自动优选写入数量',
+      autoDnsTopCount: '自动优选写入上限（兼容字段）',
       autoDnsLatencyThresholdMs: '自动优选延迟阈值',
       autoDnsProbeTimeoutMs: '自动优选测速超时',
       tgBotToken: 'Telegram Bot Token',
@@ -9592,12 +9956,15 @@ const UI_HTML = `<!DOCTYPE html>
         logBatchRetryCount: 2,
         logBatchRetryBackoffMs: 75,
         scheduledLeaseMs: 300000,
+        scheduleUtcOffsetMinutes: 480,
         scheduledMaintenanceMode: 'interval',
         scheduledMaintenanceTime: '08:30',
         scheduledMaintenanceIntervalMinutes: 60,
         autoDnsEnabled: false,
         autoDnsType: 'all',
         autoDnsTargetHost: '',
+        dnsAutoUploadTopN: 3,
+        dnsAutoUploadRecordTypes: ['A'],
         autoDnsIntervalMinutes: 60,
         autoDnsTopCount: 3,
         autoDnsLatencyThresholdMs: 2000,
@@ -10438,6 +10805,13 @@ const UI_HTML = `<!DOCTYPE html>
             const num = Number(rawValue);
             return Number.isFinite(num) ? num : fallback;
           }
+          if (binding.key === 'dnsAutoUploadCountryCodes') {
+            return normalizeDnsAutoUploadCountryCodes(rawValue);
+          }
+          if (binding.key === 'dnsAutoUploadRecordTypes') {
+            const types = Array.isArray(rawValue) ? rawValue : normalizeDnsAutoUploadRecordTypes(rawValue);
+            return (Array.isArray(types) ? types : []).join(',');
+          }
           if (rawValue === undefined || rawValue === null) return fallback;
           return String(rawValue);
         },
@@ -10480,6 +10854,15 @@ const UI_HTML = `<!DOCTYPE html>
             if (onlyPresent && !Object.prototype.hasOwnProperty.call(source || {}, binding.key)) return;
             nextSettingsForm[binding.key] = this.resolveConfigBindingInputValue(binding, source);
           });
+          if (section === 'dnsOps') {
+            const nextTopN = Number.parseInt(nextSettingsForm.dnsAutoUploadTopN, 10);
+            if (Number.isFinite(nextTopN) && nextTopN > 0) {
+              nextSettingsForm.autoDnsTopCount = nextTopN;
+            } else {
+              const legacyTopCount = Number.parseInt(nextSettingsForm.autoDnsTopCount, 10);
+              if (Number.isFinite(legacyTopCount) && legacyTopCount > 0) nextSettingsForm.dnsAutoUploadTopN = legacyTopCount;
+            }
+          }
           if (section === 'security') Object.assign(nextSettingsForm, this.resolveGeoFirewallFormState(source));
           this.settingsForm = nextSettingsForm;
         },
@@ -10502,6 +10885,8 @@ const UI_HTML = `<!DOCTYPE html>
             const num = parseFloat(rawValue);
             return Number.isFinite(num) ? num : fallback;
           }
+          if (binding.key === 'dnsAutoUploadCountryCodes') return normalizeDnsAutoUploadCountryCodes(rawValue);
+          if (binding.key === 'dnsAutoUploadRecordTypes') return normalizeDnsAutoUploadRecordTypes(rawValue);
           if (mode === 'trim') return String(rawValue || '').trim();
           if (rawValue === undefined || rawValue === null) return '';
           return rawValue;
@@ -10517,6 +10902,11 @@ const UI_HTML = `<!DOCTYPE html>
             if (value !== undefined) acc[binding.key] = value;
             return acc;
           }, {});
+          if (section === 'dnsOps') {
+            const normalizedTopN = Number.parseInt(collected.dnsAutoUploadTopN, 10);
+            if (Number.isFinite(normalizedTopN) && normalizedTopN > 0) collected.autoDnsTopCount = normalizedTopN;
+            else if (Number.isFinite(Number.parseInt(collected.autoDnsTopCount, 10))) collected.dnsAutoUploadTopN = Number.parseInt(collected.autoDnsTopCount, 10);
+          }
           if (section === 'security' && (!fieldKeySet || fieldKeySet.has('geoAllowlist') || fieldKeySet.has('geoBlocklist'))) {
             const geoMode = String(this.settingsForm?.geoMode || 'allowlist').trim().toLowerCase() === 'blocklist' ? 'blocklist' : 'allowlist';
             const geoRegions = normalizeRegionCodeCsv(this.settingsForm?.geoRegions || '');
@@ -10543,6 +10933,14 @@ const UI_HTML = `<!DOCTYPE html>
           if (typeof value === 'boolean') return value ? '开启' : '关闭';
           if (value === undefined || value === null || value === '') return '空';
           return String(value);
+        },
+
+        getScheduledTimezoneLabel() {
+          return formatScheduledUtcOffsetLabel(this.settingsForm?.scheduleUtcOffsetMinutes);
+        },
+
+        getDnsAutoUploadCountryOptions() {
+          return Array.isArray(DNS_AUTO_UPLOAD_COUNTRY_OPTIONS) ? DNS_AUTO_UPLOAD_COUNTRY_OPTIONS : [];
         },
 
         getSettingsRiskHints(section, nextConfig) {
@@ -11688,12 +12086,14 @@ const UI_HTML = `<!DOCTYPE html>
         const state = this.getAutoDnsRuntimeState();
         const status = String(state.status || 'idle').toLowerCase();
         const autoSkipReason = String(state.autoSkipReason || '').trim();
-        if (autoSkipReason === 'interval_not_reached' && state.lastAutoSkipAt) return '本轮定时触发已跳过，原因是尚未到自动优选执行周期。';
+        if (autoSkipReason === 'interval_not_reached' && state.lastAutoSkipAt) {
+          return '本轮定时触发已跳过，原因是尚未到自动优选执行周期。';
+        }
         if (autoSkipReason === 'auto_dns_disabled') return '自动优选当前处于关闭状态。';
         if (status === 'success') {
           const host = String(state.host || '').trim() || '未记录目标域名';
           const selectedCount = Number(state.selectedCount) || 0;
-          return '最近一次成功执行已写入 ' + host + '，共 ' + selectedCount + ' 条记录。';
+          return '最近一次成功执行已写入 ' + host + '，实际写入 ' + selectedCount + ' 条记录。';
         }
         if (status === 'failed') return '最近一次立即执行或定时执行失败，请查看下方错误详情。';
         if (status === 'running') return '自动优选正在执行中，请稍后刷新状态。';
@@ -11710,10 +12110,12 @@ const UI_HTML = `<!DOCTYPE html>
           state.lastAutoSkipAt ? ('最近跳过：' + this.formatLocalDateTime(state.lastAutoSkipAt)) : '',
           state.host ? ('目标域名：' + state.host) : '',
           state.type ? ('候选源：' + state.type) : '',
+          Array.isArray(state.countryCodes) && state.countryCodes.length ? ('国家筛选：' + state.countryCodes.join(' / ')) : '国家筛选：不限制',
+          Array.isArray(state.recordTypes) && state.recordTypes.length ? ('记录类型：' + state.recordTypes.join(' / ')) : '',
           Number.isFinite(Number(state.intervalMinutes)) ? ('执行周期：' + Number(state.intervalMinutes) + ' 分钟') : '',
           Number.isFinite(Number(state.totalCandidates)) ? ('候选数量：' + Number(state.totalCandidates)) : '',
           Number.isFinite(Number(state.probedCount)) ? ('测速数量：' + Number(state.probedCount)) : '',
-          Number.isFinite(Number(state.selectedCount)) ? ('写入数量：' + Number(state.selectedCount)) : '',
+          Number.isFinite(Number(state.selectedCount)) ? ('实际写入：' + Number(state.selectedCount) + ' 条') : '',
           Number.isFinite(Number(state.thresholdMs)) ? ('延迟阈值：' + Number(state.thresholdMs) + ' ms') : ''
         ].filter(Boolean);
         const topCandidates = Array.isArray(state.topCandidates) ? state.topCandidates.slice(0, 3) : [];
@@ -12073,7 +12475,7 @@ const UI_HTML = `<!DOCTYPE html>
               const result = res.result && typeof res.result === 'object' ? res.result : {};
               const host = String(result.host || '').trim() || '目标域名';
               const selectedCount = Number(result.selectedCount) || 0;
-              this.showMessage('自动优选已执行完成：' + host + ' 已写入 ' + selectedCount + ' 条记录。', { tone: 'success', modal: true });
+              this.showMessage('自动优选已执行完成：' + host + ' 实际写入 ' + selectedCount + ' 条记录。', { tone: 'success', modal: true });
           } catch (err) {
               if (err?.details?.status && typeof err.details.status === 'object') {
                   this.applyRuntimeStatusState(err.details.status);
@@ -12592,6 +12994,18 @@ const UI_HTML = `<!DOCTYPE html>
           } catch {
             return null;
           }
+      },
+      getLogColoValue(log, direction = 'ingress') {
+          const structured = this.parseLogDetailJson(log);
+          const key = direction === 'egress' ? 'egressColo' : 'ingressColo';
+          const legacyKey = direction === 'egress' ? 'outgoingColo' : 'incomingColo';
+          const value = String(structured?.[key] || structured?.[legacyKey] || '').trim().toUpperCase();
+          return value || '--';
+      },
+      getLogColoTitle(log, direction = 'ingress') {
+          const label = direction === 'egress' ? '出站机房' : '入站机房';
+          const value = this.getLogColoValue(log, direction);
+          return value === '--' ? (label + '：暂无记录') : (label + '：' + value);
       },
       getPlaybackModeBadge(errorDetail) {
           const detail = String(errorDetail || '');
@@ -14906,7 +15320,7 @@ export default {
       const kv = Database.getKV(env);
       if (!kv) return;
       const runtimeConfig = await getRuntimeConfig(env);
-      const scheduledLeaseMs = clampIntegerConfig(runtimeConfig?.scheduledLeaseMs, Config.Defaults.ScheduledLeaseMs, Config.Defaults.ScheduledLeaseMinMs, 15 * 60 * 1000);
+      const scheduledLeaseMs = resolveEffectiveScheduledLeaseMs(runtimeConfig || {});
       const leaseToken = `${nowMs()}-${Math.random().toString(36).slice(2, 10)}`;
       const lease = await Database.tryAcquireScheduledLease(kv, { token: leaseToken, leaseMs: scheduledLeaseMs });
       if (!lease.acquired) {
@@ -15146,6 +15560,8 @@ export default {
                 selectedCount: autoDnsResult.selectedCount,
                 thresholdMs: autoDnsResult.thresholdMs,
                 intervalMinutes: autoDnsIntervalMinutes,
+                countryCodes: Array.isArray(autoDnsResult.countryCodes) ? autoDnsResult.countryCodes : normalizeDnsAutoUploadCountryCodes(config.dnsAutoUploadCountryCodes),
+                recordTypes: Array.isArray(autoDnsResult.recordTypes) ? autoDnsResult.recordTypes : normalizeDnsAutoUploadRecordTypes(config.dnsAutoUploadRecordTypes),
                 records: autoDnsResult.records,
                 topCandidates: autoDnsResult.topCandidates,
                 trigger: "scheduled",
@@ -15176,6 +15592,8 @@ export default {
                 type: String(config.autoDnsType || ""),
                 host: String(config.autoDnsTargetHost || ""),
                 intervalMinutes: autoDnsIntervalMinutes,
+                countryCodes: normalizeDnsAutoUploadCountryCodes(config.dnsAutoUploadCountryCodes),
+                recordTypes: normalizeDnsAutoUploadRecordTypes(config.dnsAutoUploadRecordTypes),
                 trigger: "scheduled",
                 history: pushAutoDnsHistoryEntry(previousAutoDnsState.history, {
                   trigger: "scheduled",
@@ -15195,6 +15613,8 @@ export default {
             scheduledState.autoDns = {
               ...previousAutoDnsState,
               intervalMinutes: autoDnsIntervalMinutes,
+              countryCodes: normalizeDnsAutoUploadCountryCodes(config.dnsAutoUploadCountryCodes),
+              recordTypes: normalizeDnsAutoUploadRecordTypes(config.dnsAutoUploadRecordTypes),
               lastAutoSkipAt: nowIso,
               autoSkipReason: "interval_not_reached"
             };
@@ -15203,6 +15623,8 @@ export default {
           scheduledState.autoDns = {
             ...previousAutoDnsState,
             intervalMinutes: autoDnsIntervalMinutes,
+            countryCodes: normalizeDnsAutoUploadCountryCodes(config.dnsAutoUploadCountryCodes),
+            recordTypes: normalizeDnsAutoUploadRecordTypes(config.dnsAutoUploadRecordTypes),
             lastAutoSkipAt: nowIso,
             autoSkipReason: "auto_dns_disabled"
           };
@@ -15218,6 +15640,7 @@ export default {
             intervalMinutes: maintenanceIntervalMinutes,
             mode: maintenanceMode,
             time: maintenanceTime,
+            utcOffsetMinutes: maintenanceGate.utcOffsetMinutes,
             trigger: "scheduled",
             lastAutoSkipAt: "",
             autoSkipReason: ""
@@ -15286,6 +15709,7 @@ export default {
             intervalMinutes: maintenanceIntervalMinutes,
             mode: maintenanceMode,
             time: maintenanceTime,
+            utcOffsetMinutes: maintenanceGate.utcOffsetMinutes,
             trigger: "scheduled"
           };
           scheduledState.cleanup = {
