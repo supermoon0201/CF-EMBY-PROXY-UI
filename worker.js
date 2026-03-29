@@ -116,6 +116,13 @@ const Config = {
     TgAlertFlushRetryThreshold: 0,
     TgAlertCooldownMinutes: 30,
     TgAlertOnScheduledFailure: false,
+    PlaybackRouteHotCacheTtlMs: 86400 * 1000,
+    PlaybackRouteHotCacheMax: 1000,
+    PlaybackInfoCacheTtlSec: 60,
+    PlaybackInfoCacheMax: 500,
+    VideoProgressForwardIntervalSec: 3,
+    VideoProgressForwardSessionMax: 1000,
+    DefaultMediaAuthMode: "auto",
     UpstreamTimeoutMs: 8000,
     UpstreamRetryAttempts: 0,
     BufferedRetryBodyMaxBytes: 2 * 1024 * 1024,
@@ -157,10 +164,13 @@ const GLOBALS = {
   LogQueue: [],
   LogDedupe: new Map(),
   RateLimitCache: new Map(),
+  PlaybackRouteHotCache: new Map(),
   LogFlushPending: false,
   LogFlushTask: null,
   LogClearEpochMs: 0,
   LogLastFlushAt: 0,
+  PlaybackInfoResponseCache: new Map(),
+  PlaybackProgressRelay: new Map(),
   LineCursor: new Map(),
   LineBan: new Map(),
   OpsStatusWriteChain: Promise.resolve(),
@@ -386,6 +396,33 @@ function normalizeNodeMediaAuthMode(value = "") {
   return "auto";
 }
 
+function parseMediaAuthorizationAttributes(value = "") {
+  const text = String(value || "").trim();
+  const attributes = {};
+  if (!text) return attributes;
+  const payload = text.replace(/^[^\s]+\s+/i, "");
+  for (const segment of payload.split(/,\s*/)) {
+    const match = /^\s*([^=]+)\s*=\s*"?(.*?)"?\s*$/.exec(segment);
+    if (!match) continue;
+    attributes[String(match[1] || "").trim().toLowerCase()] = String(match[2] || "").trim();
+  }
+  return attributes;
+}
+
+export function normalizeDefaultMediaAuthMode(value = "") {
+  return normalizeNodeMediaAuthMode(value);
+}
+
+function resolveDefaultNodeMediaAuthMode(currentConfig = {}) {
+  return normalizeDefaultMediaAuthMode(currentConfig?.defaultMediaAuthMode);
+}
+
+function resolveEffectiveNodeMediaAuthMode(node = {}, currentConfig = {}) {
+  const nodeMode = normalizeNodeMediaAuthMode(node?.mediaAuthMode);
+  if (nodeMode !== "auto") return nodeMode;
+  return resolveDefaultNodeMediaAuthMode(currentConfig);
+}
+
 export function normalizeNodeRealClientIpMode(value = "") {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized || normalized === "smart" || normalized === "auto") return "smart";
@@ -401,6 +438,203 @@ export function getRealClientIpHeaderMode(node) {
   if (nodeMode === "smart" || nodeMode === "realip_only") return "real-ip-only";
   if (nodeMode === "off") return "none";
   return "real-ip-only";
+}
+
+export function isPlaybackInfoPath(proxyPath = "") {
+  return /\/playbackinfo(?:$|[/?])/i.test(String(proxyPath || ""));
+}
+
+export function isPlaybackSessionProgressPath(proxyPath = "") {
+  return /\/sessions\/playing\/progress(?:$|[/?])/i.test(String(proxyPath || ""));
+}
+
+export function isPlaybackSessionStoppedPath(proxyPath = "") {
+  return /\/sessions\/playing\/stopped(?:$|[/?])/i.test(String(proxyPath || ""));
+}
+
+export function isPlaybackSessionStartedPath(proxyPath = "") {
+  const text = String(proxyPath || "");
+  if (isPlaybackSessionProgressPath(text) || isPlaybackSessionStoppedPath(text)) return false;
+  return /\/sessions\/playing(?:\/started)?(?:$|[/?])/i.test(text);
+}
+
+function decodeBufferedBodyText(buffer) {
+  if (buffer === null || buffer === undefined) return "";
+  try {
+    if (buffer instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(buffer));
+    if (ArrayBuffer.isView(buffer)) return new TextDecoder().decode(buffer);
+    return String(buffer || "");
+  } catch {
+    return "";
+  }
+}
+
+function normalizeCaseInsensitiveObject(input = {}) {
+  const normalized = {};
+  if (!input || typeof input !== "object" || Array.isArray(input)) return normalized;
+  for (const [key, value] of Object.entries(input)) {
+    const normalizedKey = String(key || "").trim().toLowerCase();
+    if (!normalizedKey || normalized[normalizedKey] !== undefined) continue;
+    normalized[normalizedKey] = value;
+  }
+  return normalized;
+}
+
+function getCaseInsensitivePayloadValue(payload = {}, names = []) {
+  const normalizedPayload = normalizeCaseInsensitiveObject(payload);
+  for (const name of Array.isArray(names) ? names : [names]) {
+    const value = normalizedPayload[String(name || "").trim().toLowerCase()];
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return "";
+}
+
+export function resolvePlaybackProgressSessionKeyFromPayload(options = {}) {
+  const query = normalizeCaseInsensitiveObject(options?.query || {});
+  const body = normalizeCaseInsensitiveObject(options?.body || {});
+  const pickValue = (names = []) => {
+    const queryValue = getCaseInsensitivePayloadValue(query, names);
+    if (String(queryValue || "").trim()) return String(queryValue).trim();
+    const bodyValue = getCaseInsensitivePayloadValue(body, names);
+    return String(bodyValue || "").trim();
+  };
+  const sessionId = pickValue(["SessionId"]);
+  const playSessionId = pickValue(["PlaySessionId"]);
+  const deviceId = pickValue(["DeviceId"]);
+  const itemId = pickValue(["ItemId"]);
+  if (sessionId) return `session:${sessionId}`;
+  if (playSessionId) return `play:${playSessionId}`;
+  if (deviceId && itemId) return `device-item:${deviceId}:${itemId}`;
+  return `fallback:${String(options?.clientIp || "unknown").trim()}:${String(options?.proxyPath || "/").trim()}`;
+}
+
+function hasRedirectQueryAlias(url, aliases) {
+  const targetUrl = url instanceof URL ? url : null;
+  if (!targetUrl || !(aliases instanceof Set)) return false;
+  for (const key of targetUrl.searchParams.keys()) {
+    if (aliases.has(normalizeWorkerCacheParamName(key))) return true;
+  }
+  return false;
+}
+
+export function extractMediaRedirectAuth(headers) {
+  const safeHeaders = headers instanceof Headers ? headers : new Headers(headers || {});
+  const details = {
+    token: "",
+    deviceId: ""
+  };
+
+  for (const headerName of ["X-Emby-Token", "X-MediaBrowser-Token", "X-Emby-Auth-Token", "X-MediaBrowser-Auth-Token"]) {
+    const value = safeHeaders.get(headerName)?.trim() || "";
+    if (!value) continue;
+    details.token = value;
+    break;
+  }
+
+  for (const headerName of ["Authorization", "X-Emby-Authorization", "X-MediaBrowser-Authorization"]) {
+    const value = safeHeaders.get(headerName)?.trim() || "";
+    if (!value) continue;
+    const attributes = parseMediaAuthorizationAttributes(value);
+    if (!details.token && attributes.token) details.token = attributes.token;
+    if (!details.deviceId && attributes.deviceid) details.deviceId = attributes.deviceid;
+    if (!details.token) {
+      const bearerMatch = /^Bearer\s+(.+)$/i.exec(value);
+      if (bearerMatch?.[1]) details.token = bearerMatch[1].trim();
+    }
+  }
+
+  if (!details.deviceId) {
+    for (const headerName of ["X-Emby-Device-Id", "X-MediaBrowser-Device-Id"]) {
+      const value = safeHeaders.get(headerName)?.trim() || "";
+      if (!value) continue;
+      details.deviceId = value;
+      break;
+    }
+  }
+
+  return details;
+}
+
+function isRedirectableStandardMediaAuthorization(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return true;
+  if (/^Bearer\s+.+$/i.test(text)) return true;
+  const attributes = parseMediaAuthorizationAttributes(text);
+  return !!String(attributes.token || "").trim();
+}
+
+function isPotentialPrivateMediaAuthHeaderName(name = "") {
+  const normalized = String(name || "").trim().toLowerCase();
+  if (!normalized || MEDIA_REDIRECT_SAFE_HEADER_NAMES.has(normalized) || normalized === "cookie") return false;
+  return normalized.includes("authorization")
+    || normalized.includes("api-key")
+    || normalized.includes("apikey")
+    || normalized.includes("access-key")
+    || normalized.includes("accesskey")
+    || normalized.includes("access-token")
+    || normalized.includes("accesstoken")
+    || normalized.includes("session")
+    || normalized.includes("credential")
+    || normalized.includes("signature")
+    || normalized.includes("secret")
+    || normalized.includes("auth")
+    || normalized.includes("token");
+}
+
+export function evaluateMediaClientRedirectAuthPolicy(headers) {
+  const safeHeaders = headers instanceof Headers ? headers : new Headers(headers || {});
+  const auth = extractMediaRedirectAuth(safeHeaders);
+  const headerAuthHeaders = [];
+  const cookieAuthHeaders = [];
+
+  const cookieHeader = safeHeaders.get("Cookie")?.trim() || "";
+  if (cookieHeader) cookieAuthHeaders.push("cookie");
+
+  for (const headerName of MEDIA_REDIRECT_STANDARD_AUTH_HEADER_NAMES) {
+    const value = safeHeaders.get(headerName)?.trim() || "";
+    if (!value) continue;
+    if (!isRedirectableStandardMediaAuthorization(value)) headerAuthHeaders.push(headerName);
+  }
+
+  for (const [headerName, value] of safeHeaders.entries()) {
+    const normalizedName = String(headerName || "").trim().toLowerCase();
+    const normalizedValue = String(value || "").trim();
+    if (!normalizedName || !normalizedValue) continue;
+    if (isPotentialPrivateMediaAuthHeaderName(normalizedName)) headerAuthHeaders.push(normalizedName);
+  }
+
+  const uniqueHeaderAuthHeaders = [...new Set(headerAuthHeaders)];
+  const uniqueCookieAuthHeaders = [...new Set(cookieAuthHeaders)];
+  const hasQueryAuth = !!String(auth.token || "").trim() || !!String(auth.deviceId || "").trim();
+  const hasHeaderAuth = uniqueHeaderAuthHeaders.length > 0;
+  const hasCookieAuth = uniqueCookieAuthHeaders.length > 0;
+  const canDirect = !hasHeaderAuth && !hasCookieAuth;
+
+  return {
+    canDirect,
+    reason: canDirect ? "" : "direct_transport_incompatible",
+    headerAuthHeaders: uniqueHeaderAuthHeaders,
+    cookieAuthHeaders: uniqueCookieAuthHeaders,
+    hasQueryAuth,
+    hasHeaderAuth,
+    hasCookieAuth,
+    auth
+  };
+}
+
+export function appendMediaRedirectAuthToUrl(targetUrl, headersOrPolicy) {
+  const safeUrl = targetUrl instanceof URL ? new URL(targetUrl.toString()) : new URL(String(targetUrl || ""));
+  const policy = headersOrPolicy && typeof headersOrPolicy === "object" && "auth" in headersOrPolicy
+    ? headersOrPolicy
+    : { auth: extractMediaRedirectAuth(headersOrPolicy) };
+  const auth = policy.auth || {};
+  if (auth.token && !hasRedirectQueryAlias(safeUrl, MEDIA_REDIRECT_AUTH_QUERY_KEYS)) {
+    safeUrl.searchParams.set("api_key", auth.token);
+  }
+  if (auth.deviceId && !hasRedirectQueryAlias(safeUrl, MEDIA_REDIRECT_DEVICE_QUERY_KEYS)) {
+    safeUrl.searchParams.set("DeviceId", auth.deviceId);
+  }
+  return safeUrl;
 }
 
 export function buildNodeCompatAutofixCandidateModes(originalMode = "") {
@@ -741,6 +975,15 @@ function normalizeLogSearchMode(value) {
   return String(value || "").trim().toLowerCase() === "fts" ? "fts" : Config.Defaults.LogSearchMode;
 }
 
+function normalizeLogRequestGroupFilter(value = "") {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "playback" || normalized === "playback_info") return "playback_info";
+  if (normalized === "image") return "image";
+  if (normalized === "api") return "api";
+  if (normalized === "auth") return "auth";
+  return "";
+}
+
 function looksLikeFtsExpression(value) {
   const text = String(value || "").trim();
   if (!text) return false;
@@ -992,6 +1235,42 @@ const DEFAULT_WANGPAN_DIRECT_TERMS = [
 ];
 const DEFAULT_WANGPAN_DIRECT_TEXT = DEFAULT_WANGPAN_DIRECT_TERMS.join(",");
 const UPSTREAM_RETRYABLE_STATUSES = new Set([500, 502, 503, 504, 522, 523, 524, 525, 526, 530]);
+const MEDIA_REDIRECT_AUTH_QUERY_KEYS = new Set([
+  "api_key",
+  "apikey",
+  "accesstoken",
+  "token",
+  "authorization",
+  "xembytoken",
+  "xembyauthorization",
+  "xmediabrowsertoken",
+  "xmediabrowserauthorization"
+]);
+const MEDIA_REDIRECT_DEVICE_QUERY_KEYS = new Set([
+  "deviceid",
+  "xembydeviceid",
+  "xmediabrowserdeviceid"
+]);
+const MEDIA_REDIRECT_STANDARD_AUTH_HEADER_NAMES = new Set([
+  "authorization",
+  "x-emby-authorization",
+  "x-mediabrowser-authorization"
+]);
+const MEDIA_REDIRECT_TOKEN_HEADER_NAMES = new Set([
+  "x-emby-token",
+  "x-mediabrowser-token",
+  "x-emby-auth-token",
+  "x-mediabrowser-auth-token"
+]);
+const MEDIA_REDIRECT_DEVICE_HEADER_NAMES = new Set([
+  "x-emby-device-id",
+  "x-mediabrowser-device-id"
+]);
+const MEDIA_REDIRECT_SAFE_HEADER_NAMES = new Set([
+  ...MEDIA_REDIRECT_STANDARD_AUTH_HEADER_NAMES,
+  ...MEDIA_REDIRECT_TOKEN_HEADER_NAMES,
+  ...MEDIA_REDIRECT_DEVICE_HEADER_NAMES
+]);
 
 function isPrivateOrLoopbackIpv4(ip = "") {
   return /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/.test(String(ip || ""));
@@ -2013,6 +2292,7 @@ function shouldRunDailyClockGate(lastRunAt = "", dailyTime = Config.Defaults.Sch
 function sanitizeRuntimeConfig(input = {}) {
   const sanitized = sanitizeConfigWithRules(input, CONFIG_SANITIZE_RULES, { normalizeNodeNameList });
   sanitized.prewarmDepth = normalizePrewarmDepth(sanitized.prewarmDepth);
+  sanitized.defaultMediaAuthMode = normalizeDefaultMediaAuthMode(sanitized.defaultMediaAuthMode);
   sanitized.settingsExperienceMode = String(sanitized.settingsExperienceMode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
   sanitized.logSearchMode = normalizeLogSearchMode(sanitized.logSearchMode);
   sanitized.scheduledMaintenanceMode = normalizeScheduledMaintenanceMode(sanitized.scheduledMaintenanceMode);
@@ -2027,6 +2307,15 @@ function serializeConfigValue(value) {
   if (isPlainObject(value)) return JSON.stringify(value);
   if (value === undefined) return "";
   return JSON.stringify(value);
+}
+
+function hashStableText(value = "") {
+  const text = typeof value === "string" ? value : serializeConfigValue(value);
+  let hash = 5381;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash << 5) + hash) ^ text.charCodeAt(index);
+  }
+  return `h${(hash >>> 0).toString(16)}`;
 }
 
 function getConfigDiffEntries(prevConfig = {}, nextConfig = {}) {
@@ -2257,6 +2546,11 @@ const CONFIG_ALLOWED_FIELDS = [
   "enablePrewarm",
   "prewarmDepth",
   "prewarmCacheTtl",
+  "playbackInfoCacheEnabled",
+  "playbackInfoCacheTtlSec",
+  "videoProgressForwardEnabled",
+  "videoProgressForwardIntervalSec",
+  "defaultMediaAuthMode",
   "prewarmPrefetchBytes",
   "disablePrewarmPrefetch",
   "directStaticAssets",
@@ -2332,7 +2626,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: CONFIG_ALIAS_FIELDS,
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode", "scheduledMaintenanceMode", "scheduledMaintenanceTime", "autoDnsType", "autoDnsTargetHost"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode", "scheduledMaintenanceMode", "scheduledMaintenanceTime", "autoDnsType", "autoDnsTargetHost", "defaultMediaAuthMode"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList"
   },
@@ -2358,6 +2652,8 @@ const CONFIG_SANITIZE_RULES = {
     upstreamTimeoutMs: { fallback: Config.Defaults.UpstreamTimeoutMs, min: 0, max: 180000 },
     upstreamRetryAttempts: { fallback: Config.Defaults.UpstreamRetryAttempts, min: 0, max: 3 },
     prewarmCacheTtl: { fallback: Config.Defaults.PrewarmCacheTtl, min: 0, max: 3600 },
+    playbackInfoCacheTtlSec: { fallback: Config.Defaults.PlaybackInfoCacheTtlSec, min: 0, max: 60 },
+    videoProgressForwardIntervalSec: { fallback: Config.Defaults.VideoProgressForwardIntervalSec, min: 0, max: 60 },
     prewarmPrefetchBytes: { fallback: Config.Defaults.PrewarmPrefetchBytes, min: 0, max: 64 * 1024 * 1024 }
   },
   numberFields: {
@@ -2583,7 +2879,7 @@ const CacheManager = {
     const budget = Config.Defaults.CleanupBudgetMs;
     const chunkSize = Config.Defaults.CleanupChunkSize;
     const state = GLOBALS.CleanupState;
-    const iterators = state.iterators || (state.iterators = { node: null, crypto: null, rate: null, log: null });
+    const iterators = state.iterators || (state.iterators = { node: null, crypto: null, rate: null, log: null, playbackRoute: null });
     const start = now;
     const cleanMap = (map, shouldDelete, iteratorKey) => {
       let iterator = iterators[iteratorKey];
@@ -2613,6 +2909,9 @@ const CacheManager = {
     } else if (state.phase === 2) {
       cleanMap(GLOBALS.RateLimitCache, v => !v || v.resetAt < now, "rate");
       state.phase = 3;
+    } else if (state.phase === 3) {
+      cleanMap(GLOBALS.PlaybackRouteHotCache, v => !v || v.expiresAt < now, "playbackRoute");
+      state.phase = 4;
     } else {
       cleanMap(GLOBALS.LogDedupe, v => !v || (now - v) > 300000, "log");
       state.phase = 0;
@@ -2648,7 +2947,7 @@ const Database = {
   },
   async ensureLogsBaseSchema(db) {
     if (!db) return false;
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.LOGS_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, created_at TEXT NOT NULL)`).run();
+    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.LOGS_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, detail_json TEXT, created_at TEXT NOT NULL)`).run();
     let existingColumns = new Set();
     try {
       const schemaRows = await db.prepare(`PRAGMA table_info(${this.LOGS_TABLE})`).all();
@@ -2660,6 +2959,9 @@ const Database = {
     }
     if (!existingColumns.has("error_detail")) {
       await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN error_detail TEXT`).run();
+    }
+    if (!existingColumns.has("detail_json")) {
+      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN detail_json TEXT`).run();
     }
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON ${this.LOGS_TABLE} (timestamp)`).run();
     await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON ${this.LOGS_TABLE} (client_ip)`).run();
@@ -4671,6 +4973,7 @@ const Database = {
 
       const runtimeConfig = env ? await getRuntimeConfig(env) : {};
       const searchMode = normalizeLogSearchMode(filters.searchMode || runtimeConfig.logSearchMode);
+      const requestGroup = normalizeLogRequestGroupFilter(filters.requestGroup);
       const whereClause = ["proxy_logs.timestamp >= ?", "proxy_logs.timestamp <= ?"];
       /** @type {(number | string)[]} */
       const params = [startTs, endTs];
@@ -4703,9 +5006,69 @@ const Database = {
         whereClause.push("proxy_logs.category = ?");
         params.push(String(filters.category));
       }
+      if (requestGroup === "playback_info") {
+        whereClause.push("proxy_logs.category = ?");
+        params.push("api");
+        whereClause.push("(LOWER(proxy_logs.request_path) LIKE ? ESCAPE '\\' OR LOWER(proxy_logs.request_path) LIKE ? ESCAPE '\\')");
+        params.push("%/playbackinfo%", "%/sessions/playing%");
+      } else if (requestGroup === "image") {
+        whereClause.push("proxy_logs.category = ?");
+        params.push("image");
+      } else if (requestGroup === "api") {
+        whereClause.push("proxy_logs.category = ?");
+        params.push("api");
+        whereClause.push("LOWER(proxy_logs.request_path) NOT LIKE ? ESCAPE '\\'");
+        params.push("%/playbackinfo%");
+        whereClause.push("LOWER(proxy_logs.request_path) NOT LIKE ? ESCAPE '\\'");
+        params.push("%/sessions/playing%");
+        whereClause.push("LOWER(proxy_logs.request_path) NOT LIKE ? ESCAPE '\\'");
+        params.push("%/users/authenticate%");
+      } else if (requestGroup === "auth") {
+        whereClause.push("proxy_logs.category = ?");
+        params.push("api");
+        whereClause.push("LOWER(proxy_logs.request_path) LIKE ? ESCAPE '\\'");
+        params.push("%/users/authenticate%");
+      }
       if (filters.playbackMode) {
         whereClause.push("proxy_logs.error_detail LIKE ? ESCAPE '\\'");
         params.push(`%${escapeSqlLike(`Playback=${String(filters.playbackMode)}`)}%`);
+      }
+      const deliveryMode = String(filters.deliveryMode || "").trim().toLowerCase();
+      if (deliveryMode === "direct" || deliveryMode === "proxy") {
+        const legacyDirectLike = `%${escapeSqlLike("entry_307")}%`;
+        const legacyClientRedirectLike = `%${escapeSqlLike("client_redirect")}%`;
+        const legacyProxyLike = `%${escapeSqlLike("proxied_follow")}%`;
+        const legacyPlaybackInfoCacheLike = `%${escapeSqlLike("PlaybackInfoCache=hit")}%`;
+        if (deliveryMode === "direct") {
+          whereClause.push(`(
+            LOWER(COALESCE(CAST(json_extract(proxy_logs.detail_json, '$.deliveryMode') AS TEXT), '')) = ?
+            OR (
+              COALESCE(proxy_logs.detail_json, '') = ''
+              AND (
+                proxy_logs.error_detail LIKE ? ESCAPE '\\'
+                OR proxy_logs.error_detail LIKE ? ESCAPE '\\'
+              )
+            )
+          )`);
+          params.push(deliveryMode, legacyDirectLike, legacyClientRedirectLike);
+        } else {
+          whereClause.push(`(
+            LOWER(COALESCE(CAST(json_extract(proxy_logs.detail_json, '$.deliveryMode') AS TEXT), '')) = ?
+            OR (
+              COALESCE(proxy_logs.detail_json, '') = ''
+              AND (
+                proxy_logs.error_detail LIKE ? ESCAPE '\\'
+                OR proxy_logs.error_detail LIKE ? ESCAPE '\\'
+              )
+            )
+          )`);
+          params.push(deliveryMode, legacyProxyLike, legacyPlaybackInfoCacheLike);
+        }
+      }
+      const decisionReason = String(filters.decisionReason || "").trim().toLowerCase();
+      if (decisionReason) {
+        whereClause.push(`LOWER(COALESCE(CAST(json_extract(proxy_logs.detail_json, '$.decisionReason') AS TEXT), '')) = ?`);
+        params.push(decisionReason);
       }
 
       const where = "WHERE " + whereClause.join(" AND ");
@@ -4926,6 +5289,11 @@ const Proxy = {
     const isManifest = GLOBALS.Regex.ManifestExt.test(proxyPath);
     const isSegment = GLOBALS.Regex.SegmentExt.test(proxyPath);
     const isWsUpgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+    const isPlaybackInfoRequest = isPlaybackInfoPath(proxyPath);
+    const isPlaybackProgressRequest = isPlaybackSessionProgressPath(proxyPath);
+    const isPlaybackStoppedRequest = isPlaybackSessionStoppedPath(proxyPath);
+    const isPlaybackStartedRequest = isPlaybackSessionStartedPath(proxyPath);
+    const isPlaybackSessionControlRequest = isPlaybackProgressRequest || isPlaybackStoppedRequest || isPlaybackStartedRequest;
     const looksLikeVideoRoute = GLOBALS.Regex.Streaming.test(proxyPath) || /\/videos\/[^/]+\/(stream|original|download|file)/i.test(proxyPath) || /\/items\/[^/]+\/download/i.test(proxyPath) || requestUrl.searchParams.get("Static") === "true" || requestUrl.searchParams.get("Download") === "true";
     const isSafeMethod = request.method === "GET" || request.method === "HEAD";
     const isBigStream = looksLikeVideoRoute && !isManifest && !isSegment && !isSubtitle && !isImage;
@@ -4953,6 +5321,11 @@ const Proxy = {
       isManifest,
       isSegment,
       isWsUpgrade,
+      isPlaybackInfoRequest,
+      isPlaybackProgressRequest,
+      isPlaybackStoppedRequest,
+      isPlaybackStartedRequest,
+      isPlaybackSessionControlRequest,
       looksLikeVideoRoute,
       isBigStream,
       isApiRequest,
@@ -5003,9 +5376,66 @@ const Proxy = {
     if (!targetBases.length) {
       return { targetBases, invalidResponse: new Response("Invalid Node Target", { status: 502, headers: this.buildEdgeResponseHeaders(finalOrigin) }) };
     }
+    const hotSnapshot = this.getPlaybackRouteHotSnapshot(node?.name, node);
+    if (hotSnapshot?.preferredTargetKey) {
+      const preferredIndex = targetBases.findIndex(item => getRetryTargetKey(item) === hotSnapshot.preferredTargetKey);
+      if (preferredIndex > 0) {
+        targetBases.unshift(...targetBases.splice(preferredIndex, 1));
+      }
+    }
     return { targetBases, invalidResponse: null };
   },
-  async buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases) {
+  buildPlaybackRouteHotSignature(nodeName, nodeData = {}) {
+    const name = String(nodeName || "").toLowerCase().trim();
+    if (!name || !isPlainObject(nodeData)) return { cacheKey: "", orderedTargetSignature: "" };
+    const orderedLines = Database.getOrderedNodeLines(nodeData);
+    const rawTargets = orderedLines.length
+      ? orderedLines.map(line => line?.target)
+      : String(nodeData.target || "").split(",").map(item => item.trim()).filter(Boolean);
+    const orderedTargets = rawTargets.map(item => String(item || "").trim()).filter(Boolean);
+    const orderedTargetSignature = hashStableText(serializeConfigValue(orderedTargets));
+    return {
+      cacheKey: `${name}:${String(nodeData?.activeLineId || "").trim()}:${orderedTargetSignature}`,
+      orderedTargetSignature
+    };
+  },
+  buildPlaybackRouteHotSnapshot(nodeName, nodeData = {}, preferredTargetBase = null) {
+    const name = String(nodeName || "").toLowerCase().trim();
+    if (!name || !isPlainObject(nodeData)) return null;
+    const { cacheKey, orderedTargetSignature } = this.buildPlaybackRouteHotSignature(name, nodeData);
+    if (!cacheKey) return null;
+    return {
+      nodeName: name,
+      cacheKey,
+      orderedTargetSignature,
+      preferredTargetKey: preferredTargetBase ? getRetryTargetKey(preferredTargetBase) : "",
+      expiresAt: nowMs() + Config.Defaults.PlaybackRouteHotCacheTtlMs
+    };
+  },
+  getPlaybackRouteHotSnapshot(nodeName, nodeData = {}) {
+    const name = String(nodeName || "").toLowerCase().trim();
+    if (!name) return null;
+    const entry = GLOBALS.PlaybackRouteHotCache.get(name);
+    if (!entry) return null;
+    if (Number(entry.expiresAt) <= nowMs()) {
+      GLOBALS.PlaybackRouteHotCache.delete(name);
+      return null;
+    }
+    const { cacheKey } = this.buildPlaybackRouteHotSignature(name, nodeData);
+    if (!cacheKey || cacheKey !== entry.cacheKey) {
+      GLOBALS.PlaybackRouteHotCache.delete(name);
+      return null;
+    }
+    touchMapEntry(GLOBALS.PlaybackRouteHotCache, name);
+    return entry;
+  },
+  setPlaybackRouteHotSnapshot(nodeName, nodeData = {}, preferredTargetBase = null) {
+    const snapshot = this.buildPlaybackRouteHotSnapshot(nodeName, nodeData, preferredTargetBase);
+    if (!snapshot) return null;
+    setBoundedMapEntry(GLOBALS.PlaybackRouteHotCache, snapshot.nodeName, snapshot, Config.Defaults.PlaybackRouteHotCacheMax);
+    return snapshot;
+  },
+  async buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases, options = {}) {
     const newHeaders = new Headers(request.headers);
     GLOBALS.DropRequestHeaders.forEach(h => newHeaders.delete(h));
 
@@ -5025,7 +5455,7 @@ const Proxy = {
     if (mergedCookie) newHeaders.set("Cookie", mergedCookie);
     else newHeaders.delete("Cookie");
 
-    normalizeMediaAuthHeaders(newHeaders, node.mediaAuthMode);
+    normalizeMediaAuthHeaders(newHeaders, options.effectiveMediaAuthMode || node.mediaAuthMode);
 
     const realClientIpHeaderMode = getRealClientIpHeaderMode(node);
     if (realClientIpHeaderMode === "full" || realClientIpHeaderMode === "real-ip-only") {
@@ -5072,9 +5502,11 @@ const Proxy = {
       newHeaders,
       adminCustomHeaders,
       preparedBody,
+      preparedBodyText: preparedBodyMode === "buffered" ? decodeBufferedBodyText(preparedBody) : "",
       preparedBodyMode,
       retryTargets,
-      allowAutomaticRetry
+      allowAutomaticRetry,
+      clientRedirectAuthPolicy: evaluateMediaClientRedirectAuthPolicy(newHeaders)
     };
   },
   evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, policy) {
@@ -5169,7 +5601,409 @@ const Proxy = {
     return requestCategory ? `${nodeName}|${requestCategory}` : nodeName;
   },
   isPlaybackInfoRequest(proxyPath) {
-    return /\/playbackinfo\b/i.test(String(proxyPath || ""));
+    return isPlaybackInfoPath(proxyPath);
+  },
+  buildPlaybackInfoAuthSignature(execution, transport = null) {
+    const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
+    const headers = transport?.newHeaders instanceof Headers
+      ? transport.newHeaders
+      : new Headers(transport?.newHeaders || execution?.request?.headers || {});
+    const signature = {
+      queryToken: requestUrl ? [
+        requestUrl.searchParams.get("api_key"),
+        requestUrl.searchParams.get("X-Emby-Token"),
+        requestUrl.searchParams.get("X-MediaBrowser-Token")
+      ].find(Boolean) || "" : "",
+      authorization: headers.get("Authorization") || "",
+      xEmbyAuthorization: headers.get("X-Emby-Authorization") || "",
+      xMediaBrowserAuthorization: headers.get("X-MediaBrowser-Authorization") || "",
+      cookie: headers.get("Cookie") || ""
+    };
+    return hashStableText(signature);
+  },
+  buildPlaybackInfoCacheKey(execution, transport = null) {
+    if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
+    if (execution.playbackInfoCacheEnabled !== true || Number(execution.playbackInfoCacheTtlSec) <= 0) {
+      execution.playbackInfoCacheState = "skip";
+      execution.playbackInfoCacheKey = "";
+      return "";
+    }
+    const requestMethod = String(execution?.request?.method || "GET").trim().toUpperCase() || "GET";
+    const needsBodySignature = requestMethod !== "GET" && requestMethod !== "HEAD";
+    if (needsBodySignature && transport?.preparedBodyMode !== "buffered") {
+      execution.playbackInfoCacheState = "skip";
+      execution.playbackInfoCacheKey = "";
+      return "";
+    }
+    const bodyText = transport?.preparedBodyMode === "buffered"
+      ? String(transport?.preparedBodyText || decodeBufferedBodyText(transport?.preparedBody))
+      : "";
+    const payload = {
+      nodeName: String(execution?.nodeName || "").trim(),
+      requestMethod,
+      proxyPath: String(execution?.proxyPath || "").trim(),
+      query: String(execution?.requestUrl?.search || "").trim(),
+      bodyText,
+      authHash: this.buildPlaybackInfoAuthSignature(execution, transport)
+    };
+    const cacheKey = `playback-info:${hashStableText(payload)}`;
+    execution.playbackInfoCacheKey = cacheKey;
+    return cacheKey;
+  },
+  cleanupPlaybackInfoResponseCache(now = nowMs()) {
+    const cache = GLOBALS.PlaybackInfoResponseCache;
+    if (!(cache instanceof Map) || cache.size <= 0) return;
+    for (const [cacheKey, entry] of cache) {
+      const expiresAt = Number(entry?.expiresAt) || 0;
+      if (expiresAt > 0 && expiresAt <= now) cache.delete(cacheKey);
+    }
+    const maxEntries = Math.max(1, Number(Config.Defaults.PlaybackInfoCacheMax) || 1);
+    while (cache.size > maxEntries) {
+      const oldestKey = cache.keys().next().value;
+      if (!oldestKey) break;
+      cache.delete(oldestKey);
+    }
+  },
+  async storePlaybackInfoResponseCache(execution, response, transport = null) {
+    if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return false;
+    const cacheKey = execution.playbackInfoCacheKey || this.buildPlaybackInfoCacheKey(execution, transport);
+    if (!cacheKey) return false;
+    if (!response || !(response.status >= 200 && response.status < 300)) return false;
+    const contentType = String(response.headers.get("Content-Type") || "").toLowerCase();
+    if (!contentType.includes("json")) return false;
+    let bodyText = "";
+    try {
+      bodyText = execution?.request?.method === "HEAD" ? "" : await response.text();
+    } catch {
+      return false;
+    }
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("Set-Cookie");
+    const ttlMs = Math.max(0, Number(execution?.playbackInfoCacheTtlSec) || 0) * 1000;
+    if (ttlMs <= 0) return false;
+    const cache = GLOBALS.PlaybackInfoResponseCache;
+    const now = nowMs();
+    cache.delete(cacheKey);
+    cache.set(cacheKey, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: [...responseHeaders.entries()],
+      bodyText,
+      expiresAt: now + ttlMs
+    });
+    this.cleanupPlaybackInfoResponseCache(now);
+    return true;
+  },
+  async tryServePlaybackInfoResponseCache(execution, transport = null) {
+    if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return null;
+    const cacheKey = this.buildPlaybackInfoCacheKey(execution, transport);
+    if (!cacheKey) return null;
+    const cache = GLOBALS.PlaybackInfoResponseCache;
+    this.cleanupPlaybackInfoResponseCache();
+    const cacheEntry = cache.get(cacheKey);
+    if (!cacheEntry) {
+      execution.playbackInfoCacheState = execution.playbackInfoCacheState === "skip" ? "skip" : "miss";
+      return null;
+    }
+    if ((Number(cacheEntry.expiresAt) || 0) <= nowMs()) {
+      cache.delete(cacheKey);
+      execution.playbackInfoCacheState = "miss";
+      return null;
+    }
+    cache.delete(cacheKey);
+    cache.set(cacheKey, cacheEntry);
+    execution.playbackInfoCacheState = "hit";
+    const cachedResponse = new Response(
+      execution.request.method === "HEAD" ? null : String(cacheEntry.bodyText || ""),
+      {
+        status: Number(cacheEntry.status) || 200,
+        statusText: String(cacheEntry.statusText || ""),
+        headers: new Headers(Array.isArray(cacheEntry.headers) ? cacheEntry.headers : [])
+      }
+    );
+    const modifiedHeaders = this.buildProxyResponseHeaders(
+      cachedResponse,
+      execution.request,
+      execution.dynamicCors,
+      execution.finalOrigin,
+      execution.requestTraits,
+      {
+        enableH3: execution.enableH3,
+        forceH1: execution.forceH1,
+        imageCacheMaxAge: execution.imageCacheMaxAge
+      }
+    );
+    this.recordAccessLog(execution, {
+      statusCode: cachedResponse.status,
+      category: this.classifyProxyLogCategory(execution.requestTraits),
+      errorDetail: `PlaybackInfoCache=hit; TTL=${execution.playbackInfoCacheTtlSec}s`,
+      redirectMode: "playback_info_cache",
+      decisionReason: "playback_info_cache_hit"
+    });
+    return new Response(execution.request.method === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
+      status: cachedResponse.status,
+      statusText: cachedResponse.statusText,
+      headers: modifiedHeaders
+    });
+  },
+  parsePlaybackSessionControlPayload(execution, transport = null) {
+    const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
+    const queryPayload = {};
+    if (requestUrl) {
+      for (const [key, value] of requestUrl.searchParams.entries()) {
+        const normalizedKey = String(key || "").trim().toLowerCase();
+        if (!normalizedKey || queryPayload[normalizedKey] !== undefined) continue;
+        queryPayload[normalizedKey] = value;
+      }
+    }
+    const result = { query: queryPayload, body: {}, parseError: false };
+    const requestMethod = String(execution?.request?.method || "GET").trim().toUpperCase();
+    if (requestMethod === "GET" || requestMethod === "HEAD") return result;
+    if (transport?.preparedBodyMode === "stream") {
+      result.parseError = true;
+      return result;
+    }
+    const rawBodyText = String(transport?.preparedBodyText || decodeBufferedBodyText(transport?.preparedBody));
+    if (!rawBodyText.trim()) return result;
+    const contentType = String(transport?.newHeaders?.get("Content-Type") || execution?.request?.headers?.get("Content-Type") || "").toLowerCase();
+    try {
+      if (contentType.includes("application/json")) {
+        result.body = normalizeCaseInsensitiveObject(JSON.parse(rawBodyText));
+      } else if (contentType.includes("application/x-www-form-urlencoded")) {
+        const formPayload = {};
+        for (const [key, value] of new URLSearchParams(rawBodyText).entries()) {
+          const normalizedKey = String(key || "").trim().toLowerCase();
+          if (!normalizedKey || formPayload[normalizedKey] !== undefined) continue;
+          formPayload[normalizedKey] = value;
+        }
+        result.body = formPayload;
+      }
+    } catch {
+      result.parseError = true;
+    }
+    return result;
+  },
+  resolvePlaybackProgressSessionKey(execution, transport = null) {
+    const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
+    return {
+      sessionKey: resolvePlaybackProgressSessionKeyFromPayload({
+        query: parsedPayload.query,
+        body: parsedPayload.body,
+        clientIp: execution?.clientIp,
+        proxyPath: execution?.proxyPath
+      }),
+      parseError: parsedPayload.parseError === true
+    };
+  },
+  cleanupPlaybackProgressRelay(now = nowMs()) {
+    const relayMap = GLOBALS.PlaybackProgressRelay;
+    if (!(relayMap instanceof Map) || relayMap.size <= 0) return;
+    const staleWindowMs = Math.max(30000, Math.max(1, Number(Config.Defaults.VideoProgressForwardIntervalSec) || 1) * 20000);
+    for (const [sessionKey, entry] of relayMap) {
+      const touchedAt = Number(entry?.lastTouchedAt || entry?.lastForwardAt || 0) || 0;
+      const hasPending = !!entry?.pendingSnapshot || !!entry?.activeFlushPromise;
+      if (!hasPending && touchedAt > 0 && (touchedAt + staleWindowMs) <= now) relayMap.delete(sessionKey);
+    }
+    const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
+    while (relayMap.size > maxEntries) {
+      const oldestKey = relayMap.keys().next().value;
+      if (!oldestKey) break;
+      relayMap.delete(oldestKey);
+    }
+  },
+  buildPlaybackProgressSnapshot(execution, transport, buildFetchOptions, targetBase) {
+    if (!execution || !transport || typeof buildFetchOptions !== "function" || !(targetBase instanceof URL)) return null;
+    const preparedBody = transport.preparedBodyMode === "buffered" && transport.preparedBody
+      ? transport.preparedBody.slice(0)
+      : transport.preparedBody;
+    return {
+      targetBase: new URL(targetBase.toString()),
+      proxyPath: String(execution.proxyPath || "/"),
+      requestUrl: new URL(execution.requestUrl.toString()),
+      buildFetchOptions,
+      requestMethod: String(execution.request?.method || "POST").toUpperCase(),
+      preparedBodyMode: transport.preparedBodyMode,
+      preparedBody,
+      upstreamTimeoutMs: execution.upstreamTimeoutMs
+    };
+  },
+  schedulePlaybackProgressRelayFlush(sessionKey, entry) {
+    if (!entry?.pendingSnapshot || entry?.scheduledFlushAt > 0) return;
+    const intervalMs = Math.max(0, Number(entry.intervalMs) || 0);
+    if (intervalMs <= 0) return;
+    const dueAt = Math.max(nowMs(), Number(entry.lastForwardAt) || 0) + intervalMs;
+    entry.scheduledFlushAt = dueAt;
+    entry.lastTouchedAt = nowMs();
+    const waitPromise = (async () => {
+      await sleepMs(Math.max(0, dueAt - nowMs()));
+      const relayMap = GLOBALS.PlaybackProgressRelay;
+      const currentEntry = relayMap.get(sessionKey);
+      if (!currentEntry || currentEntry !== entry || Number(currentEntry.scheduledFlushAt) !== dueAt) return;
+      currentEntry.scheduledFlushAt = 0;
+      await this.flushPlaybackProgressRelayEntry(sessionKey, { background: true, attachToCtx: false });
+    })();
+    entry.scheduledPromise = waitPromise;
+    const waitUntilCtx = entry.waitUntilCtx || null;
+    if (waitUntilCtx?.waitUntil) waitUntilCtx.waitUntil(waitPromise);
+  },
+  async forwardPlaybackProgressSnapshot(snapshot) {
+    if (!snapshot) return null;
+    const upstream = await this.performUpstreamFetch(
+      snapshot.targetBase,
+      snapshot.proxyPath,
+      snapshot.requestUrl,
+      snapshot.buildFetchOptions,
+      {
+        method: snapshot.requestMethod,
+        bodyMode: snapshot.preparedBodyMode,
+        body: snapshot.preparedBody,
+        timeoutMs: snapshot.upstreamTimeoutMs
+      }
+    );
+    try {
+      if (upstream.response.body) {
+        try {
+          await upstream.response.arrayBuffer();
+        } catch {
+          try { upstream.response.body?.cancel?.(); } catch {}
+        }
+      }
+    } finally {
+      try { upstream.releaseFetchController?.(); } catch {}
+    }
+    return upstream.response;
+  },
+  async flushPlaybackProgressRelayEntry(sessionKey, options = {}) {
+    const relayMap = GLOBALS.PlaybackProgressRelay;
+    const entry = relayMap.get(sessionKey);
+    if (!entry) return false;
+    if (entry.activeFlushPromise) {
+      if (options.background === true) return false;
+      try { await entry.activeFlushPromise; } catch {}
+    }
+    if (!entry.pendingSnapshot) return false;
+    const snapshot = entry.pendingSnapshot;
+    entry.pendingSnapshot = null;
+    entry.scheduledFlushAt = 0;
+    entry.lastForwardAt = nowMs();
+    entry.lastTouchedAt = entry.lastForwardAt;
+    const flushPromise = (async () => {
+      try {
+        await this.forwardPlaybackProgressSnapshot(snapshot);
+      } finally {
+        const currentEntry = relayMap.get(sessionKey);
+        if (!currentEntry || currentEntry !== entry) return;
+        currentEntry.activeFlushPromise = null;
+        currentEntry.lastTouchedAt = nowMs();
+        if (currentEntry.pendingSnapshot) this.schedulePlaybackProgressRelayFlush(sessionKey, currentEntry);
+      }
+    })();
+    entry.activeFlushPromise = flushPromise;
+    if (options.attachToCtx === true && entry.waitUntilCtx?.waitUntil) entry.waitUntilCtx.waitUntil(flushPromise);
+    if (options.background !== true) {
+      try { await flushPromise; } catch {}
+    }
+    return true;
+  },
+  async flushPlaybackProgressBeforeStopped(execution) {
+    const sessionKey = String(execution?.progressForwardSessionKey || "").trim();
+    if (!sessionKey) return false;
+    const relayMap = GLOBALS.PlaybackProgressRelay;
+    const entry = relayMap.get(sessionKey);
+    if (!entry) return false;
+    if (entry.activeFlushPromise) {
+      try { await entry.activeFlushPromise; } catch {}
+    }
+    if (!entry.pendingSnapshot) return false;
+    entry.scheduledFlushAt = 0;
+    return await this.flushPlaybackProgressRelayEntry(sessionKey, { background: false, attachToCtx: false });
+  },
+  buildPlaybackProgressThrottleResponse(execution) {
+    const responseHeaders = this.buildEdgeResponseHeaders(execution.finalOrigin);
+    this.recordAccessLog(execution, {
+      statusCode: 204,
+      category: this.classifyProxyLogCategory(execution.requestTraits),
+      errorDetail: `ProgressRelay=${execution.progressForwardMode || "throttled_204"}; Interval=${execution.videoProgressForwardIntervalSec}s`,
+      redirectMode: "progress_relay",
+      decisionReason: execution.progressForwardMode || "progress_relay_throttled"
+    });
+    return new Response(null, { status: 204, statusText: "No Content", headers: responseHeaders });
+  },
+  async maybeHandlePlaybackProgressRelay(execution, transport, buildFetchOptions, targetBases = []) {
+    if (execution?.requestTraits?.isPlaybackSessionControlRequest !== true) return null;
+    const intervalSec = Math.max(0, Number(execution?.videoProgressForwardIntervalSec) || 0);
+    if (execution?.videoProgressForwardEnabled !== true || intervalSec <= 0 || !execution?.ctx?.waitUntil) {
+      execution.progressForwardMode = "pass_through";
+      return null;
+    }
+    const sessionInfo = this.resolvePlaybackProgressSessionKey(execution, transport);
+    execution.progressForwardSessionKey = String(sessionInfo.sessionKey || "").trim();
+    if (sessionInfo.parseError) {
+      execution.progressForwardMode = "parse_bypass";
+      return null;
+    }
+    if (execution.requestTraits.isPlaybackStartedRequest === true) {
+      execution.progressForwardMode = "started_passthrough";
+      if (execution.progressForwardSessionKey) GLOBALS.PlaybackProgressRelay.delete(execution.progressForwardSessionKey);
+      return null;
+    }
+    if (execution.requestTraits.isPlaybackStoppedRequest === true) {
+      const flushed = await this.flushPlaybackProgressBeforeStopped(execution);
+      execution.progressForwardMode = flushed ? "flush_before_stopped" : "stopped_passthrough";
+      if (execution.progressForwardSessionKey) GLOBALS.PlaybackProgressRelay.delete(execution.progressForwardSessionKey);
+      return null;
+    }
+    if (execution.requestTraits.isPlaybackProgressRequest !== true) return null;
+    const targetBase = targetBases[0] instanceof URL ? targetBases[0] : null;
+    if (!targetBase) {
+      execution.progressForwardMode = "pass_through";
+      return null;
+    }
+    if ((execution.request.method !== "GET" && execution.request.method !== "HEAD") && transport?.preparedBodyMode !== "buffered") {
+      execution.progressForwardMode = "unbuffered_bypass";
+      return null;
+    }
+    const relayMap = GLOBALS.PlaybackProgressRelay;
+    this.cleanupPlaybackProgressRelay();
+    const sessionKey = execution.progressForwardSessionKey || `fallback:${execution.clientIp}:${execution.proxyPath}`;
+    let relayEntry = relayMap.get(sessionKey);
+    if (!relayEntry) {
+      relayEntry = {
+        lastForwardAt: 0,
+        lastTouchedAt: nowMs(),
+        intervalMs: intervalSec * 1000,
+        waitUntilCtx: execution.ctx,
+        pendingSnapshot: null,
+        scheduledFlushAt: 0,
+        scheduledPromise: null,
+        activeFlushPromise: null
+      };
+      relayMap.set(sessionKey, relayEntry);
+    }
+    relayEntry.intervalMs = intervalSec * 1000;
+    relayEntry.waitUntilCtx = execution.ctx;
+    relayEntry.lastTouchedAt = nowMs();
+    relayMap.delete(sessionKey);
+    relayMap.set(sessionKey, relayEntry);
+    const now = nowMs();
+    const withinWindow = relayEntry.lastForwardAt > 0 && (now - relayEntry.lastForwardAt) < relayEntry.intervalMs;
+    if (!withinWindow && !relayEntry.activeFlushPromise && !relayEntry.pendingSnapshot) {
+      relayEntry.pendingSnapshot = null;
+      relayEntry.scheduledFlushAt = 0;
+      relayEntry.lastForwardAt = now;
+      execution.progressForwardMode = "forward_now";
+      return null;
+    }
+    const snapshot = this.buildPlaybackProgressSnapshot(execution, transport, buildFetchOptions, targetBase);
+    if (!snapshot) {
+      execution.progressForwardMode = "snapshot_bypass";
+      return null;
+    }
+    relayEntry.pendingSnapshot = snapshot;
+    relayEntry.lastTouchedAt = now;
+    execution.progressForwardMode = "throttled_204";
+    this.schedulePlaybackProgressRelayFlush(sessionKey, relayEntry);
+    return this.buildPlaybackProgressThrottleResponse(execution);
   },
   async extractPlaybackInfoDiagnostic(proxyPath, requestUrl, response) {
     if (!this.isPlaybackInfoRequest(proxyPath)) return null;
@@ -5223,6 +6057,32 @@ const Proxy = {
     const cfCache = response.headers.get("CF-Cache-Status");
     if (cfCache) hints.push(`CF-Cache: ${cfCache}`);
     return hints.length > 0 ? hints.join(" | ") : response.statusText;
+  },
+  buildStructuredLogDetail(execution, payload = {}, options = {}) {
+    const deliveryMode = String(options.deliveryMode || "").trim().toLowerCase() === "direct" ? "direct" : "proxy";
+    const redirectMode = String(options.redirectMode || "").trim() || null;
+    const decisionReason = String(options.decisionReason || execution?.directRedirectAuthReason || "").trim() || null;
+    const protocolFailureReason = String(options.protocolFailureReason || "").trim() || null;
+    const strmResolution = String(options.strmResolution || execution?.strmResolutionState || "").trim() || null;
+    const strmError = String(options.strmError || execution?.strmErrorReason || "").trim() || null;
+    return {
+      deliveryMode,
+      redirectDecision: {
+        mode: redirectMode,
+        reason: decisionReason
+      },
+      decisionReason,
+      protocolFailureReason,
+      targetHotCache: String(options.targetHotCache || execution?.targetHotCacheState || "").trim() || null,
+      playbackInfoCache: String(options.playbackInfoCache || execution?.playbackInfoCacheState || "").trim() || null,
+      playbackInfoCacheTtlSec: Math.max(0, Math.trunc(Number(options.playbackInfoCacheTtlSec ?? execution?.playbackInfoCacheTtlSec) || 0)),
+      progressRelayMode: String(options.progressRelayMode || execution?.progressForwardMode || "").trim() || null,
+      progressIntervalSec: Math.max(0, Math.trunc(Number(options.progressIntervalSec ?? execution?.videoProgressForwardIntervalSec) || 0)),
+      strmResolution,
+      strmError,
+      upstreamHost: String(options.upstreamHost || options.finalUrl?.hostname || "").trim() || null,
+      upstreamStatus: Number(options.upstreamStatus || payload.statusCode || 0) || 0
+    };
   },
   buildMetadataCacheStorageResponse(response, requestTraits, options = {}) {
     const cacheHeaders = new Headers(response.headers);
@@ -5512,6 +6372,18 @@ const Proxy = {
   },
   recordAccessLog(execution, payload = {}) {
     if (execution.internalCompatProbe === true) return;
+    const detailJson = payload.detailJson && typeof payload.detailJson === "object"
+      ? payload.detailJson
+      : this.buildStructuredLogDetail(execution, { statusCode: payload.statusCode }, {
+          deliveryMode: payload.deliveryMode,
+          redirectMode: payload.redirectMode,
+          decisionReason: payload.decisionReason,
+          protocolFailureReason: payload.protocolFailureReason,
+          strmResolution: payload.strmResolution,
+          strmError: payload.strmError,
+          upstreamHost: payload.upstreamHost,
+          upstreamStatus: payload.upstreamStatus
+        });
     Logger.record(execution.env, execution.ctx, {
       nodeName: execution.nodeName,
       requestPath: execution.proxyPath,
@@ -5520,6 +6392,7 @@ const Proxy = {
       clientIp: execution.clientIp,
       userAgent: execution.request.headers.get("User-Agent"),
       referer: execution.request.headers.get("Referer"),
+      detailJson,
       ...payload
     });
   },
@@ -5552,6 +6425,8 @@ const Proxy = {
       directStaticAssets: currentConfig.directStaticAssets === true,
       directHlsDash: currentConfig.directHlsDash === true
     });
+    const playbackHotEligible = requestTraits.isBigStream === true || requestTraits.isManifest === true || requestTraits.isSegment === true || requestTraits.isPlaybackInfoRequest === true;
+    const playbackHotSnapshot = playbackHotEligible ? this.getPlaybackRouteHotSnapshot(name, node) : null;
 
     const enableH2 = currentConfig.enableH2 === true;
     const enableH3 = currentConfig.enableH3 === true;
@@ -5559,6 +6434,11 @@ const Proxy = {
     const protocolFallback = currentConfig.protocolFallback !== false;
     const upstreamTimeoutMs = clampIntegerConfig(currentConfig.upstreamTimeoutMs, Config.Defaults.UpstreamTimeoutMs, 0, 180000);
     const upstreamRetryAttempts = clampIntegerConfig(currentConfig.upstreamRetryAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3);
+    const playbackInfoCacheEnabled = currentConfig.playbackInfoCacheEnabled !== false;
+    const playbackInfoCacheTtlSec = clampIntegerConfig(currentConfig.playbackInfoCacheTtlSec, Config.Defaults.PlaybackInfoCacheTtlSec, 0, 60);
+    const videoProgressForwardEnabled = currentConfig.videoProgressForwardEnabled !== false;
+    const videoProgressForwardIntervalSec = clampIntegerConfig(currentConfig.videoProgressForwardIntervalSec, Config.Defaults.VideoProgressForwardIntervalSec, 0, 60);
+    const effectiveMediaAuthMode = resolveEffectiveNodeMediaAuthMode(node, currentConfig);
     const imageCacheMaxAge = clampIntegerConfig(currentConfig.cacheTtlImages, Config.Defaults.CacheTtlImagesDays, 0, 365) * 86400;
     const utc8Hour = (new Date().getUTCHours() + 8) % 24;
     const isPeakHour = utc8Hour >= 20 && utc8Hour < 24;
@@ -5588,6 +6468,20 @@ const Proxy = {
       protocolFallback,
       upstreamTimeoutMs,
       upstreamRetryAttempts,
+      playbackInfoCacheEnabled,
+      playbackInfoCacheTtlSec,
+      playbackInfoCacheState: requestTraits.isPlaybackInfoRequest === true
+        ? (playbackInfoCacheEnabled && playbackInfoCacheTtlSec > 0 ? "miss" : "skip")
+        : "",
+      playbackInfoCacheKey: "",
+      targetHotCacheState: playbackHotEligible ? (playbackHotSnapshot ? "hit" : "miss") : "skip",
+      videoProgressForwardEnabled,
+      videoProgressForwardIntervalSec,
+      effectiveMediaAuthMode,
+      progressForwardMode: "",
+      progressForwardSessionKey: "",
+      strmResolutionState: "",
+      strmErrorReason: "",
       imageCacheMaxAge,
       metadataCacheKey,
       metadataCache
@@ -5613,7 +6507,9 @@ const Proxy = {
       this.recordAccessLog(execution, {
         statusCode: cachedResponse.status,
         category: this.classifyProxyLogCategory(execution.requestTraits),
-        errorDetail: this.extractProxyErrorDetail(cachedResponse)
+        errorDetail: this.extractProxyErrorDetail(cachedResponse),
+        redirectMode: "worker_cache",
+        decisionReason: "worker_cache_hit"
       });
       return new Response(cachedResponse.body, {
         status: cachedResponse.status,
@@ -5650,11 +6546,21 @@ const Proxy = {
 
     return await this.tryServeMetadataCache(execution);
   },
-  maybeBuildDirectRedirectResponse(execution, targetBases) {
+  maybeBuildDirectRedirectResponse(execution, targetBases, transport = null) {
     if (execution.requestTraits.direct307Mode !== true) return null;
     const activeTargetBase = targetBases[0];
+    const redirectAuthPolicy = transport?.clientRedirectAuthPolicy || evaluateMediaClientRedirectAuthPolicy(transport?.newHeaders || execution.request.headers);
+    if (
+      (execution.requestTraits.isBigStream || execution.requestTraits.isManifest || execution.requestTraits.isSegment)
+      && redirectAuthPolicy.canDirect !== true
+    ) {
+      execution.directRedirectAuthReason = redirectAuthPolicy.reason || "direct_transport_incompatible";
+      execution.progressForwardMode = execution.progressForwardMode || "";
+      return null;
+    }
     const directRedirectUrl = buildUpstreamProxyUrl(activeTargetBase, execution.proxyPath);
     directRedirectUrl.search = execution.requestUrl.search;
+    const authedRedirectUrl = appendMediaRedirectAuthToUrl(directRedirectUrl, redirectAuthPolicy);
     const syntheticRedirect = new Response(null, { status: 307, statusText: "Temporary Redirect" });
     const modifiedHeaders = this.buildProxyResponseHeaders(
       syntheticRedirect,
@@ -5674,18 +6580,78 @@ const Proxy = {
       activeTargetBase,
       execution.nodeName,
       execution.nodeKey,
-      directRedirectUrl,
-      directRedirectUrl
+      authedRedirectUrl,
+      authedRedirectUrl
     );
     this.recordAccessLog(execution, {
       statusCode: 307,
       category: this.classifyProxyLogCategory(execution.requestTraits),
-      errorDetail: null
+      errorDetail: redirectAuthPolicy.canDirect === true ? null : "Direct auth guard bypassed to proxy",
+      deliveryMode: "direct",
+      redirectMode: "entry_307",
+      decisionReason: execution.requestTraits.isManifest ? "entry_direct_manifest" : execution.requestTraits.isSegment ? "entry_direct_segment" : execution.requestTraits.isBigStream ? "entry_direct_stream" : "entry_direct"
     });
     return new Response(null, {
       status: 307,
       statusText: "Temporary Redirect",
       headers: modifiedHeaders
+    });
+  },
+  shouldGuardClientDirectForRequest(requestTraits = {}) {
+    return requestTraits.isBigStream === true
+      || requestTraits.isManifest === true
+      || requestTraits.isSegment === true
+      || requestTraits.isPlaybackInfoRequest === true;
+  },
+  async maybeConvertDirectRedirectToProxiedState(execution, transport, buildFetchOptions, upstreamState) {
+    const directRedirectUrl = upstreamState?.directRedirectUrl;
+    if (!(directRedirectUrl instanceof URL)) return upstreamState;
+    if (!this.shouldGuardClientDirectForRequest(execution?.requestTraits)) return upstreamState;
+    const redirectAuthPolicy = transport?.clientRedirectAuthPolicy || evaluateMediaClientRedirectAuthPolicy(transport?.newHeaders || execution?.request?.headers);
+    if (redirectAuthPolicy.canDirect === true) return upstreamState;
+    execution.directRedirectAuthReason = redirectAuthPolicy.reason || "direct_transport_incompatible";
+
+    const proxiedUpstream = await this.fetchAbsoluteWithRetryLoop({
+      absoluteUrl: appendMediaRedirectAuthToUrl(directRedirectUrl, redirectAuthPolicy),
+      buildFetchOptions,
+      fetchOptions: {
+        method: String(execution.request.method || "GET").toUpperCase(),
+        bodyMode: transport?.preparedBodyMode || "none",
+        body: transport?.preparedBody,
+        isExternalRedirect: true
+      },
+      retryableStatuses: UPSTREAM_RETRYABLE_STATUSES,
+      protocolFallback: execution.protocolFallback,
+      preparedBodyMode: transport?.preparedBodyMode || "none",
+      allowAutomaticRetry: transport?.allowAutomaticRetry === true,
+      stripAuthOnProtocolFallback: execution.requestTraits.canStripAuthOnProtocolFallback,
+      upstreamTimeoutMs: execution.upstreamTimeoutMs,
+      maxExtraAttempts: transport?.allowAutomaticRetry ? execution.upstreamRetryAttempts : 0,
+      isRetry: false
+    });
+
+    const compatibleUpstream = await this.maybeRecoverPlaybackCompatibility(execution, transport, buildFetchOptions, {
+      response: proxiedUpstream.response,
+      finalUrl: proxiedUpstream.finalUrl,
+      targetBase: upstreamState.activeTargetBase
+    }, {
+      method: String(execution.request.method || "GET").toUpperCase(),
+      bodyMode: transport?.preparedBodyMode || "none",
+      body: transport?.preparedBody,
+      isExternalRedirect: true
+    });
+
+    return await this.followRedirectChainFromState(execution, transport, buildFetchOptions, {
+      response: compatibleUpstream.response,
+      finalUrl: compatibleUpstream.finalUrl,
+      activeTargetBase: upstreamState.activeTargetBase,
+      proxiedExternalRedirect: true,
+      directRedirectUrl: null
+    }, {
+      method: String(execution.request.method || "GET").toUpperCase(),
+      bodyMode: transport?.preparedBodyMode || "none",
+      body: transport?.preparedBody,
+      isExternalRedirect: true
     });
   },
   createBuildFetchOptions(execution, transport) {
@@ -6003,6 +6969,8 @@ const Proxy = {
   },
   async tryResolveStrmUpstreamState(execution, transport, buildFetchOptions) {
     if (!this.shouldTryResolveStrm(execution)) return null;
+    execution.strmResolutionState = "fetching";
+    execution.strmErrorReason = "";
 
     const strmUpstream = await this.fetchUpstreamWithRetryLoop({
       retryTargets: transport.retryTargets,
@@ -6032,6 +7000,8 @@ const Proxy = {
       directRedirectUrl: null
     };
     if (!strmUpstream.response.ok) {
+      execution.strmResolutionState = "upstream_passthrough";
+      execution.strmErrorReason = `strm_upstream_${strmUpstream.response.status}`;
       return { ...baseState, response: strmUpstream.response };
     }
 
@@ -6039,25 +7009,38 @@ const Proxy = {
     try {
       strmText = await strmUpstream.response.text();
     } catch {
+      execution.strmResolutionState = "parse_error";
+      execution.strmErrorReason = "strm_text_read_failed";
       return {
         ...baseState,
-        response: new Response("STRM parse error", {
+        response: new Response("STRM 解析失败：上游文本读取异常", {
           status: 500,
-          headers: { "Content-Type": "text/plain; charset=utf-8" }
+          statusText: "STRM Parse Error",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "X-Application-Error-Code": "STRM_PARSE_ERROR"
+          }
         })
       };
     }
 
     const resolvedUrl = extractFirstValidStrmUrl(strmText);
     if (!resolvedUrl) {
+      execution.strmResolutionState = "invalid";
+      execution.strmErrorReason = "strm_no_valid_http_url";
       return {
         ...baseState,
-        response: new Response("Bad STRM", {
+        response: new Response("STRM 无有效的 http/https 地址", {
           status: 400,
-          headers: { "Content-Type": "text/plain; charset=utf-8" }
+          statusText: "Invalid STRM",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "X-Application-Error-Code": "STRM_INVALID_URL"
+          }
         })
       };
     }
+    execution.strmResolutionState = "resolved";
 
     const syntheticRedirect = new Response(null, {
       status: 302,
@@ -6108,9 +7091,15 @@ const Proxy = {
       body: transport.preparedBody
     });
   },
-  async buildSuccessResponse(execution, buildFetchOptions, upstreamState) {
+  async buildSuccessResponse(execution, buildFetchOptions, upstreamState, transport = null) {
+    const stableUpstreamState = await this.maybeConvertDirectRedirectToProxiedState(execution, transport, buildFetchOptions, upstreamState);
+    upstreamState = stableUpstreamState || upstreamState;
     const finalStatus = upstreamState.response.status;
     const finalStatusText = upstreamState.response.statusText;
+    const redirectAuthPolicy = transport?.clientRedirectAuthPolicy || evaluateMediaClientRedirectAuthPolicy(transport?.newHeaders || execution.request.headers);
+    const directRedirectUrl = upstreamState.directRedirectUrl
+      ? appendMediaRedirectAuthToUrl(upstreamState.directRedirectUrl, redirectAuthPolicy)
+      : null;
     const modifiedHeaders = this.buildProxyResponseHeaders(
       upstreamState.response,
       execution.request,
@@ -6130,7 +7119,7 @@ const Proxy = {
       upstreamState.activeTargetBase,
       execution.nodeName,
       execution.nodeKey,
-      upstreamState.directRedirectUrl,
+      directRedirectUrl,
       upstreamState.finalUrl
     );
 
@@ -6143,8 +7132,21 @@ const Proxy = {
     this.recordAccessLog(execution, {
       statusCode: finalStatus,
       category: this.classifyProxyLogCategory(execution.requestTraits),
-      errorDetail
+      errorDetail,
+      deliveryMode: directRedirectUrl ? "direct" : "proxy",
+      redirectMode: directRedirectUrl ? "client_redirect" : (upstreamState.proxiedExternalRedirect ? "proxied_follow" : "proxy_response"),
+      decisionReason: directRedirectUrl ? "client_redirect" : (upstreamState.proxiedExternalRedirect ? "proxied_follow" : "upstream_response"),
+      protocolFailureReason: finalStatus >= 500 ? "upstream_5xx" : (finalStatus >= 400 ? "upstream_4xx" : ""),
+      upstreamHost: upstreamState.finalUrl?.hostname || upstreamState.activeTargetBase?.hostname || "",
+      upstreamStatus: finalStatus
     });
+
+    if (execution.requestTraits.isPlaybackInfoRequest === true) {
+      await this.storePlaybackInfoResponseCache(execution, upstreamState.response.clone(), null);
+    }
+    if (upstreamState.activeTargetBase instanceof URL && finalStatus >= 200 && finalStatus < 400) {
+      this.setPlaybackRouteHotSnapshot(execution.nodeName, execution.node, upstreamState.activeTargetBase);
+    }
 
     if (execution.metadataCacheKey && execution.ctx && upstreamState.response.status === 200) {
       const cacheClone = upstreamState.response.clone();
@@ -6195,7 +7197,12 @@ const Proxy = {
     this.recordAccessLog(execution, {
       statusCode: 502,
       category: "error",
-      errorDetail: errorMessage
+      errorDetail: errorMessage,
+      redirectMode: "proxy_error",
+      decisionReason: "proxy_error",
+      protocolFailureReason: /timeout/i.test(errorMessage) ? "connect_timeout" : "unknown_fetch_error",
+      upstreamHost: err?.lastFinalUrl?.hostname || err?.lastTargetBase?.hostname || "",
+      upstreamStatus: 502
     });
 
     const errHeaders = new Headers({
@@ -6241,16 +7248,19 @@ const Proxy = {
         execution.clientIp,
         execution.requestTraits,
         execution.forceH1,
-        targetBases
+        targetBases,
+        {
+          effectiveMediaAuthMode: execution.effectiveMediaAuthMode
+        }
       );
       buildFetchOptions = this.createBuildFetchOptions(execution, transport);
       const strmUpstreamState = await this.tryResolveStrmUpstreamState(execution, transport, buildFetchOptions);
       if (strmUpstreamState) {
-        return await this.buildSuccessResponse(execution, buildFetchOptions, strmUpstreamState);
+        return await this.buildSuccessResponse(execution, buildFetchOptions, strmUpstreamState, transport);
       }
     }
 
-    const directResponse = this.maybeBuildDirectRedirectResponse(execution, targetBases);
+    const directResponse = this.maybeBuildDirectRedirectResponse(execution, targetBases, transport);
     if (directResponse) return directResponse;
 
     if (!transport || !buildFetchOptions) {
@@ -6262,14 +7272,21 @@ const Proxy = {
         execution.clientIp,
         execution.requestTraits,
         execution.forceH1,
-        targetBases
+        targetBases,
+        {
+          effectiveMediaAuthMode: execution.effectiveMediaAuthMode
+        }
       );
       buildFetchOptions = this.createBuildFetchOptions(execution, transport);
     }
 
     try {
+      const playbackInfoCachedResponse = await this.tryServePlaybackInfoResponseCache(execution, transport);
+      if (playbackInfoCachedResponse) return playbackInfoCachedResponse;
+      const progressRelayResponse = await this.maybeHandlePlaybackProgressRelay(execution, transport, buildFetchOptions, transport.retryTargets);
+      if (progressRelayResponse) return progressRelayResponse;
       const upstreamState = await this.executeUpstreamFlow(execution, transport, buildFetchOptions);
-      return await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState);
+      return await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState, transport);
     } catch (err) {
       return this.buildErrorResponse(execution, err);
     }
@@ -6328,6 +7345,7 @@ const Logger = {
       referer: logData.referer || null,
       category: logData.category || "api",
       errorDetail: logData.errorDetail || null, // [新增] 记录错误详情
+      detailJson: logData.detailJson && typeof logData.detailJson === "object" ? logData.detailJson : null,
       createdAt: new Date(recordTimestamp).toISOString()
     });
     // 💡 [极简修复 1] 内存泄流阀：如果 D1 阻塞导致队列堆积，强行丢弃最老的日志，死守内存底线
@@ -6386,14 +7404,14 @@ const Logger = {
         activeBatchWrittenCount = 0;
         for (let index = 0; index < eligibleLogs.length; index += chunkSize) {
           const chunk = eligibleLogs.slice(index, index + chunkSize);
-          const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, created_at)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          const statements = chunk.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, error_detail, detail_json, created_at)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE ? > COALESCE((
               SELECT CAST(json_extract(payload, '$.clearEpochMs') AS INTEGER)
               FROM ${Database.SYS_STATUS_TABLE}
               WHERE scope = ?
               LIMIT 1
-            ), 0)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.createdAt, item.timestamp, logScope));
+            ), 0)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.errorDetail, item.detailJson ? JSON.stringify(item.detailJson) : null, item.createdAt, item.timestamp, logScope));
           let attempt = 0;
           while (true) {
             try {
@@ -6979,11 +7997,22 @@ const UI_HTML = `<!DOCTYPE html>
 	              <input type="text" id="log-search-input" v-model="App.logSearchKeyword" :placeholder="App.getLogSearchInputPlaceholder()" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white flex-1 md:w-56" @keydown.enter="App.loadLogs(1)">
               <button @click="App.loadLogs(1)" class="text-brand-500 text-sm px-2 hover:text-brand-600"><i data-lucide="search" class="w-4 h-4 inline"></i></button>
               <div v-if="App.isSettingsExpertMode()" class="flex flex-wrap items-center gap-1.5">
+                <button data-log-request-group-filter="" @click="App.setLogsRequestGroupFilter('')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsRequestGroupFilterClass('')">全部请求</button>
+                <button data-log-request-group-filter="playback_info" @click="App.setLogsRequestGroupFilter('playback_info')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsRequestGroupFilterClass('playback_info')">播放信息</button>
+                <button data-log-request-group-filter="image" @click="App.setLogsRequestGroupFilter('image')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsRequestGroupFilterClass('image')">图片海报</button>
+                <button data-log-request-group-filter="api" @click="App.setLogsRequestGroupFilter('api')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsRequestGroupFilterClass('api')">常规 API</button>
+                <button data-log-request-group-filter="auth" @click="App.setLogsRequestGroupFilter('auth')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsRequestGroupFilterClass('auth')">用户认证</button>
                 <button data-log-playback-filter="" @click="App.setLogsPlaybackModeFilter('')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('')">全部模式</button>
                 <button data-log-playback-filter="transcode" @click="App.setLogsPlaybackModeFilter('transcode')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('transcode')">只看转码</button>
                 <button data-log-playback-filter="direct_stream" @click="App.setLogsPlaybackModeFilter('direct_stream')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('direct_stream')">只看直串</button>
                 <button data-log-playback-filter="direct_play" @click="App.setLogsPlaybackModeFilter('direct_play')" class="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium transition" :class="App.getLogsPlaybackFilterClass('direct_play')">只看直放</button>
               </div>
+              <select v-if="App.isSettingsExpertMode()" :value="App.logsDeliveryModeFilter" @change="App.setLogsDeliveryModeFilter($event.target.value)" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-xs text-slate-900 dark:text-white">
+                <option v-for="option in App.getLogsDeliveryModeOptions()" :key="'delivery-' + option.value" :value="option.value">{{ option.label }}</option>
+              </select>
+              <select v-if="App.isSettingsExpertMode()" :value="App.logsDecisionReasonFilter" @change="App.setLogsDecisionReasonFilter($event.target.value)" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-xs text-slate-900 dark:text-white">
+                <option v-for="option in App.getLogsDecisionReasonOptions()" :key="'decision-' + option.value" :value="option.value">{{ option.label }}</option>
+              </select>
               
               <div class="w-px h-5 bg-slate-300 dark:bg-slate-700 mx-1 hidden md:block"></div>
               
@@ -7395,6 +8424,40 @@ const UI_HTML = `<!DOCTYPE html>
                     </select>
                     <p class="text-xs text-slate-500 mb-3 ml-6">“索引”包含播放列表与字幕等轻量元数据，不包含任何视频分片或大文件 Range。</p>
                     <p id="cfg-prewarm-runtime-hint" class="text-xs text-cyan-700 dark:text-cyan-300 mb-3 ml-6">{{ App.proxySettingsGuardrails.prewarmHint }}</p>
+                  </div>
+
+                  <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
+                    <div class="flex items-center justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                      <div>
+                        <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Playback</div>
+                        <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">播放信息与状态回传</div>
+                      </div>
+                      <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">短缓存 / 节流</span>
+                    </div>
+                    <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-playback-info-cache-enabled" v-model="App.settingsForm.playbackInfoCacheEnabled" class="mr-2 w-4 h-4 rounded"> 开启 PlaybackInfo 获取缓存</label>
+                    <p class="text-xs text-slate-500 mb-3 ml-6">只缓存 <code>200-299</code> 且 <code>Content-Type</code> 为 JSON 的 PlaybackInfo 响应，用来削减短时间重复请求。</p>
+                    <label class="block text-sm text-slate-500 mb-1 ml-6">PlaybackInfo 缓存时间</label>
+                    <div class="relative w-[calc(100%-1.5rem)] ml-6">
+                      <input type="number" min="0" max="60" step="1" id="cfg-playback-info-cache-ttl" v-model="App.settingsForm.playbackInfoCacheTtlSec" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white">
+                      <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">秒</span>
+                    </div>
+                    <p class="text-xs text-slate-500 mb-3 ml-6">默认 60 秒；设为 0 等于关闭这层短缓存。</p>
+                    <label class="flex items-center text-sm font-medium mb-2 cursor-pointer text-slate-900 dark:text-white"><input type="checkbox" id="cfg-video-progress-forward-enabled" v-model="App.settingsForm.videoProgressForwardEnabled" class="mr-2 w-4 h-4 rounded"> 开启视频回传进度控制</label>
+                    <p class="text-xs text-slate-500 mb-3 ml-6">仅对 <code>/Sessions/Playing/Progress</code> 做控频，窗口内命中会先回 <code>204</code>，并在窗口结束时只回源最新一条。</p>
+                    <label class="block text-sm text-slate-500 mb-1 ml-6">视频回传进度控制间隔</label>
+                    <div class="relative w-[calc(100%-1.5rem)] ml-6">
+                      <input type="number" min="0" max="60" step="1" id="cfg-video-progress-forward-interval" v-model="App.settingsForm.videoProgressForwardIntervalSec" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white">
+                      <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">秒</span>
+                    </div>
+                    <p class="text-xs text-slate-500 mb-3 ml-6">默认 3 秒；设为 0 则恢复逐条透传。</p>
+                    <label class="block text-sm text-slate-500 mb-1">媒体认证头模式</label>
+                    <select id="cfg-default-media-auth-mode" v-model="App.settingsForm.defaultMediaAuthMode" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                      <option value="auto">自动识别 (默认)</option>
+                      <option value="emby">强制 Emby</option>
+                      <option value="jellyfin">强制 Jellyfin</option>
+                      <option value="passthrough">完全透传</option>
+                    </select>
+                    <p class="text-xs text-slate-500 mt-2">当节点自身媒体认证头模式保持 <code>auto</code> 时，会跟随这里的全局默认值做规范化。</p>
                   </div>
 
                   <div v-if="App.isSettingsExpertMode()" class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
@@ -8211,6 +9274,11 @@ const UI_HTML = `<!DOCTYPE html>
     const UI_DEFAULTS = {
       uiRadiusPx: 10,
       settingsExperienceMode: 'novice',
+      playbackInfoCacheEnabled: true,
+      playbackInfoCacheTtlSec: 60,
+      videoProgressForwardEnabled: true,
+      videoProgressForwardIntervalSec: 3,
+      defaultMediaAuthMode: 'auto',
       directStaticAssets: false,
       directHlsDash: false,
       prewarmDepth: 'poster',
@@ -8331,6 +9399,11 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'enablePrewarm', id: 'cfg-enable-prewarm', kind: 'checkbox', checkboxMode: 'defaultTrue' },
         { key: 'prewarmDepth', id: 'cfg-prewarm-depth', kind: 'or-default', defaultValue: UI_DEFAULTS.prewarmDepth },
         { key: 'prewarmCacheTtl', id: 'cfg-prewarm-ttl', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: UI_DEFAULTS.prewarmCacheTtl },
+        { key: 'playbackInfoCacheEnabled', id: 'cfg-playback-info-cache-enabled', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'playbackInfoCacheTtlSec', id: 'cfg-playback-info-cache-ttl', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: UI_DEFAULTS.playbackInfoCacheTtlSec },
+        { key: 'videoProgressForwardEnabled', id: 'cfg-video-progress-forward-enabled', kind: 'checkbox', checkboxMode: 'defaultTrue' },
+        { key: 'videoProgressForwardIntervalSec', id: 'cfg-video-progress-forward-interval', kind: 'int-or-default', loadMode: 'number-finite', saveMode: 'int-finite', defaultValue: UI_DEFAULTS.videoProgressForwardIntervalSec },
+        { key: 'defaultMediaAuthMode', id: 'cfg-default-media-auth-mode', kind: 'or-default', defaultValue: UI_DEFAULTS.defaultMediaAuthMode },
         { key: 'directStaticAssets', id: 'cfg-direct-static-assets', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'directHlsDash', id: 'cfg-direct-hls-dash', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'sourceSameOriginProxy', id: 'cfg-source-same-origin-proxy', kind: 'checkbox', checkboxMode: 'defaultTrue' },
@@ -8417,6 +9490,11 @@ const UI_HTML = `<!DOCTYPE html>
       enablePrewarm: '轻量级元数据预热',
       prewarmDepth: '预热深度',
       prewarmCacheTtl: '元数据预热缓存时长',
+      playbackInfoCacheEnabled: 'PlaybackInfo 获取缓存',
+      playbackInfoCacheTtlSec: 'PlaybackInfo 缓存时间',
+      videoProgressForwardEnabled: '视频回传进度控制',
+      videoProgressForwardIntervalSec: '视频回传进度控制间隔',
+      defaultMediaAuthMode: '媒体认证头模式默认值',
       directStaticAssets: '静态文件直连',
       directHlsDash: 'HLS / DASH 直连',
       sourceSameOriginProxy: '源站同源代理',
@@ -8481,6 +9559,11 @@ const UI_HTML = `<!DOCTYPE html>
         enablePrewarm: true,
         prewarmDepth: 'poster',
         prewarmCacheTtl: 120,
+        playbackInfoCacheEnabled: true,
+        playbackInfoCacheTtlSec: 60,
+        videoProgressForwardEnabled: true,
+        videoProgressForwardIntervalSec: 3,
+        defaultMediaAuthMode: 'auto',
         directStaticAssets: false,
         directHlsDash: false,
         sourceSameOriginProxy: true,
@@ -8733,6 +9816,9 @@ const UI_HTML = `<!DOCTYPE html>
         logEndDate: '',
         logTimeTick: 0,
         logsPlaybackModeFilter: '',
+        logsRequestGroupFilter: '',
+        logsDeliveryModeFilter: '',
+        logsDecisionReasonFilter: '',
         dnsRecords: [],
         dnsEditMode: 'cname',
         dnsOriginalEditMode: 'cname',
@@ -9467,7 +10553,7 @@ const UI_HTML = `<!DOCTYPE html>
           if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledLeaseMs) > 0 && Number(nextConfig.scheduledLeaseMs) < 60000) {
             hints.push('定时任务租约低于 60 秒，慢清理或网络抖动时更容易出现并发重入。');
           }
-          if ((section === 'logs' || section === 'all') && String(nextConfig.scheduledMaintenanceMode || 'interval') === 'daily' && !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(String(nextConfig.scheduledMaintenanceTime || '').trim())) {
+          if ((section === 'logs' || section === 'all') && String(nextConfig.scheduledMaintenanceMode || 'interval') === 'daily' && !/^(?:[01]?\\d|2[0-3]):[0-5]\\d$/.test(String(nextConfig.scheduledMaintenanceTime || '').trim())) {
             hints.push('日志类任务选择了每日定时执行，但时间格式无效；应使用 HH:mm，例如 08:30。');
           }
           if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledMaintenanceIntervalMinutes) > 0 && Number(nextConfig.scheduledMaintenanceIntervalMinutes) < 15) {
@@ -10783,7 +11869,12 @@ const UI_HTML = `<!DOCTYPE html>
         };
         uiBrowserBridge.persistSettingsExperienceMode(nextMode);
         if (!this.isSettingsTabVisible(this.activeSettingsTab)) this.activeSettingsTab = 'ui';
-        if (nextMode !== 'expert') this.logsPlaybackModeFilter = '';
+        if (nextMode !== 'expert') {
+          this.logsPlaybackModeFilter = '';
+          this.logsRequestGroupFilter = '';
+          this.logsDeliveryModeFilter = '';
+          this.logsDecisionReasonFilter = '';
+        }
         this.settingsScrollResetKey += 1;
       },
 
@@ -11463,7 +12554,7 @@ const UI_HTML = `<!DOCTYPE html>
           return this.formatRelativeTime(ts);
       },
 
-      getResourceCategoryBadge(path, category) {
+	      getResourceCategoryBadge(path, category) {
           const p = String(path || "").toLowerCase();
           if (category === 'error') return { label: '请求报错', className: 'text-red-500 bg-red-50 dark:bg-red-500/10 px-2 py-1.5 rounded-lg font-medium' };
           if (category === 'segment' || p.includes('.ts') || p.includes('.m4s')) return { label: '视频流分片', className: 'text-blue-600 bg-blue-50 dark:text-blue-400 dark:bg-blue-500/10 px-2 py-1.5 rounded-lg font-medium' };
@@ -11473,6 +12564,7 @@ const UI_HTML = `<!DOCTYPE html>
           if (category === 'subtitle' || p.includes('.srt') || p.includes('.vtt') || p.includes('.ass')) return { label: '字幕文件', className: 'text-indigo-600 bg-indigo-50 dark:text-indigo-400 dark:bg-indigo-500/10 px-2 py-1.5 rounded-lg font-medium' };
           if (category === 'prewarm') return { label: '连接预热', className: 'text-cyan-600 bg-cyan-50 dark:text-cyan-400 dark:bg-cyan-500/10 px-2 py-1.5 rounded-lg font-medium' };
           if (category === 'websocket' || p.includes('websocket')) return { label: '长连接通讯', className: 'text-rose-600 bg-rose-50 dark:text-rose-400 dark:bg-rose-500/10 px-2 py-1.5 rounded-lg font-medium' };
+          if (p.includes('.strm')) return { label: 'STRM 文件', className: 'text-lime-700 bg-lime-50 dark:text-lime-300 dark:bg-lime-500/10 px-2 py-1.5 rounded-lg font-medium' };
           
           if (p.includes('/sessions/playing')) return { label: '播放状态同步', className: 'text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-800 px-2 py-1.5 rounded-lg font-medium' };
           if (p.includes('/playbackinfo')) return { label: '播放信息获取', className: 'text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-800 px-2 py-1.5 rounded-lg font-medium' };
@@ -11480,6 +12572,17 @@ const UI_HTML = `<!DOCTYPE html>
           if (p.includes('/items/') || p.includes('/shows/') || p.includes('/movies/') || p.includes('/users/')) return { label: '媒体元数据', className: 'text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-800 px-2 py-1.5 rounded-lg font-medium' };
           
           return { label: '常规 API', className: 'text-slate-500 bg-slate-50 dark:text-slate-400 dark:bg-slate-800/50 px-2 py-1.5 rounded-lg font-medium' };
+      },
+      parseLogDetailJson(log) {
+          const raw = log?.detail_json ?? log?.detailJson;
+          if (!raw) return null;
+          if (raw && typeof raw === 'object') return raw;
+          try {
+            const parsed = JSON.parse(String(raw));
+            return parsed && typeof parsed === 'object' ? parsed : null;
+          } catch {
+            return null;
+          }
       },
       getPlaybackModeBadge(errorDetail) {
           const detail = String(errorDetail || '');
@@ -11510,14 +12613,115 @@ const UI_HTML = `<!DOCTYPE html>
               className: 'px-2 py-1 rounded-lg text-[11px] font-semibold ' + meta.className
           };
       },
+      getRoutingModeBadge(log) {
+          const structured = this.parseLogDetailJson(log);
+          const deliveryMode = String(structured?.deliveryMode || '').trim().toLowerCase();
+          const redirectMode = String(structured?.redirectDecision?.mode || '').trim().toLowerCase();
+          if (deliveryMode === 'direct') {
+              const isEntry = redirectMode === 'entry_307';
+              return {
+                  label: isEntry ? '入口直连' : '跳转直连',
+                  className: 'px-2 py-1 rounded-lg text-[11px] font-semibold ' + (isEntry
+                    ? 'text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-500/15'
+                    : 'text-orange-700 bg-orange-100 dark:text-orange-300 dark:bg-orange-500/15')
+              };
+          }
+          if (deliveryMode === 'proxy') {
+              if (redirectMode === 'playback_info_cache') {
+                  return { label: 'PBI 缓存', className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-cyan-700 bg-cyan-100 dark:text-cyan-300 dark:bg-cyan-500/15' };
+              }
+              return { label: 'Worker 代理', className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-sky-700 bg-sky-100 dark:text-sky-300 dark:bg-sky-500/15' };
+          }
+          return null;
+      },
+      getPlaybackInfoCacheBadge(log) {
+          const structured = this.parseLogDetailJson(log);
+          const state = String(structured?.playbackInfoCache || '').trim().toLowerCase();
+          if (!state || state === 'skip') return null;
+          const labelMap = {
+            hit: 'PBI Hit',
+            miss: 'PBI Miss'
+          };
+          return {
+            label: labelMap[state] || ('PBI ' + state),
+            className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-cyan-700 bg-cyan-100 dark:text-cyan-300 dark:bg-cyan-500/15'
+          };
+      },
+      getProgressRelayBadge(log) {
+          const structured = this.parseLogDetailJson(log);
+          const mode = String(structured?.progressRelayMode || '').trim().toLowerCase();
+          if (!mode) return null;
+          const labelMap = {
+            throttled_204: '进度节流',
+            forward_now: '进度直传',
+            flush_before_stopped: '停止前刷新',
+            stopped_passthrough: '停止透传',
+            started_passthrough: '开始透传'
+          };
+          return {
+            label: labelMap[mode] || ('进度 ' + mode),
+            className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-fuchsia-700 bg-fuchsia-100 dark:text-fuchsia-300 dark:bg-fuchsia-500/15'
+          };
+      },
+      getTargetHotCacheBadge(log) {
+          const structured = this.parseLogDetailJson(log);
+          const state = String(structured?.targetHotCache || '').trim().toLowerCase();
+          if (!state || state === 'skip') return null;
+          return {
+            label: state === 'hit' ? '热点命中' : '热点未命中',
+            className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-emerald-700 bg-emerald-100 dark:text-emerald-300 dark:bg-emerald-500/15'
+          };
+      },
+      getStrmBadge(log) {
+          const structured = this.parseLogDetailJson(log);
+          const state = String(structured?.strmResolution || '').trim().toLowerCase();
+          if (!state) return null;
+          const labelMap = {
+            resolved: 'STRM 已解析',
+            invalid: 'STRM 无效',
+            parse_error: 'STRM 解析异常',
+            upstream_passthrough: 'STRM 上游直返'
+          };
+          return {
+            label: labelMap[state] || ('STRM ' + state),
+            className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-lime-700 bg-lime-100 dark:text-lime-300 dark:bg-lime-500/15'
+          };
+      },
+      getDecisionReasonBadge(log) {
+          const structured = this.parseLogDetailJson(log);
+          const reason = String(structured?.decisionReason || '').trim();
+          if (!reason) return null;
+          const label = reason === 'playback_info_cache_hit'
+            ? '缓存命中'
+            : reason === 'progress_relay_throttled'
+              ? '节流回包'
+              : reason === 'client_redirect'
+                ? '客户端跳转'
+                : reason === 'proxied_follow'
+                  ? 'Worker 跟随'
+                  : reason === 'upstream_response'
+                    ? '上游返回'
+                    : reason;
+          return {
+            label,
+            className: 'px-2 py-1 rounded-lg text-[11px] font-semibold text-slate-700 bg-slate-100 dark:text-slate-300 dark:bg-slate-700/60'
+          };
+      },
       getLogCategoryBadges(log) {
           return [
               this.getResourceCategoryBadge(log?.request_path, log?.category),
-              this.getPlaybackModeBadge(log?.error_detail)
+              this.getRoutingModeBadge(log),
+              this.getPlaybackModeBadge(log?.error_detail),
+              this.getPlaybackInfoCacheBadge(log),
+              this.getProgressRelayBadge(log),
+              this.getTargetHotCacheBadge(log),
+              this.getStrmBadge(log),
+              this.getDecisionReasonBadge(log)
           ].filter(Boolean);
       },
       getLogStatusMeta(log) {
           const statusCode = Number(log?.status_code) || 0;
+          const structured = this.parseLogDetailJson(log);
           if (statusCode < 400) {
               return {
                   text: String(statusCode || ''),
@@ -11539,6 +12743,9 @@ const UI_HTML = `<!DOCTYPE html>
               522: 'Connection Timed Out (CF 无法与您的源站建立 TCP 连接)'
           };
           let hint = errMap[statusCode] || ('HTTP 异常码: ' + statusCode);
+          if (structured?.protocolFailureReason) hint += '\\n[协议原因] ' + String(structured.protocolFailureReason);
+          if (structured?.decisionReason) hint += '\\n[决策原因] ' + String(structured.decisionReason);
+          if (structured?.strmError) hint += '\\n[STRM] ' + String(structured.strmError);
           if (log?.error_detail) hint += '\\n[抓取详情] ' + log.error_detail;
           return {
               text: String(statusCode),
@@ -11547,7 +12754,15 @@ const UI_HTML = `<!DOCTYPE html>
           };
 	      },
 	      getLogPathTitle(log) {
-	          return log?.error_detail ? (String(log.request_path || '') + '\\n[诊断] ' + log.error_detail) : String(log?.request_path || '');
+	          const structured = this.parseLogDetailJson(log);
+	          const parts = [String(log?.request_path || '')];
+	          if (structured?.deliveryMode) parts.push('[传输] ' + String(structured.deliveryMode));
+	          if (structured?.decisionReason) parts.push('[决策] ' + String(structured.decisionReason));
+	          if (structured?.targetHotCache) parts.push('[热点缓存] ' + String(structured.targetHotCache));
+	          if (structured?.strmResolution) parts.push('[STRM] ' + String(structured.strmResolution));
+	          if (structured?.strmError) parts.push('[STRM 错误] ' + String(structured.strmError));
+	          if (log?.error_detail) parts.push('[诊断] ' + String(log.error_detail));
+	          return parts.join('\\n');
 	      },
 	      getRuntimeLogSearchMode() {
 	          return normalizeLogSearchMode(this.runtimeConfig?.logSearchMode || UI_DEFAULTS.logSearchMode);
@@ -11596,6 +12811,19 @@ const UI_HTML = `<!DOCTYPE html>
 	            ? 'border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-500/40 dark:bg-rose-500/10 dark:text-rose-300'
 	            : 'border-emerald-200 bg-emerald-50 text-emerald-600 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-300';
 	      },
+	      getLogsRequestGroupFilterClass(mode = '') {
+	          const active = normalizeLogRequestGroupFilter(mode) === normalizeLogRequestGroupFilter(this.logsRequestGroupFilter || '');
+	          return active
+	            ? 'bg-brand-50 text-brand-600 dark:bg-brand-500/10 dark:text-brand-400'
+	            : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800';
+	      },
+	      updateLogsRequestGroupFilterButtons() {
+	          return this.logsRequestGroupFilter;
+	      },
+	      setLogsRequestGroupFilter(mode = '') {
+	          this.logsRequestGroupFilter = normalizeLogRequestGroupFilter(mode);
+	          this.loadLogs(1);
+	      },
 	      getLogsPlaybackFilterClass(mode = '') {
 	          const active = String(mode || '') === String(this.logsPlaybackModeFilter || '');
 	          return active
@@ -11607,6 +12835,33 @@ const UI_HTML = `<!DOCTYPE html>
       },
       setLogsPlaybackModeFilter(mode = '') {
           this.logsPlaybackModeFilter = String(mode || '').trim();
+          this.loadLogs(1);
+      },
+      getLogsDeliveryModeOptions() {
+          return [
+            { value: '', label: '全部传输' },
+            { value: 'proxy', label: 'Worker 代理' },
+            { value: 'direct', label: '直连下发' }
+          ];
+      },
+      setLogsDeliveryModeFilter(mode = '') {
+          this.logsDeliveryModeFilter = String(mode || '').trim();
+          this.loadLogs(1);
+      },
+      getLogsDecisionReasonOptions() {
+          return [
+            { value: '', label: '全部决策' },
+            { value: 'client_redirect', label: '客户端跳转' },
+            { value: 'proxied_follow', label: 'Worker 跟随' },
+            { value: 'playback_info_cache_hit', label: 'PBI 缓存命中' },
+            { value: 'progress_relay_throttled', label: '进度节流回包' },
+            { value: 'upstream_response', label: '上游正常返回' },
+            { value: 'proxy_error', label: '代理失败' },
+            { value: 'direct_transport_incompatible', label: '直连鉴权受限' }
+          ];
+      },
+      setLogsDecisionReasonFilter(reason = '') {
+          this.logsDecisionReasonFilter = String(reason || '').trim();
           this.loadLogs(1);
       },
 
@@ -12383,7 +13638,7 @@ const UI_HTML = `<!DOCTYPE html>
           }
       },
 
-      async loadLogs(page = this.logPage) {
+	      async loadLogs(page = this.logPage) {
           const keyword = this.logSearchKeyword || '';
           const { startDate, endDate } = this.ensureLogDateRange();
           try {
@@ -12393,7 +13648,10 @@ const UI_HTML = `<!DOCTYPE html>
 	                filters: {
 	                  keyword,
 	                  searchMode: this.getRuntimeLogSearchMode(),
+	                  requestGroup: this.logsRequestGroupFilter || '',
 	                  playbackMode: this.logsPlaybackModeFilter || '',
+	                  deliveryMode: this.logsDeliveryModeFilter || '',
+	                  decisionReason: this.logsDecisionReasonFilter || '',
 	                  startDate,
 	                  endDate
                 }

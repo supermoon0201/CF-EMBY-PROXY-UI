@@ -9,6 +9,14 @@ import {
   buildMedia403CompatibilityModes,
   shouldFallbackToNoRange,
   selectTopCandidatesForDns,
+  isPlaybackInfoPath,
+  isPlaybackSessionProgressPath,
+  isPlaybackSessionStoppedPath,
+  isPlaybackSessionStartedPath,
+  resolvePlaybackProgressSessionKeyFromPayload,
+  extractMediaRedirectAuth,
+  evaluateMediaClientRedirectAuthPolicy,
+  appendMediaRedirectAuthToUrl,
   buildNodeCompatAutofixCandidateModes,
   selectNodeCompatAutofixMode,
   shouldBanUpstreamLine,
@@ -84,6 +92,74 @@ test('keeps only the fastest usable top3 candidates', () => {
     { ip: '4.4.4.4', latencyMs: 95 }
   ]);
   assert.deepEqual(top.map(item => item.ip), ['2.2.2.2', '4.4.4.4', '1.1.1.1']);
+});
+
+test('classifies playback info and session control paths', () => {
+  assert.equal(isPlaybackInfoPath('/Items/123/PlaybackInfo'), true);
+  assert.equal(isPlaybackInfoPath('/Items/123/PlaybackInfo?UserId=1'), true);
+  assert.equal(isPlaybackInfoPath('/Items/123/PlaybackInfoX'), false);
+  assert.equal(isPlaybackSessionProgressPath('/Sessions/Playing/Progress'), true);
+  assert.equal(isPlaybackSessionStoppedPath('/Sessions/Playing/Stopped'), true);
+  assert.equal(isPlaybackSessionStartedPath('/Sessions/Playing'), true);
+  assert.equal(isPlaybackSessionStartedPath('/Sessions/Playing/Started'), true);
+  assert.equal(isPlaybackSessionStartedPath('/Sessions/Playing/Progress'), false);
+});
+
+test('builds stable playback progress relay session keys from query and body payloads', () => {
+  assert.equal(
+    resolvePlaybackProgressSessionKeyFromPayload({
+      query: { SessionId: 'abc' },
+      clientIp: '1.1.1.1',
+      proxyPath: '/Sessions/Playing/Progress'
+    }),
+    'session:abc'
+  );
+  assert.equal(
+    resolvePlaybackProgressSessionKeyFromPayload({
+      body: { PlaySessionId: 'play-1' },
+      clientIp: '1.1.1.1',
+      proxyPath: '/Sessions/Playing/Progress'
+    }),
+    'play:play-1'
+  );
+  assert.equal(
+    resolvePlaybackProgressSessionKeyFromPayload({
+      body: { DeviceId: 'dev-1', ItemId: 'item-9' },
+      clientIp: '1.1.1.1',
+      proxyPath: '/Sessions/Playing/Progress'
+    }),
+    'device-item:dev-1:item-9'
+  );
+});
+
+test('extracts redirect-safe media auth and appends it to direct urls', () => {
+  const headers = new Headers({
+    Authorization: 'MediaBrowser Token="abc123", DeviceId="dev-1"',
+    'X-Emby-Device-Id': 'dev-1'
+  });
+  assert.deepEqual(extractMediaRedirectAuth(headers), {
+    token: 'abc123',
+    deviceId: 'dev-1'
+  });
+
+  const url = appendMediaRedirectAuthToUrl('https://media.example.com/video.m3u8', headers);
+  assert.equal(url.searchParams.get('api_key'), 'abc123');
+  assert.equal(url.searchParams.get('DeviceId'), 'dev-1');
+});
+
+test('marks cookie or private auth headers as not direct-safe', () => {
+  const unsafePolicy = evaluateMediaClientRedirectAuthPolicy(new Headers({
+    Cookie: 'sid=1',
+    'X-Custom-Auth': 'secret-token'
+  }));
+  assert.equal(unsafePolicy.canDirect, false);
+  assert.equal(unsafePolicy.reason, 'direct_transport_incompatible');
+
+  const safePolicy = evaluateMediaClientRedirectAuthPolicy(new Headers({
+    Authorization: 'Bearer demo-token',
+    'X-Emby-Device-Id': 'device-1'
+  }));
+  assert.equal(safePolicy.canDirect, true);
 });
 
 test('orders node compat autofix candidates and keeps sticky original mode', () => {

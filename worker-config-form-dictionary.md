@@ -45,6 +45,11 @@
 | `protocolFallback` | `cfg-protocol-fallback` | `checkbox` | `checkbox(defaultTrue)` | `true` |
 | `enablePrewarm` | `cfg-enable-prewarm` | `checkbox` | `checkbox(defaultTrue)` | `true` |
 | `prewarmCacheTtl` | `cfg-prewarm-ttl` | `int-or-default` | `number-finite` | `180` |
+| `playbackInfoCacheEnabled` | `cfg-playback-info-cache-enabled` | `checkbox` | `checkbox(defaultTrue)` | `true` |
+| `playbackInfoCacheTtlSec` | `cfg-playback-info-cache-ttl` | `int-or-default` | `number-finite` | `60` |
+| `videoProgressForwardEnabled` | `cfg-video-progress-forward-enabled` | `checkbox` | `checkbox(defaultTrue)` | `true` |
+| `videoProgressForwardIntervalSec` | `cfg-video-progress-forward-interval` | `int-or-default` | `number-finite` | `3` |
+| `defaultMediaAuthMode` | `cfg-default-media-auth-mode` | `or-default` | `or-default` | `auto` |
 | `prewarmPrefetchBytes` | `cfg-prewarm-prefetch-bytes` | `int-finite` | `int-finite` | `4194304` |
 | `sourceSameOriginProxy` | `cfg-source-same-origin-proxy` | `checkbox` | `checkbox(defaultTrue)` | `true` |
 | `forceExternalProxy` | `cfg-force-external-proxy` | `checkbox` | `checkbox(defaultTrue)` | `true` |

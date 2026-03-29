@@ -96,6 +96,11 @@
 - 支持媒体 `403` 兼容梯子回退，以及 `bytes=0-...` 异常响应时的单次无 `Range` 降级
 - 支持多线路节点在请求间做轻量轮转；明显失败的线路会被短暂跳过，降低持续撞坏线的概率
 - 支持解析非 Emby 原生 `.strm` 文本，并将解析出的真实 URL 继续交给现有直连 / 反代规则处理
+- 支持 `PlaybackInfo` 短缓存，降低播放器短时间重复拉取播放信息的压力
+- 支持 `/Sessions/Playing/Progress` 进度控频：窗口内命中可直接回 `204`，并在窗口结束时仅回源最新一条
+- 支持媒体直连 URL 自动补 `api_key / DeviceId`，减少播放器在 30x 直连后丢失认证的问题
+- 支持媒体直连鉴权保护：命中 Cookie 或私有鉴权头时，优先回退为 Worker 继续代理，而不是硬下发不可用直连
+- 支持节点级热点目标短缓存，近期成功的线路会在后续播放请求里被优先尝试
 
 ### 4) 安全与可观测性
 - 登录失败次数限制，达到阈值自动锁定 15 分钟
@@ -106,6 +111,7 @@
 - 日志写入 D1、运行状态优先写入 D1 `sys_status`（KV 兜底）、定时清理、Telegram 每日报表
 - DNS 修改属于敏感操作，管理 API 需要显式确认头；当前 UI 主链路按“站点级草稿 -> 保存时统一同步”执行
 - 支持 Cloudflare GraphQL 仪表盘统计与本地 D1 兜底统计
+- 日志页已支持播放链路徽章、请求分组、传输方式、决策原因等筛选与可视化诊断
 
 ---
 
@@ -468,7 +474,7 @@ https://你的域名/secret_portal_99
 ### 后台主要页面
 - **仪表盘**：展示请求量、流量趋势、资源类别、运行状态、定时任务状态，按需手动刷新
 - **节点管理**：搜索节点、导入/导出配置、全局 Ping
-- **日志记录**：按日期范围查询请求记录、初始化 DB、手动清理
+- **日志记录**：按日期范围查询请求记录、初始化 DB、手动清理，并支持按请求分组 / 播放模式 / 传输方式 / 决策原因筛选
 - **优选调度**：拉取远程候选 IP、Worker 侧测速、复制去 ITDog、把单条或 TOP3 结果同步到当前站点 DNS
 - **DNS 编辑**：当前站点 DNS 草稿编辑、推荐优选域名、历史记录回填、实用链接
 - **设置页**：系统 UI、代理与网络、静态资源策略、安全防护、日志设置、监控告警、账号设置、备份与恢复
@@ -507,6 +513,11 @@ https://你的域名/secret_portal_99
 - 轻量级元数据预热
 - 元数据预热缓存时长
 - 预热深度（仅海报 / 海报+索引）
+- PlaybackInfo 获取缓存
+- PlaybackInfo 缓存时间
+- 视频回传进度控制
+- 视频回传进度控制间隔
+- 媒体认证头模式默认值
 - 静态文件直连
 - HLS / DASH 直连
 - HLS / DASH 直连命中时，播放列表与分片自动走 307 数据面直传
@@ -540,6 +551,14 @@ https://你的域名/secret_portal_99
 - D1 重试退避时间（高手模式）
 - 定时任务租约时长（高手模式）
 - 一键恢复推荐值
+
+#### 日志页增强
+- 资源类别徽章：视频数据 / 播放列表 / 图片海报 / 字幕文件 / STRM 文件 / 常规 API 等
+- 播放链路徽章：入口直连 / 跳转直连 / Worker 代理 / PBI 缓存 / 进度节流 / 热点命中
+- 请求分组筛选：全部请求 / 播放信息 / 图片海报 / 常规 API / 用户认证
+- 传输方式筛选：Worker 代理 / 直连下发
+- 决策原因筛选：客户端跳转 / Worker 跟随 / PBI 缓存命中 / 进度节流回包 / 代理失败等
+- 状态 tooltip 与路径 title 会附带结构化诊断信息，便于排查播放链路
 
 #### 监控告警
 - Telegram Bot Token
@@ -858,10 +877,12 @@ https://你的域名/hk/123
 
 | 表 / 结构 | 类型 | 关键字段 | 用途说明 |
 |---|---|---|---|
-| `proxy_logs` | 普通表 | `id`, `timestamp`, `node_name`, `request_path`, `request_method`, `status_code`, `response_time`, `client_ip`, `user_agent`, `referer`, `category`, `error_detail`, `created_at` | 请求日志主表；日志页查询、日报统计、仪表盘本地兜底都依赖它 |
+| `proxy_logs` | 普通表 | `id`, `timestamp`, `node_name`, `request_path`, `request_method`, `status_code`, `response_time`, `client_ip`, `user_agent`, `referer`, `category`, `error_detail`, `detail_json`, `created_at` | 请求日志主表；日志页查询、日报统计、仪表盘本地兜底都依赖它 |
 | `proxy_logs` 索引 | 普通索引 | `timestamp`, `client_ip`, `(node_name, timestamp)`, `category`, `(status_code, timestamp)`, `(category, timestamp)` | 优化按时间范围、节点、状态码、分类等常见查询 |
 | `proxy_logs_fts` | FTS5 虚拟表 | `node_name`, `request_path`, `user_agent`, `error_detail` | 关键词搜索专用；通过 `proxy_logs_fts_ai` 插入触发器和 `rebuild` 迁移历史数据 |
 | `sys_status` | 普通表 | `scope`, `payload`, `updated_at` | 保存日志刷盘状态、定时任务状态等动态运行信息 |
+
+> `detail_json` 当前会记录 `deliveryMode`、`redirectDecision`、`decisionReason`、`playbackInfoCache`、`progressRelayMode`、`targetHotCache`、`strmResolution`、`strmError` 等结构化诊断字段，供日志页徽章、筛选与 tooltip 使用。
 
 > 常见 `sys_status.scope` 包括：`ops_status:root`、`ops_status:log`、`ops_status:scheduled`。如果 D1 不可用，运行状态会回退到 KV 中的兼容键。
 
