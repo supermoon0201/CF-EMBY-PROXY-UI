@@ -5120,7 +5120,7 @@ const Database = {
 
     async listDnsIpWorkspace(data, { env, kv, request }) {
       try {
-        const dnsRes = await this.listDnsRecords({}, { env, kv, request });
+        const dnsRes = await Database.ApiHandlers.listDnsRecords({}, { env, kv, request });
         const dnsPayload = await dnsRes.json();
         if (!dnsPayload?.ok) return jsonResponse(dnsPayload, dnsRes.status || 400);
         const currentHostItems = await buildDnsIpWorkspaceItems((Array.isArray(dnsPayload.records) ? dnsPayload.records : []).map(record => ({
@@ -10234,6 +10234,13 @@ const UI_HTML = `<!DOCTYPE html>
 
     function cloneDnsEditorDraftRecord(record = {}, fallbackType = 'A') {
       return createDnsEditorDraftRecord(normalizeDnsDraftType(record?.type, fallbackType), record);
+    }
+
+    function normalizeUiDnsIpType(value = '') {
+      const normalized = String(value || '').trim().toUpperCase();
+      if (normalized === 'IPV6' || normalized === 'AAAA') return 'IPv6';
+      if (normalized === 'IPV4' || normalized === 'A') return 'IPv4';
+      return 'ALL';
     }
 
     function createSchedulerSourceDraft(source = {}, index = 0) {
