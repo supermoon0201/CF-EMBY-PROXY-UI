@@ -9364,6 +9364,15 @@ const UI_HTML = `<!DOCTYPE html>
 	      return String(value || '').trim().toLowerCase() === 'fts' ? 'fts' : UI_DEFAULTS.logSearchMode;
 	    }
 
+	    function normalizeLogRequestGroupFilter(value = '') {
+	      const normalized = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+	      if (normalized === 'playback' || normalized === 'playback_info') return 'playback_info';
+	      if (normalized === 'image') return 'image';
+	      if (normalized === 'api') return 'api';
+	      if (normalized === 'auth') return 'auth';
+	      return '';
+	    }
+
       function normalizeUiAutoDnsHistoryEntry(entry = {}) {
         const item = entry && typeof entry === 'object' ? entry : {};
         return {
