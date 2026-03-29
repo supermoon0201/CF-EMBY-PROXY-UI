@@ -66,27 +66,72 @@ test('rendered admin ui lucide bridge constrains placeholder shells before nesti
   assert.match(script, /element\.replaceChildren\(svgElement\)/);
 });
 
-test('rendered admin ui scheduler copy button keeps pill content from shrinking', async () => {
+test('rendered admin ui removes standalone scheduler view and keeps dns workspace actions inline', async () => {
   const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
   const html = await response.text();
 
   assert.equal(response.status, 200);
-  assert.match(html, /App\.copySchedulerIpsForItdog\(\)[^>]+class="[^"]*inline-flex[^"]*shrink-0[^"]*whitespace-nowrap/);
+  assert.doesNotMatch(html, /id="view-scheduler"/);
+  assert.match(html, /回填到当前站点 A\/AAAA 草稿/);
+  assert.match(html, /API 抓取/);
 });
 
-test('rendered admin ui scheduler table keeps ipv6 candidate cells wrapped without squeezing adjacent columns', async () => {
+test('rendered admin ui scheduler exposes configurable source modal entry', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+  const script = extractLastInlineScript(html);
+
+  assert.equal(response.status, 200);
+  assert.match(html, /抓取源/);
+  assert.match(html, /管理远程候选 IP 抓取源/);
+  assert.match(script, /apiCall\('listRemoteCandidateSources'/);
+  assert.match(script, /apiCall\('saveRemoteCandidateSources'/);
+  assert.match(script, /schedulerSourceFilter: 'all'/);
+  assert.match(script, /getSchedulerSourceOptions\(/);
+});
+
+test('rendered admin ui dns view embeds preferred ip workspace draft-fill actions', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+  const script = extractLastInlineScript(html);
+
+  assert.equal(response.status, 200);
+  assert.match(html, /Preferred IP Workspace/);
+  assert.match(html, /优选工作台/);
+  assert.match(html, /当前站点 IP/);
+  assert.match(html, /独立 IP 池/);
+  assert.match(html, /导入/);
+  assert.match(html, /API 抓取/);
+  assert.match(html, /回填到当前站点 A\/AAAA 草稿/);
+  assert.match(script, /shouldShowDnsWorkspace\(/);
+  assert.match(script, /refreshDnsIpWorkspace\(/);
+  assert.match(script, /refreshDnsIpPoolFromSourcesFromUi\(/);
+  assert.match(script, /fillDnsDraftFromIpPoolFromUi\(/);
+});
+
+test('rendered admin ui dns workspace tables keep current-host and pool columns visible', async () => {
   const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
   const html = await response.text();
 
   assert.equal(response.status, 200);
-  assert.match(
-    html,
-    /<th class="py-3 px-4 w-\[26rem\]">候选 IP<\/th>[\s\S]*?<td class="[^"]*py-3[^"]*px-4[^"]*w-\[26rem\][^"]*font-mono[^"]*text-xs[^"]*break-all[^"]*whitespace-normal[^"]*leading-6[^"]*text-slate-700[^"]*dark:text-slate-200[^"]*">/
-  );
-  assert.match(html, /<th class="py-3 px-4 w-28">线路<\/th>/);
-  assert.match(html, /<th class="py-3 px-4 w-32">来源<\/th>/);
-  assert.match(html, /<th class="py-3 px-4 w-28">延迟<\/th>/);
-  assert.match(html, /<td class="py-3 px-4 whitespace-nowrap">/);
-  assert.match(html, /<td class="py-3 px-4 text-xs text-slate-500 whitespace-nowrap">/);
-  assert.match(html, /<td class="py-3 px-4 text-sm font-medium whitespace-nowrap"/);
+  assert.match(html, /<button type="button" @click="App\.setDnsIpWorkspaceTab\('current'\)"/);
+  assert.match(html, /<button type="button" @click="App\.setDnsIpWorkspaceTab\('pool'\)"/);
+  assert.match(html, /<th class="px-4 py-3">真实 COLO<\/th>/);
+  assert.match(html, /<th class="px-4 py-3">城市 \/ 国家<\/th>/);
+  assert.match(html, /<th class="px-4 py-3">来源<\/th>/);
+  assert.match(html, /App\.getDnsIpProbeStatusClass\(item\.probeStatus\)/);
+  assert.match(html, /App\.formatDnsIpProbedAt\(item\)/);
+});
+
+test('rendered admin ui logs table exposes ingress and egress colo columns with wide layout', async () => {
+  const response = await worker.fetch(new Request('https://example.com/admin'), createAdminEnv(), {});
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /<table class="w-full text-left table-fixed min-w-\[1320px\] border-separate border-spacing-0">/);
+  assert.match(html, /<th class="py-3 px-4 w-24 border-b border-slate-200 dark:border-slate-800">入站机房\(COLO\)<\/th>/);
+  assert.match(html, /<th class="py-3 px-4 w-24 border-b border-slate-200 dark:border-slate-800">出站机房\(COLO\)<\/th>/);
+  assert.match(html, /<td colspan="8" class="py-10 text-center text-slate-500 dark:text-slate-400">暂无匹配日志记录<\/td>/);
+  assert.match(html, /App\.getLogColoValue\(log, 'ingress'\)/);
+  assert.match(html, /App\.getLogColoValue\(log, 'egress'\)/);
 });

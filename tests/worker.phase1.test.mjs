@@ -5,10 +5,14 @@ import {
   normalizeNodeRealClientIpMode,
   getRealClientIpHeaderMode,
   parseRemoteCandidateIpsFromSource,
+  normalizeRemoteCandidateSourceRecord,
   buildRemoteCandidateProbeUrl,
   buildMedia403CompatibilityModes,
   shouldFallbackToNoRange,
   selectTopCandidatesForDns,
+  normalizeScheduleUtcOffsetMinutes,
+  normalizeDnsAutoUploadCountryCodes,
+  normalizeDnsAutoUploadRecordTypes,
   isPlaybackInfoPath,
   isPlaybackSessionProgressPath,
   isPlaybackSessionStoppedPath,
@@ -68,10 +72,37 @@ test('parses github top list candidates and removes private IPs', () => {
   assert.deepEqual(parsed.map(item => item.ip), ['1.1.1.1', '8.8.8.8']);
 });
 
+test('normalizes remote candidate source drafts with stable defaults', () => {
+  const source = normalizeRemoteCandidateSourceRecord({
+    name: '自定义源',
+    url: 'https://example.com/list.txt',
+    parser: 'unknown-parser',
+    enabled: false,
+    sortOrder: '3'
+  }, 1);
+
+  assert.equal(source.name, '自定义源');
+  assert.equal(source.url, 'https://example.com/list.txt');
+  assert.equal(source.parser, 'github-top10');
+  assert.equal(source.enabled, false);
+  assert.equal(source.sortOrder, 3);
+});
+
 test('builds worker-side remote candidate probe urls over http for ip targets', () => {
   assert.equal(buildRemoteCandidateProbeUrl('162.159.45.186'), 'http://162.159.45.186/cdn-cgi/trace');
   assert.equal(buildRemoteCandidateProbeUrl('[2606:4700:4700::1111]'), 'http://[2606:4700:4700::1111]/cdn-cgi/trace');
   assert.equal(buildRemoteCandidateProbeUrl('not-an-ip'), '');
+});
+
+test('keeps parsed candidate entries ready for later geo enrichment without altering source parsing', () => {
+  const parsed = parseRemoteCandidateIpsFromSource('1.1.1.1 8.8.8.8', 'github-top10');
+  assert.deepEqual(
+    parsed.map(item => ({ ip: item.ip, countryCode: item.countryCode ?? null })),
+    [
+      { ip: '1.1.1.1', countryCode: null },
+      { ip: '8.8.8.8', countryCode: null }
+    ]
+  );
 });
 
 test('builds media 403 compatibility ladder in the expected order', () => {
@@ -92,6 +123,25 @@ test('keeps only the fastest usable top3 candidates', () => {
     { ip: '4.4.4.4', latencyMs: 95 }
   ]);
   assert.deepEqual(top.map(item => item.ip), ['2.2.2.2', '4.4.4.4', '1.1.1.1']);
+});
+
+test('normalizes auto dns country codes against the built-in allowlist', () => {
+  assert.deepEqual(
+    normalizeDnsAutoUploadCountryCodes(['sg', 'US', 'US', 'ZZ', '']),
+    ['SG', 'US']
+  );
+  assert.deepEqual(
+    normalizeDnsAutoUploadCountryCodes('hk, cn, unknown, hk'),
+    ['HK']
+  );
+});
+
+test('normalizes dns auto upload scheduling settings', () => {
+  assert.equal(normalizeScheduleUtcOffsetMinutes('480'), 480);
+  assert.equal(normalizeScheduleUtcOffsetMinutes('-300'), -300);
+  assert.equal(normalizeScheduleUtcOffsetMinutes('9999'), 840);
+  assert.deepEqual(normalizeDnsAutoUploadRecordTypes('a, aaaa, txt, A'), ['A', 'AAAA']);
+  assert.deepEqual(normalizeDnsAutoUploadRecordTypes([]), ['A']);
 });
 
 test('classifies playback info and session control paths', () => {

@@ -1475,38 +1475,276 @@ async function fetchTextWithTimeout(url, options = {}) {
   }
 }
 
-async function listRemoteCandidateIpsByType(type = "") {
+const REMOTE_CANDIDATE_SOURCES_KEY = "sys:remote_candidate_sources:v1";
+const DEFAULT_REMOTE_CANDIDATE_SOURCES = Object.freeze([
+  Object.freeze({
+    id: "remote-source-uouin",
+    name: "麒麟优选",
+    url: "https://api.uouin.com/cloudflare.html",
+    parser: "uouin",
+    enabled: true,
+    sortOrder: 0,
+    lastFetchAt: "",
+    lastFetchStatus: "",
+    lastFetchCount: 0
+  }),
+  Object.freeze({
+    id: "remote-source-github-top10",
+    name: "GitHub Top10",
+    url: "https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html",
+    parser: "github-top10",
+    enabled: true,
+    sortOrder: 1,
+    lastFetchAt: "",
+    lastFetchStatus: "",
+    lastFetchCount: 0
+  })
+]);
+
+function createRemoteCandidateSourceId(seed = "") {
+  return `remote-source-${hashStableText(seed || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)}`;
+}
+
+function normalizeRemoteCandidateSourceParser(value = "") {
+  return String(value || "").trim().toLowerCase() === "uouin" ? "uouin" : "github-top10";
+}
+
+export function normalizeRemoteCandidateSourceRecord(source = {}, index = 0) {
+  const nowIso = new Date().toISOString();
+  const name = String(source?.name || "").trim();
+  const url = String(source?.url || "").trim();
+  const parser = normalizeRemoteCandidateSourceParser(source?.parser || source?.sourceType || source?.kind);
+  return {
+    id: String(source?.id || createRemoteCandidateSourceId(`${name}|${url}|${parser}|${index}`)),
+    name: name || `抓取源 ${Number(index) + 1}`,
+    url: url || (parser === "uouin" ? DEFAULT_REMOTE_CANDIDATE_SOURCES[0].url : DEFAULT_REMOTE_CANDIDATE_SOURCES[1].url),
+    parser,
+    enabled: source?.enabled !== false,
+    sortOrder: Math.max(0, Number.parseInt(String(source?.sortOrder ?? source?.sort_order ?? index), 10) || 0),
+    lastFetchAt: String(source?.lastFetchAt || source?.last_fetch_at || ""),
+    lastFetchStatus: String(source?.lastFetchStatus || source?.last_fetch_status || ""),
+    lastFetchCount: Math.max(0, Number(source?.lastFetchCount ?? source?.last_fetch_count) || 0),
+    createdAt: String(source?.createdAt || source?.created_at || nowIso),
+    updatedAt: String(source?.updatedAt || source?.updated_at || nowIso)
+  };
+}
+
+async function getRemoteCandidateSources(kv) {
+  if (!kv) return DEFAULT_REMOTE_CANDIDATE_SOURCES.map((source, index) => normalizeRemoteCandidateSourceRecord(source, index));
+  try {
+    const raw = await kv.get(REMOTE_CANDIDATE_SOURCES_KEY);
+    if (!raw) return DEFAULT_REMOTE_CANDIDATE_SOURCES.map((source, index) => normalizeRemoteCandidateSourceRecord(source, index));
+    const parsed = JSON.parse(raw);
+    const normalized = (Array.isArray(parsed) ? parsed : [])
+      .map((source, index) => normalizeRemoteCandidateSourceRecord(source, index))
+      .filter(source => String(source?.url || "").trim())
+      .sort((left, right) => Number(left?.sortOrder || 0) - Number(right?.sortOrder || 0));
+    return normalized.length
+      ? normalized
+      : DEFAULT_REMOTE_CANDIDATE_SOURCES.map((source, index) => normalizeRemoteCandidateSourceRecord(source, index));
+  } catch {
+    return DEFAULT_REMOTE_CANDIDATE_SOURCES.map((source, index) => normalizeRemoteCandidateSourceRecord(source, index));
+  }
+}
+
+async function persistRemoteCandidateSources(kv, sources = []) {
+  if (!kv) return DEFAULT_REMOTE_CANDIDATE_SOURCES.map((source, index) => normalizeRemoteCandidateSourceRecord(source, index));
+  const normalized = (Array.isArray(sources) ? sources : [])
+    .map((source, index) => normalizeRemoteCandidateSourceRecord(source, index))
+    .filter(source => String(source?.url || "").trim())
+    .sort((left, right) => Number(left?.sortOrder || 0) - Number(right?.sortOrder || 0));
+  await kv.put(REMOTE_CANDIDATE_SOURCES_KEY, JSON.stringify(normalized));
+  return normalized;
+}
+
+function shouldIncludeRemoteCandidateByType(candidate = {}, type = "", source = {}) {
   const normalizedType = String(type || "all").trim().toLowerCase() || "all";
-  const candidates = [];
-  const sourceSummary = [];
-  const appendCandidates = (items = [], filterFn = null) => {
-    for (const item of Array.isArray(items) ? items : []) {
-      if (typeof filterFn === "function" && !filterFn(item)) continue;
-      candidates.push(item);
+  if (normalizedType === "all") return true;
+  const lineType = String(candidate?.lineType || "").trim().toLowerCase();
+  if (["电信", "联通", "移动", "多线"].includes(normalizedType)) return lineType === normalizedType;
+  if (normalizedType === "ipv6") return lineType === "ipv6" || String(candidate?.family || "").trim().toLowerCase() === "ipv6";
+  if (normalizedType === "优选") return normalizeRemoteCandidateSourceParser(source?.parser) !== "uouin";
+  return true;
+}
+
+function detectDnsWorkspaceIpType(value = "") {
+  const normalized = String(value || "").trim().replace(/^\[|\]$/g, "");
+  if (!normalized) return "";
+  if (isValidIpv6Address(normalized)) return "IPv6";
+  if (isValidIpv4Address(normalized)) return "IPv4";
+  return "";
+}
+
+export function extractIpListFromText(text = "") {
+  const rawText = String(text || "");
+  const results = [];
+  const seen = new Set();
+  const pushIp = (ip) => {
+    const normalized = String(ip || "").trim().replace(/^\[|\]$/g, "");
+    const ipType = detectDnsWorkspaceIpType(normalized);
+    if (!normalized || !ipType) return;
+    const displayIp = ipType === "IPv6" ? `[${normalized}]` : normalized;
+    const dedupeKey = displayIp.toLowerCase();
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+    results.push({ ip: displayIp, ipType });
+  };
+  const ipv4Matches = rawText.match(/\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g) || [];
+  ipv4Matches.forEach(pushIp);
+  const ipv6Matches = rawText.match(/(?<![0-9A-Fa-f:])(?:\[)?((?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4})(?:\])?(?![0-9A-Fa-f:])/g) || [];
+  ipv6Matches.forEach(match => pushIp(String(match || "").replace(/^\[|\]$/g, "")));
+  return results;
+}
+
+function normalizeDnsIpPoolItemRecord(item = {}, options = {}) {
+  const rawIp = String(item?.ip || item?.content || "").trim();
+  const ipType = detectDnsWorkspaceIpType(rawIp);
+  if (!rawIp || !ipType) return null;
+  const normalizedIp = ipType === "IPv6" ? `[${rawIp.replace(/^\[|\]$/g, "")}]` : rawIp.replace(/^\[|\]$/g, "");
+  const nowIso = String(options.updatedAt || new Date().toISOString());
+  return {
+    id: String(item?.id || `dns-ip-${hashStableText(normalizedIp.toLowerCase())}`),
+    ip: normalizedIp,
+    ipType,
+    recordId: String(item?.recordId || item?.record_id || ""),
+    host: String(item?.host || item?.name || ""),
+    sourceKind: String(item?.sourceKind || item?.source_kind || options.sourceKind || "manual").trim().toLowerCase() || "manual",
+    sourceLabel: String(item?.sourceLabel || item?.source_label || options.sourceLabel || "").trim(),
+    remark: String(item?.remark || "").trim(),
+    probeStatus: String(item?.probeStatus || item?.probe_status || ""),
+    latencyMs: Number.isFinite(Number(item?.latencyMs ?? item?.latency_ms)) ? Math.max(0, Math.round(Number(item?.latencyMs ?? item?.latency_ms))) : null,
+    cfRay: String(item?.cfRay || item?.cf_ray || ""),
+    coloCode: String(item?.coloCode || item?.colo_code || "").trim().toUpperCase(),
+    cityName: String(item?.cityName || item?.city_name || ""),
+    countryCode: String(item?.countryCode || item?.country_code || "").trim().toUpperCase(),
+    countryName: String(item?.countryName || item?.country_name || ""),
+    probedAt: String(item?.probedAt || item?.probed_at || ""),
+    createdAt: String(item?.createdAt || item?.created_at || options.createdAt || nowIso),
+    updatedAt: nowIso
+  };
+}
+
+function buildDnsIpWorkspaceSummary(currentHostItems = [], sharedPoolItems = []) {
+  const rows = [...(Array.isArray(currentHostItems) ? currentHostItems : []), ...(Array.isArray(sharedPoolItems) ? sharedPoolItems : [])];
+  const countrySet = new Set();
+  const coloSet = new Set();
+  let ipv4Count = 0;
+  let ipv6Count = 0;
+  for (const item of rows) {
+    if (String(item?.ipType || "").trim() === "IPv6") ipv6Count += 1;
+    else ipv4Count += 1;
+    if (String(item?.countryCode || "").trim()) countrySet.add(String(item.countryCode).trim().toUpperCase());
+    if (String(item?.coloCode || "").trim()) coloSet.add(String(item.coloCode).trim().toUpperCase());
+  }
+  return {
+    currentHost: { ipCount: Array.isArray(currentHostItems) ? currentHostItems.length : 0 },
+    sharedPool: { ipCount: Array.isArray(sharedPoolItems) ? sharedPoolItems.length : 0 },
+    total: {
+      ipCount: rows.length,
+      ipv4Count,
+      ipv6Count,
+      countryCount: countrySet.size,
+      coloCount: coloSet.size
     }
   };
+}
 
-  if (["all", "电信", "联通", "移动", "多线", "ipv6"].includes(normalizedType)) {
+function normalizeUiDnsIpType(value = "") {
+  const normalized = String(value || "").trim().toUpperCase();
+  if (normalized === "IPV6" || normalized === "AAAA") return "IPv6";
+  if (normalized === "IPV4" || normalized === "A") return "IPv4";
+  return "ALL";
+}
+
+async function buildDnsIpWorkspaceItems(items = [], requestColo = "UNKNOWN", options = {}) {
+  const forceRefresh = options?.forceRefresh === true;
+  const probedItems = [];
+  for (const rawItem of Array.isArray(items) ? items : []) {
+    const normalized = normalizeDnsIpPoolItemRecord(rawItem, options);
+    if (!normalized) continue;
+    const probe = await probeRemoteCandidateIpLatency(normalized.ip, { timeoutMs: 2500 });
+    probedItems.push(normalizeDnsIpPoolItemRecord({
+      ...normalized,
+      probeStatus: probe.ok ? "ok" : (probe.error || "network_error"),
+      latencyMs: probe.latencyMs,
+      cfRay: "",
+      coloCode: probe.coloCode || requestColo || "",
+      cityName: probe.cityName,
+      countryCode: probe.countryCode,
+      countryName: probe.countryName,
+      probedAt: forceRefresh ? new Date().toISOString() : (normalized.probedAt || new Date().toISOString())
+    }, options));
+  }
+  return probedItems;
+}
+
+async function listRemoteCandidateIpsByType(type = "", options = {}) {
+  const normalizedType = String(type || "all").trim().toLowerCase() || "all";
+  const normalizedSourceId = String(options?.sourceId || "all").trim();
+  const candidates = [];
+  const sourceSummary = [];
+  const kv = options?.kv || null;
+  const sourceList = await getRemoteCandidateSources(kv);
+  const nextSourceList = [];
+  const appendCandidates = (items = []) => {
+    for (const item of Array.isArray(items) ? items : []) candidates.push(item);
+  };
+
+  for (const source of sourceList) {
+    const currentSource = normalizeRemoteCandidateSourceRecord(source);
+    if (normalizedSourceId && normalizedSourceId !== "all" && String(currentSource.id || "").trim() !== normalizedSourceId) {
+      nextSourceList.push(currentSource);
+      continue;
+    }
+    if (currentSource.enabled !== true || !currentSource.url) {
+      nextSourceList.push(currentSource);
+      continue;
+    }
+    const fetchAt = new Date().toISOString();
     try {
-      const text = await fetchTextWithTimeout("https://api.uouin.com/cloudflare.html");
-      const parsed = parseRemoteCandidateIpsFromSource(text, "uouin");
-      appendCandidates(parsed, item => normalizedType === "all" || item.lineType === normalizedType);
-      sourceSummary.push({ source: "uouin", ok: true, count: parsed.length });
+      const text = await fetchTextWithTimeout(currentSource.url);
+      const parsed = parseRemoteCandidateIpsFromSource(text, currentSource.parser);
+      const matched = parsed
+        .filter(item => shouldIncludeRemoteCandidateByType(item, normalizedType, currentSource))
+        .map(item => ({
+          ...item,
+          sourceId: currentSource.id,
+          source: currentSource.parser,
+          sourceLabel: currentSource.name || currentSource.parser
+        }));
+      appendCandidates(matched);
+      sourceSummary.push({
+        id: currentSource.id,
+        source: currentSource.name || currentSource.parser,
+        parser: currentSource.parser,
+        ok: true,
+        count: parsed.length,
+        matchedCount: matched.length
+      });
+      nextSourceList.push(normalizeRemoteCandidateSourceRecord({
+        ...currentSource,
+        lastFetchAt: fetchAt,
+        lastFetchStatus: parsed.length ? "success" : "empty",
+        lastFetchCount: parsed.length
+      }));
     } catch (error) {
-      sourceSummary.push({ source: "uouin", ok: false, error: String(error?.message || error || "unknown_error") });
+      sourceSummary.push({
+        id: currentSource.id,
+        source: currentSource.name || currentSource.parser,
+        parser: currentSource.parser,
+        ok: false,
+        error: String(error?.message || error || "unknown_error")
+      });
+      nextSourceList.push(normalizeRemoteCandidateSourceRecord({
+        ...currentSource,
+        lastFetchAt: fetchAt,
+        lastFetchStatus: "failed",
+        lastFetchCount: 0
+      }));
     }
   }
 
-  if (["all", "优选"].includes(normalizedType)) {
-    try {
-      const text = await fetchTextWithTimeout("https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html");
-      const parsed = parseRemoteCandidateIpsFromSource(text, "github-top10");
-      appendCandidates(parsed);
-      sourceSummary.push({ source: "github-top10", ok: true, count: parsed.length });
-    } catch (error) {
-      sourceSummary.push({ source: "github-top10", ok: false, error: String(error?.message || error || "unknown_error") });
-    }
-  }
+  if (kv) await persistRemoteCandidateSources(kv, nextSourceList);
 
   const deduped = [];
   const seen = new Set();
@@ -1516,7 +1754,12 @@ async function listRemoteCandidateIpsByType(type = "") {
     seen.add(key);
     deduped.push(candidate);
   }
-  return { type: normalizedType, candidates: deduped, sourceSummary };
+  return {
+    type: normalizedType,
+    candidates: deduped,
+    sourceSummary,
+    sourceList: nextSourceList.length ? nextSourceList : sourceList
+  };
 }
 
 export function buildRemoteCandidateProbeUrl(ip = "") {
@@ -1750,7 +1993,7 @@ async function runScheduledAutoDnsUpdate(env, kv, runtimeConfig = {}) {
     throw new Error("自动优选无法确定目标域名，请先填写自动优选目标域名");
   }
 
-  const sourceResult = await listRemoteCandidateIpsByType(type);
+  const sourceResult = await listRemoteCandidateIpsByType(type, { kv });
   const sourceCandidates = Array.isArray(sourceResult?.candidates) ? sourceResult.candidates : [];
   if (!sourceCandidates.length) throw new Error("远程候选 IP 为空");
 
@@ -4831,19 +5074,148 @@ const Database = {
       }
     },
 
-    async listRemoteCandidateIps(data) {
+    async listRemoteCandidateSources(data, { kv }) {
       try {
-        const result = await listRemoteCandidateIpsByType(data?.type || "all");
+        const sourceList = await getRemoteCandidateSources(kv);
+        return jsonResponse({
+          ok: true,
+          sourceList
+        });
+      } catch (error) {
+        return jsonError("REMOTE_CANDIDATE_SOURCE_LIST_FAILED", error?.message || "抓取源读取失败", 500);
+      }
+    },
+
+    async saveRemoteCandidateSources(data, { kv }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace");
+      try {
+        const sourceList = await persistRemoteCandidateSources(kv, data?.sources || []);
+        return jsonResponse({
+          ok: true,
+          sourceList
+        });
+      } catch (error) {
+        return jsonError("REMOTE_CANDIDATE_SOURCE_SAVE_FAILED", error?.message || "抓取源保存失败", 500);
+      }
+    },
+
+    async listRemoteCandidateIps(data, { kv }) {
+      try {
+        const result = await listRemoteCandidateIpsByType(data?.type || "all", {
+          kv,
+          sourceId: data?.sourceId || "all"
+        });
         return jsonResponse({
           ok: true,
           type: result.type,
           totalCount: result.candidates.length,
           candidates: result.candidates,
-          sourceSummary: result.sourceSummary
+          sourceSummary: result.sourceSummary,
+          sourceList: result.sourceList
         });
       } catch (error) {
         return jsonError("REMOTE_CANDIDATE_FETCH_FAILED", error?.message || "远程候选 IP 拉取失败", 500);
       }
+    },
+
+    async listDnsIpWorkspace(data, { env, kv, request }) {
+      try {
+        const dnsRes = await this.listDnsRecords({}, { env, kv, request });
+        const dnsPayload = await dnsRes.json();
+        if (!dnsPayload?.ok) return jsonResponse(dnsPayload, dnsRes.status || 400);
+        const currentHostItems = await buildDnsIpWorkspaceItems((Array.isArray(dnsPayload.records) ? dnsPayload.records : []).map(record => ({
+          id: record.id,
+          ip: record.content,
+          recordId: record.id,
+          host: record.name,
+          sourceKind: "current_host",
+          sourceLabel: "当前站点 DNS"
+        })), "AUTO", { forceRefresh: data?.forceRefresh === true });
+        const incomingPoolItems = (Array.isArray(data?.poolItems) ? data.poolItems : [])
+          .map(item => normalizeDnsIpPoolItemRecord(item))
+          .filter(Boolean);
+        const sharedPoolItems = await buildDnsIpWorkspaceItems(incomingPoolItems, "AUTO", {
+          forceRefresh: data?.forceRefresh === true,
+          scope: "shared_pool"
+        });
+        const sourceList = await getRemoteCandidateSources(kv);
+        const countryCounter = new Map();
+        for (const item of [...currentHostItems, ...sharedPoolItems]) {
+          const code = String(item?.countryCode || "").trim().toUpperCase();
+          if (!code) continue;
+          const current = countryCounter.get(code) || { code, name: String(item?.countryName || "未知"), count: 0 };
+          current.count += 1;
+          countryCounter.set(code, current);
+        }
+        return jsonResponse({
+          ok: true,
+          zoneId: String(dnsPayload.zoneId || "").trim(),
+          zoneName: String(dnsPayload.zoneName || "").trim(),
+          host: String(dnsPayload.currentHost || "").trim(),
+          requestColo: "AUTO",
+          currentHostItems,
+          sharedPoolItems,
+          sourceList,
+          availableCountries: [...countryCounter.values()].sort((left, right) => String(left.code || "").localeCompare(String(right.code || ""))),
+          summary: buildDnsIpWorkspaceSummary(currentHostItems, sharedPoolItems),
+          generatedAt: new Date().toISOString()
+        });
+      } catch (error) {
+        return jsonError("DNS_IP_WORKSPACE_FAILED", error?.message || "优选工作台加载失败", 500);
+      }
+    },
+
+    async importDnsIpPoolItems(data) {
+      const rawText = String(data?.text || data?.content || "").trim();
+      if (!rawText) return jsonError("EMPTY_IMPORT_TEXT", "请先提供要导入的文本内容");
+      const sourceKind = String(data?.sourceKind || "manual").trim().toLowerCase() || "manual";
+      const sourceLabel = String(data?.sourceLabel || "").trim() || (sourceKind === "file" ? "文件导入" : "手动导入");
+      const items = extractIpListFromText(rawText)
+        .map(item => normalizeDnsIpPoolItemRecord({ ...item, sourceKind, sourceLabel }))
+        .filter(Boolean);
+      return jsonResponse({
+        success: true,
+        importedCount: items.length,
+        items
+      });
+    },
+
+    async refreshDnsIpPoolFromSources(data, { kv }) {
+      try {
+        const sourceResult = await listRemoteCandidateIpsByType("all", { kv, sourceId: data?.sourceId || "all" });
+        const items = (Array.isArray(sourceResult.candidates) ? sourceResult.candidates : [])
+          .map(item => normalizeDnsIpPoolItemRecord({
+            ip: item.ip,
+            sourceKind: "api",
+            sourceLabel: item.sourceLabel || item.source || ""
+          }))
+          .filter(Boolean);
+        return jsonResponse({
+          success: true,
+          sourceResults: sourceResult.sourceSummary || [],
+          sourceList: sourceResult.sourceList || [],
+          importedCount: items.length,
+          items
+        });
+      } catch (error) {
+        return jsonError("DNS_IP_POOL_FETCH_FAILED", error?.message || "抓取独立 IP 池失败", 500);
+      }
+    },
+
+    async fillDnsDraftFromIpPool(data) {
+      const records = (Array.isArray(data?.ips) ? data.ips : [])
+        .map(item => normalizeDnsIpPoolItemRecord(item))
+        .filter(Boolean)
+        .map(item => ({
+          type: item.ipType === "IPv6" ? "AAAA" : "A",
+          content: String(item.ip || "").trim().replace(/^\[|\]$/g, "")
+        }));
+      if (!records.length) return jsonError("EMPTY_DNS_POOL_SELECTION", "请先选择至少一个 IP");
+      return jsonResponse({
+        success: true,
+        mode: "a",
+        records
+      });
     },
 
     async probeRemoteCandidateIp(data) {
@@ -4859,7 +5231,11 @@ const Database = {
         latencyMs: result.latencyMs,
         status: result.status,
         url: result.url,
-        error: result.error
+        error: result.error,
+        coloCode: result.coloCode,
+        cityName: result.cityName,
+        countryCode: result.countryCode,
+        countryName: result.countryName
       });
     },
 
@@ -8329,87 +8705,80 @@ const UI_HTML = `<!DOCTYPE html>
         </div>
       </div>
 
-      <div id="view-scheduler" class="view-section w-full mx-auto space-y-6" :class="{ active: App.currentHash === '#scheduler' }">
-        <div class="glass-card rounded-3xl p-6 shadow-sm flex flex-col min-h-[calc(100vh-120px)]">
-          <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-            <div class="min-w-0">
-              <h3 class="font-semibold text-lg flex-shrink-0">优选调度</h3>
-              <p class="text-xs text-slate-500 mt-1 break-all">{{ App.schedulerHintText }}</p>
-              <p class="text-[11px] text-slate-500 mt-1">当前页会从远程优选源拉取候选 IP，由 Worker 侧代测延迟，并通过现有 Cloudflare DNS 保存链路把单条或 TOP3 结果写回当前站点。</p>
+      <div v-if="App.dnsIpImportModalOpen" data-ui-backdrop="1" class="fixed inset-0 z-[88] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4" @click.self="App.closeDnsIpImportModal()">
+        <div data-ui-dialog-surface="1" class="w-full max-w-2xl rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl p-6">
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <h3 class="text-lg font-semibold text-slate-900 dark:text-white">导入独立 IP 池</h3>
+              <p class="mt-2 text-sm text-slate-500">支持手动粘贴文本或上传文件，导入后的 IP 仅保存在当前浏览器本地缓存，不会直接写入 Cloudflare DNS。</p>
             </div>
-            <div class="flex flex-wrap items-center gap-2 w-full md:w-auto">
-              <select v-model="App.schedulerType" class="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
-                <option value="all">综合混合源</option>
-                <option value="电信">电信专属</option>
-                <option value="联通">联通专属</option>
-                <option value="移动">移动专属</option>
-                <option value="多线">多线 BGP</option>
-                <option value="ipv6">IPv6 节点</option>
-                <option value="优选">优选库</option>
-              </select>
-              <button @click="App.fetchSchedulerCandidates()" :disabled="App.schedulerFetchPending || App.schedulerTestingPending" class="px-4 py-2 bg-brand-600 text-white rounded-xl text-sm font-medium hover:bg-brand-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
-                <i :data-lucide="App.schedulerFetchPending || App.schedulerTestingPending ? 'loader' : 'radar'" :class="App.schedulerFetchPending || App.schedulerTestingPending ? 'w-4 h-4 mr-2 animate-spin' : 'w-4 h-4 mr-2'"></i>{{ App.getSchedulerFetchButtonText() }}
-              </button>
-              <button @click="App.saveSchedulerTopCandidates()" :disabled="App.isSchedulerTopSaveDisabled()" class="px-4 py-2 bg-rose-600 text-white rounded-xl text-sm font-medium hover:bg-rose-700 flex items-center transition whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
-                <i data-lucide="upload-cloud" class="w-4 h-4 mr-2"></i>同步 TOP3 到 DNS
-              </button>
-              <button @click="App.copySchedulerIpsForItdog()" :disabled="!App.schedulerCandidates.length" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-sm font-medium hover:bg-slate-300 dark:hover:bg-slate-700 transition inline-flex shrink-0 items-center gap-2 whitespace-nowrap disabled:opacity-40 disabled:pointer-events-none">
-                <i data-lucide="copy" class="w-4 h-4"></i>复制去 ITDog
-              </button>
+            <button type="button" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition" @click="App.closeDnsIpImportModal()">&times;</button>
+          </div>
+          <div class="mt-4 flex items-center gap-2 rounded-2xl bg-slate-100 p-1 dark:bg-slate-800">
+            <button type="button" @click="App.dnsIpImportTab = 'paste'" class="flex-1 rounded-lg px-3 py-2 text-sm font-medium transition" :class="App.dnsIpImportTab === 'paste' ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white' : 'text-slate-500 dark:text-slate-300'">粘贴文本</button>
+            <button type="button" @click="App.dnsIpImportTab = 'file'" class="flex-1 rounded-lg px-3 py-2 text-sm font-medium transition" :class="App.dnsIpImportTab === 'file' ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white' : 'text-slate-500 dark:text-slate-300'">上传文件</button>
+          </div>
+          <div class="mt-4">
+            <div v-if="App.dnsIpImportTab === 'file'" class="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 p-5 text-center">
+              <label class="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition">
+                <i data-lucide="upload" class="w-4 h-4"></i>选择文件
+                <input type="file" class="hidden" accept=".txt,.json,.csv,.yaml,.yml" @change="App.handleDnsIpImportFileChange($event)">
+              </label>
+              <p class="mt-3 text-xs text-slate-500">{{ App.dnsIpImportFileName || '支持 .txt / .json / .csv / .yaml，读取后会直接按文件内容导入。' }}</p>
             </div>
+            <textarea v-if="App.dnsIpImportTab === 'paste'" v-model="App.dnsIpImportText" placeholder="在此粘贴包含 IP 的任意文本..." class="w-full h-56 px-4 py-3 rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm font-mono text-slate-900 dark:text-white resize-none"></textarea>
           </div>
-
-          <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 px-4 py-3 text-sm text-slate-600 dark:text-slate-300 mb-4">
-            {{ App.schedulerStatusText }}
+          <div class="mt-4 flex items-center justify-end gap-3">
+            <button type="button" class="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition" @click="App.closeDnsIpImportModal()">取消</button>
+            <button type="button" class="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium transition disabled:opacity-50 disabled:pointer-events-none" :disabled="App.dnsIpImportPending" @click="App.submitDnsIpImport()">{{ App.dnsIpImportPending ? '导入中...' : '开始导入' }}</button>
           </div>
+        </div>
+      </div>
 
-          <div class="overflow-x-auto min-h-0 w-full mb-4">
-            <table class="w-full text-left border-collapse table-fixed min-w-[980px]">
-              <thead>
-                <tr class="text-sm text-slate-500 border-b border-slate-200 dark:border-slate-800">
-                  <th class="py-3 px-4 w-[26rem]">候选 IP</th>
-                  <th class="py-3 px-4 w-28">线路</th>
-                  <th class="py-3 px-4 w-32">来源</th>
-                  <th class="py-3 px-4 w-28">延迟</th>
-                  <th class="py-3 px-4">操作</th>
-                </tr>
-              </thead>
-              <tbody class="text-sm">
-                <tr v-if="!App.schedulerCandidates.length">
-                  <td colspan="5" class="py-8 text-center text-slate-500">暂无候选数据，点击“获取节点并测速”开始。</td>
-                </tr>
-                <tr v-for="(candidate, index) in App.getSchedulerCandidates()" v-else :key="candidate.ip + '-' + index" class="border-b border-slate-100 dark:border-slate-800/50 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
-                  <td class="py-3 px-4 w-[26rem] font-mono text-xs break-all whitespace-normal leading-6 text-slate-700 dark:text-slate-200">{{ candidate.ip }}</td>
-                  <td class="py-3 px-4 whitespace-nowrap">
-                    <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">{{ App.getSchedulerCandidateLineText(candidate) }}</span>
-                  </td>
-                  <td class="py-3 px-4 text-xs text-slate-500 whitespace-nowrap">{{ candidate.source || '-' }}</td>
-                  <td class="py-3 px-4 text-sm font-medium whitespace-nowrap" :class="App.getSchedulerLatencyTextClass(candidate.latencyMs, candidate.testing)">
-                    {{ App.getSchedulerLatencyText(candidate) }}
-                  </td>
-                  <td class="py-3 px-4 whitespace-nowrap">
-                    <button @click="App.saveSchedulerSingleCandidate(candidate)" :disabled="App.isSchedulerSingleSaveDisabled(candidate)" class="px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">同步到 DNS</button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800 space-y-4">
-            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-              <p class="text-xs text-slate-500">{{ App.getSchedulerFooterHint() }}</p>
-              <button @click="App.loadSchedulerContext()" :disabled="App.schedulerFetchPending || App.schedulerTestingPending || App.schedulerSavePending" class="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40 disabled:pointer-events-none">
-                <i data-lucide="refresh-cw" class="w-4 h-4"></i>刷新当前站点
-              </button>
+      <div v-if="App.schedulerSourceModalOpen" data-ui-backdrop="1" class="fixed inset-0 z-[89] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4" @click.self="App.closeSchedulerSourceModal()">
+        <div data-ui-dialog-surface="1" class="w-full max-w-3xl rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl p-6">
+          <div class="flex items-start justify-between gap-3">
+            <div>
+              <h3 class="text-lg font-semibold text-slate-900 dark:text-white">管理远程候选 IP 抓取源</h3>
+              <p class="mt-2 text-sm text-slate-500">这里维护 DNS 编辑工作台使用的 API 源。默认已预置现有写死源，后续你可以直接在这里增删改，不需要再改代码。</p>
             </div>
-            <div v-if="App.schedulerSourceSummary.length" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-4">
-              <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500 mb-3">Source Status</div>
-              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div v-for="(entry, index) in App.schedulerSourceSummary" :key="'scheduler-source-' + index" class="rounded-xl border px-3 py-2 text-sm" :class="entry.ok ? 'border-emerald-200 bg-emerald-50/70 text-emerald-700 dark:border-emerald-900/40 dark:bg-emerald-950/20 dark:text-emerald-300' : 'border-amber-200 bg-amber-50/70 text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300'">
-                  <div class="font-medium">{{ entry.source }}</div>
-                  <div class="text-xs mt-1">{{ entry.ok ? ('已解析 ' + (entry.count || 0) + ' 条候选') : ('失败：' + (entry.error || '未知错误')) }}</div>
+            <button type="button" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition" @click="App.closeSchedulerSourceModal()">&times;</button>
+          </div>
+          <div class="mt-4 space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+            <div v-for="(source, index) in App.schedulerSourceDrafts" :key="'scheduler-source-draft-' + source.id" class="rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-950/40 p-4">
+              <div class="grid gap-3 lg:grid-cols-[1fr,2fr,180px,auto,auto] lg:items-center">
+                <div>
+                  <label class="block text-xs font-semibold tracking-[0.08em] uppercase text-slate-400 dark:text-slate-500 mb-2">名称</label>
+                  <input type="text" v-model="source.name" :placeholder="'抓取源 ' + (index + 1)" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
                 </div>
+                <div>
+                  <label class="block text-xs font-semibold tracking-[0.08em] uppercase text-slate-400 dark:text-slate-500 mb-2">URL</label>
+                  <input type="text" v-model="source.url" placeholder="https://example.com/ip-list.txt" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm font-mono text-slate-900 dark:text-white">
+                </div>
+                <div>
+                  <label class="block text-xs font-semibold tracking-[0.08em] uppercase text-slate-400 dark:text-slate-500 mb-2">解析方式</label>
+                  <select v-model="source.parser" class="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                    <option value="uouin">麒麟表格</option>
+                    <option value="github-top10">通用 IP 列表</option>
+                  </select>
+                </div>
+                <label class="inline-flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200 mt-6 lg:mt-0">
+                  <input type="checkbox" v-model="source.enabled" class="w-4 h-4 rounded">启用
+                </label>
+                <button type="button" @click="App.removeSchedulerSourceDraft(source.id)" class="mt-6 lg:mt-0 inline-flex items-center justify-center gap-1 rounded-xl border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-950/20 px-3 py-2 text-sm font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-950/40 transition">
+                  <i data-lucide="trash-2" class="w-4 h-4"></i>移除
+                </button>
               </div>
+              <div class="mt-3 text-xs text-slate-500">状态：{{ App.getSchedulerSourceStatusText(source) }}<span v-if="source.lastFetchAt"> · {{ App.formatLocalDateTime(source.lastFetchAt) }}</span><span v-if="source.lastFetchCount"> · {{ source.lastFetchCount }} 条</span></div>
+            </div>
+          </div>
+          <div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+            <button type="button" class="inline-flex items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition" @click="App.addSchedulerSourceDraft()">
+              <i data-lucide="plus" class="w-4 h-4"></i>新增抓取源
+            </button>
+            <div class="flex items-center gap-3">
+              <button type="button" class="px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition" @click="App.closeSchedulerSourceModal()">取消</button>
+              <button type="button" class="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium transition disabled:opacity-50 disabled:pointer-events-none" :disabled="App.schedulerSourcePending" @click="App.saveSchedulerSourcesFromModal()">{{ App.schedulerSourcePending ? '保存中...' : '保存抓取源' }}</button>
             </div>
           </div>
         </div>
@@ -8489,6 +8858,201 @@ const UI_HTML = `<!DOCTYPE html>
           <div v-if="!App.dnsRecords.length" id="dns-empty" class="text-sm text-slate-500 text-center py-4">{{ App.dnsEmptyText }}</div>
 
           <div class="mt-auto pt-6 border-t border-slate-200 dark:border-slate-800 space-y-4">
+            <div v-if="App.shouldShowDnsWorkspace()" class="ui-radius-card rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm">
+              <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
+                <div>
+                  <div class="text-xs font-semibold tracking-[0.12em] uppercase text-slate-400 dark:text-slate-500">Preferred IP Workspace</div>
+                  <div class="text-base font-semibold text-slate-900 dark:text-white mt-1">优选工作台</div>
+                  <p class="text-xs text-slate-500 mt-2">{{ App.getDnsWorkspaceHint() }}</p>
+                </div>
+                <span class="inline-flex items-center rounded-full bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">{{ App.getSchedulerSourceCountText() }}</span>
+              </div>
+              <div class="flex flex-col gap-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <button type="button" @click="App.setDnsIpWorkspaceTab('current')" class="px-4 py-2 rounded-xl border text-sm font-medium transition" :class="App.getDnsIpWorkspaceTabClass('current')">当前站点 IP</button>
+                  <button type="button" @click="App.setDnsIpWorkspaceTab('pool')" class="px-4 py-2 rounded-xl border text-sm font-medium transition" :class="App.getDnsIpWorkspaceTabClass('pool')">独立 IP 池</button>
+                  <span class="inline-flex items-center rounded-full bg-white px-3 py-1 text-[11px] font-medium text-slate-500 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">
+                    更新时间：{{ App.dnsIpWorkspaceGeneratedAt ? App.formatLocalDateTime(App.dnsIpWorkspaceGeneratedAt) : '未加载' }}
+                  </span>
+                </div>
+                <div v-if="App.dnsIpWorkspaceTab === 'current'" class="space-y-4">
+                  <div class="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <div class="flex items-center bg-slate-100 dark:bg-slate-800 rounded-xl p-1">
+                        <button type="button" @click="App.setDnsIpFilterType('ALL')" class="px-3 py-1 text-xs font-medium rounded-lg transition-all" :class="App.getDnsIpFilterTypeButtonClass('ALL')">全部</button>
+                        <button type="button" @click="App.setDnsIpFilterType('IPv4')" class="px-3 py-1 text-xs font-medium rounded-lg transition-all" :class="App.getDnsIpFilterTypeButtonClass('IPv4')">IPv4</button>
+                        <button type="button" @click="App.setDnsIpFilterType('IPv6')" class="px-3 py-1 text-xs font-medium rounded-lg transition-all" :class="App.getDnsIpFilterTypeButtonClass('IPv6')">IPv6</button>
+                      </div>
+                    </div>
+                    <div class="w-full xl:w-[24rem]">
+                      <input type="text" v-model="App.dnsIpFilterKeyword" @input="App.handleDnsIpFilterKeywordInput()" placeholder="搜索 IP / COLO / 城市 / 国家" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button
+                      v-for="country in App.getDnsIpAvailableCountryOptions()"
+                      :key="'dns-ip-country-' + country.code"
+                      type="button"
+                      class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition"
+                      :class="App.getDnsIpCountryChipClass(country.code)"
+                      @click="App.toggleDnsIpCountryFilter(country.code)"
+                    >
+                      <span>{{ country.code }}</span>
+                      <span class="opacity-70">{{ country.name }}</span>
+                      <span class="opacity-60">{{ country.count }}</span>
+                    </button>
+                    <button v-if="App.dnsIpFilterCountries.length" type="button" @click="App.clearDnsIpCountryFilters()" class="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">清空国家筛选</button>
+                  </div>
+                  <div v-if="App.dnsIpFilterCountries.length && App.getDnsIpAvailableColoOptions().length" class="flex flex-wrap items-center gap-2">
+                    <button
+                      v-for="colo in App.getDnsIpAvailableColoOptions()"
+                      :key="'dns-ip-colo-' + colo.code"
+                      type="button"
+                      class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition"
+                      :class="App.getDnsIpColoChipClass(colo.code)"
+                      @click="App.toggleDnsIpColoFilter(colo.code)"
+                    >
+                      <span>{{ colo.code }}</span>
+                      <span class="opacity-70">{{ colo.label }}</span>
+                      <span class="opacity-60">{{ colo.count }}</span>
+                    </button>
+                    <button v-if="App.dnsIpFilterColos.length" type="button" @click="App.clearDnsIpColoFilters()" class="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">清空机房筛选</button>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" @click="App.refreshDnsIpWorkspace(true)" :disabled="App.dnsIpWorkspaceLoading" class="inline-flex items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-50 disabled:pointer-events-none">
+                      <i data-lucide="radar" class="w-4 h-4"></i>{{ App.dnsIpWorkspaceLoading ? '探测中...' : '刷新探测' }}
+                    </button>
+                  </div>
+                  <div v-if="!App.getFilteredDnsCurrentHostItems().length" class="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 px-4 py-8 text-center text-sm text-slate-500 dark:text-slate-400">
+                    {{ App.getDnsIpCurrentHostEmptyText() }}
+                  </div>
+                  <div v-else v-for="group in App.getGroupedDnsCurrentHostItems()" :key="'dns-ip-current-group-' + group.code" class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/40 overflow-hidden">
+                    <div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-slate-200/80 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40">
+                      <div class="text-sm font-semibold text-slate-900 dark:text-white">{{ group.code }} · {{ group.name }}</div>
+                      <div class="text-xs text-slate-500">{{ group.items.length }} 个 IP</div>
+                    </div>
+                    <div class="overflow-x-auto">
+                      <table class="w-full min-w-[980px] text-left text-sm">
+                        <thead class="text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800">
+                          <tr>
+                            <th class="px-4 py-3">IP</th>
+                            <th class="px-4 py-3">类型</th>
+                            <th class="px-4 py-3">真实 COLO</th>
+                            <th class="px-4 py-3">城市 / 国家</th>
+                            <th class="px-4 py-3">最近探测</th>
+                            <th class="px-4 py-3">操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="item in group.items" :key="'dns-ip-current-' + item.id" class="border-b border-slate-200 dark:border-slate-800 last:border-b-0 hover:bg-slate-50/70 dark:hover:bg-slate-900/40">
+                            <td class="px-4 py-3 font-mono text-slate-900 dark:text-white">{{ item.ip }}</td>
+                            <td class="px-4 py-3"><span class="inline-flex items-center rounded-full border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-slate-600 dark:text-slate-300">{{ item.ipType }}</span></td>
+                            <td class="px-4 py-3"><span class="inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold" :class="App.getDnsIpProbeStatusClass(item.probeStatus)">{{ item.coloCode || App.getDnsIpProbeStatusText(item.probeStatus) }}</span></td>
+                            <td class="px-4 py-3 text-slate-600 dark:text-slate-300">{{ item.cityName || '未知城市' }} / {{ item.countryName || item.countryCode || '未知国家' }}</td>
+                            <td class="px-4 py-3 text-xs text-slate-500">{{ App.formatDnsIpProbedAt(item) }}</td>
+                            <td class="px-4 py-3"><button type="button" @click="App.copyDnsIpValue(item.ip)" class="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"><i data-lucide="copy" class="w-3.5 h-3.5"></i>复制</button></td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="space-y-4">
+                  <div class="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <div class="flex items-center bg-slate-100 dark:bg-slate-800 rounded-xl p-1">
+                        <button type="button" @click="App.setDnsIpFilterType('ALL')" class="px-3 py-1 text-xs font-medium rounded-lg transition-all" :class="App.getDnsIpFilterTypeButtonClass('ALL')">全部</button>
+                        <button type="button" @click="App.setDnsIpFilterType('IPv4')" class="px-3 py-1 text-xs font-medium rounded-lg transition-all" :class="App.getDnsIpFilterTypeButtonClass('IPv4')">IPv4</button>
+                        <button type="button" @click="App.setDnsIpFilterType('IPv6')" class="px-3 py-1 text-xs font-medium rounded-lg transition-all" :class="App.getDnsIpFilterTypeButtonClass('IPv6')">IPv6</button>
+                      </div>
+                    </div>
+                    <div class="w-full xl:w-[24rem]">
+                      <input type="text" v-model="App.dnsIpFilterKeyword" @input="App.handleDnsIpFilterKeywordInput()" placeholder="搜索 IP / COLO / 城市 / 国家" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button
+                      v-for="country in App.getDnsIpAvailableCountryOptions()"
+                      :key="'dns-ip-pool-country-' + country.code"
+                      type="button"
+                      class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition"
+                      :class="App.getDnsIpCountryChipClass(country.code)"
+                      @click="App.toggleDnsIpCountryFilter(country.code)"
+                    >
+                      <span>{{ country.code }}</span>
+                      <span class="opacity-70">{{ country.name }}</span>
+                      <span class="opacity-60">{{ country.count }}</span>
+                    </button>
+                    <button v-if="App.dnsIpFilterCountries.length" type="button" @click="App.clearDnsIpCountryFilters()" class="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">清空国家筛选</button>
+                  </div>
+                  <div v-if="App.dnsIpFilterCountries.length && App.getDnsIpAvailableColoOptions().length" class="flex flex-wrap items-center gap-2">
+                    <button
+                      v-for="colo in App.getDnsIpAvailableColoOptions()"
+                      :key="'dns-ip-pool-colo-' + colo.code"
+                      type="button"
+                      class="inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition"
+                      :class="App.getDnsIpColoChipClass(colo.code)"
+                      @click="App.toggleDnsIpColoFilter(colo.code)"
+                    >
+                      <span>{{ colo.code }}</span>
+                      <span class="opacity-70">{{ colo.label }}</span>
+                      <span class="opacity-60">{{ colo.count }}</span>
+                    </button>
+                    <button v-if="App.dnsIpFilterColos.length" type="button" @click="App.clearDnsIpColoFilters()" class="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200">清空机房筛选</button>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" @click="App.openDnsIpImportModal()" class="inline-flex items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"><i data-lucide="file-plus-2" class="w-4 h-4"></i>导入</button>
+                    <button type="button" @click="App.openSchedulerSourceModal()" class="inline-flex items-center gap-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"><i data-lucide="settings-2" class="w-4 h-4"></i>抓取源</button>
+                    <select v-model="App.schedulerType" class="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                      <option value="all">综合混合源</option>
+                      <option value="电信">电信专属</option>
+                      <option value="联通">联通专属</option>
+                      <option value="移动">移动专属</option>
+                      <option value="多线">多线 BGP</option>
+                      <option value="ipv6">IPv6 节点</option>
+                      <option value="优选">优选库</option>
+                    </select>
+                    <select v-model="App.schedulerSourceFilter" class="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white">
+                      <option v-for="option in App.getSchedulerSourceOptions()" :key="'dns-pool-source-filter-' + option.value" :value="option.value">{{ option.label }}</option>
+                    </select>
+                    <button type="button" @click="App.refreshDnsIpPoolFromSourcesFromUi()" :disabled="App.dnsIpPoolActionPending" class="inline-flex items-center gap-2 rounded-xl border border-blue-200 dark:border-blue-900/40 bg-blue-50 dark:bg-blue-950/20 px-3 py-2 text-sm font-medium text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-950/40 transition disabled:opacity-50 disabled:pointer-events-none"><i data-lucide="cloud-download" class="w-4 h-4"></i>{{ App.dnsIpPoolActionPending ? '处理中...' : 'API 抓取' }}</button>
+                    <button type="button" @click="App.fillDnsDraftFromIpPoolFromUi()" :disabled="App.dnsIpPoolActionPending || !App.getDnsIpPoolSelectedCount()" class="inline-flex items-center gap-2 rounded-xl border border-emerald-200 dark:border-emerald-900/40 bg-emerald-50 dark:bg-emerald-950/20 px-3 py-2 text-sm font-medium text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-950/40 transition disabled:opacity-50 disabled:pointer-events-none"><i data-lucide="arrow-down-to-line" class="w-4 h-4"></i>回填到当前站点 A/AAAA 草稿</button>
+                    <button type="button" @click="App.deleteSelectedDnsIpPoolItems()" :disabled="App.dnsIpPoolActionPending || !App.getDnsIpPoolSelectedCount()" class="inline-flex items-center gap-2 rounded-xl border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-950/20 px-3 py-2 text-sm font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-950/40 transition disabled:opacity-50 disabled:pointer-events-none"><i data-lucide="trash-2" class="w-4 h-4"></i>删除已选</button>
+                  </div>
+                  <div v-if="!App.getFilteredDnsSharedPoolItems().length" class="rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 px-4 py-8 text-center text-sm text-slate-500 dark:text-slate-400">
+                    {{ App.getDnsIpPoolEmptyText() }}
+                  </div>
+                  <div v-else class="overflow-x-auto rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/40">
+                    <table class="w-full min-w-[1120px] text-left text-sm">
+                      <thead class="text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40">
+                        <tr>
+                          <th class="px-4 py-3 w-14"><input type="checkbox" class="w-4 h-4 rounded" :checked="App.areAllVisibleDnsIpPoolItemsSelected()" @change="App.toggleDnsIpPoolSelectAll()"></th>
+                          <th class="px-4 py-3">IP</th>
+                          <th class="px-4 py-3">类型</th>
+                          <th class="px-4 py-3">来源</th>
+                          <th class="px-4 py-3">真实 COLO</th>
+                          <th class="px-4 py-3">城市 / 国家</th>
+                          <th class="px-4 py-3">最近探测</th>
+                          <th class="px-4 py-3">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="item in App.getFilteredDnsSharedPoolItems()" :key="'dns-ip-pool-' + item.id" class="border-b border-slate-200 dark:border-slate-800 last:border-b-0 hover:bg-slate-50/70 dark:hover:bg-slate-900/40">
+                          <td class="px-4 py-3"><input type="checkbox" class="w-4 h-4 rounded" :checked="App.isDnsIpPoolItemSelected(item.ip)" @change="App.toggleDnsIpPoolSelection(item.ip)"></td>
+                          <td class="px-4 py-3 font-mono text-slate-900 dark:text-white">{{ item.ip }}</td>
+                          <td class="px-4 py-3"><span class="inline-flex items-center rounded-full border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-slate-600 dark:text-slate-300">{{ item.ipType }}</span></td>
+                          <td class="px-4 py-3"><div class="text-slate-700 dark:text-slate-200">{{ item.sourceLabel || item.sourceKind || '-' }}</div></td>
+                          <td class="px-4 py-3"><span class="inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold" :class="App.getDnsIpProbeStatusClass(item.probeStatus)">{{ item.coloCode || App.getDnsIpProbeStatusText(item.probeStatus) }}</span></td>
+                          <td class="px-4 py-3 text-slate-600 dark:text-slate-300">{{ item.cityName || '未知城市' }} / {{ item.countryName || item.countryCode || '未知国家' }}</td>
+                          <td class="px-4 py-3 text-xs text-slate-500">{{ App.formatDnsIpProbedAt(item) }}</td>
+                          <td class="px-4 py-3"><button type="button" @click="App.copyDnsIpValue(item.ip)" class="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"><i data-lucide="copy" class="w-3.5 h-3.5"></i>复制</button></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
             <div v-if="App.hasDnsHistoryCards()" class="ui-radius-card rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm">
               <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 pb-3 mb-4 border-b border-slate-200/80 dark:border-slate-800">
                 <div>
@@ -9621,7 +10185,8 @@ const UI_HTML = `<!DOCTYPE html>
 
     const UI_STORAGE_KEYS = {
       theme: 'theme',
-      settingsExperienceMode: 'settingsExperienceMode'
+      settingsExperienceMode: 'settingsExperienceMode',
+      dnsIpPoolItems: 'dnsIpPoolItemsV1'
     };
 
     const DNS_RECOMMENDED_CNAME_OPTIONS = [
@@ -9669,6 +10234,24 @@ const UI_HTML = `<!DOCTYPE html>
 
     function cloneDnsEditorDraftRecord(record = {}, fallbackType = 'A') {
       return createDnsEditorDraftRecord(normalizeDnsDraftType(record?.type, fallbackType), record);
+    }
+
+    function createSchedulerSourceDraft(source = {}, index = 0) {
+      const rawSource = source && typeof source === 'object' ? source : {};
+      const parser = String(rawSource.parser || '').trim().toLowerCase() === 'uouin' ? 'uouin' : 'github-top10';
+      return {
+        id: String(rawSource.id || ('scheduler-source-' + Date.now() + '-' + index + '-' + Math.random().toString(36).slice(2, 8))),
+        name: String(rawSource.name || (parser === 'uouin' ? '麒麟优选' : 'GitHub Top10')),
+        url: String(rawSource.url || (parser === 'uouin'
+          ? 'https://api.uouin.com/cloudflare.html'
+          : 'https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html')),
+        parser,
+        enabled: rawSource.enabled !== false,
+        sortOrder: Number.isFinite(Number(rawSource.sortOrder)) ? Math.max(0, Number(rawSource.sortOrder)) : index,
+        lastFetchAt: String(rawSource.lastFetchAt || ''),
+        lastFetchStatus: String(rawSource.lastFetchStatus || ''),
+        lastFetchCount: Math.max(0, Number(rawSource.lastFetchCount) || 0)
+      };
     }
 
 	    function normalizeRegionCodeCsv(value = '') {
@@ -9981,7 +10564,6 @@ const UI_HTML = `<!DOCTYPE html>
       '#nodes': '节点列表',
       '#logs': '日志记录',
       '#dns': 'DNS编辑',
-      '#scheduler': '优选调度',
       '#settings': '全局设置'
     };
 
@@ -9990,7 +10572,6 @@ const UI_HTML = `<!DOCTYPE html>
       { hash: '#nodes', icon: 'server', label: '节点列表' },
       { hash: '#logs', icon: 'activity', label: '日志记录' },
       { hash: '#dns', icon: 'globe', label: 'DNS编辑' },
-      { hash: '#scheduler', icon: 'radar', label: '优选调度' },
       { hash: '#settings', icon: 'settings', label: '全局设置' }
     ];
 
@@ -10211,9 +10792,31 @@ const UI_HTML = `<!DOCTYPE html>
         dnsHistoryLimit: 5,
         dnsBatchSaving: false,
         dnsLoadSeq: 0,
+        dnsIpWorkspaceTab: 'current',
+        dnsIpWorkspaceLoading: false,
+        dnsIpWorkspaceGeneratedAt: '',
+        dnsIpCurrentHostItems: [],
+        dnsIpSharedPoolItems: [],
+        dnsIpWorkspaceAvailableCountries: [],
+        dnsIpFilterType: 'ALL',
+        dnsIpFilterKeyword: '',
+        dnsIpFilterCountries: [],
+        dnsIpFilterColos: [],
+        dnsIpPoolSelected: [],
+        dnsIpImportModalOpen: false,
+        dnsIpImportTab: 'paste',
+        dnsIpImportText: '',
+        dnsIpImportFileName: '',
+        dnsIpImportPending: false,
+        dnsIpPoolActionPending: false,
         schedulerType: 'all',
+        schedulerSourceFilter: 'all',
         schedulerCandidates: [],
+        schedulerRemoteSources: [],
+        schedulerSourceDrafts: [],
         schedulerSourceSummary: [],
+        schedulerSourceModalOpen: false,
+        schedulerSourcePending: false,
         schedulerCurrentHost: '',
         schedulerHintText: '当前站点：加载中...',
         schedulerStatusText: '点击“获取节点并测速”后，系统会拉取远程候选 IP，并由 Worker 侧执行延迟探测。',
@@ -10620,7 +11223,8 @@ const UI_HTML = `<!DOCTYPE html>
         },
 
         getCurrentRouteHash(fallback = '#dashboard') {
-          return String(this.currentHash || uiBrowserBridge.readHash(fallback) || fallback || '#dashboard');
+          const rawHash = String(this.currentHash || uiBrowserBridge.readHash(fallback) || fallback || '#dashboard');
+          return rawHash === '#scheduler' ? '#dns' : rawHash;
         },
 
         hasSettingsFieldValue(key) {
@@ -11926,7 +12530,8 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       navigate(hash) {
-        const nextHash = String(hash || '').trim() || '#dashboard';
+        const normalizedHash = String(hash || '').trim() || '#dashboard';
+        const nextHash = normalizedHash === '#scheduler' ? '#dns' : normalizedHash;
         if (String(this.currentHash || '#dashboard') === nextHash && this.getCurrentRouteHash() === nextHash) {
           this.route(nextHash);
           return Promise.resolve(true);
@@ -11941,7 +12546,8 @@ const UI_HTML = `<!DOCTYPE html>
       },
 
       handleExternalHashNavigation(nextHash) {
-        const targetHash = String(nextHash || '').trim() || '#dashboard';
+        const rawHash = String(nextHash || '').trim() || '#dashboard';
+        const targetHash = rawHash === '#scheduler' ? '#dns' : rawHash;
         const currentHash = String(this.currentHash || '#dashboard');
         if (targetHash === currentHash) return Promise.resolve(true);
         return Promise.resolve().then(() => {
@@ -12235,7 +12841,6 @@ const UI_HTML = `<!DOCTYPE html>
         if (hash === '#nodes') this.runRouteLoader(hash, () => this.loadNodes(), '节点列表加载失败: ');
         if (hash === '#logs') this.runRouteLoader(hash, () => this.loadLogs(1), '日志加载失败: ');
         if (hash === '#dns') this.runRouteLoader(hash, () => this.loadDnsRecords(), 'DNS 加载失败: ');
-        if (hash === '#scheduler') this.runRouteLoader(hash, () => this.loadSchedulerContext(), '优选调度加载失败: ');
         if (hash === '#settings') this.runRouteLoader(hash, () => this.loadSettings(), '设置加载失败: ');
       },
 
@@ -13536,6 +14141,7 @@ const UI_HTML = `<!DOCTYPE html>
               }, 'CNAME');
           } else {
               this.ensureDnsAddressDrafts();
+              this.refreshDnsIpWorkspace(false).catch(() => {});
           }
           this.updateDnsSaveAllButtonState();
       },
@@ -13608,6 +14214,463 @@ const UI_HTML = `<!DOCTYPE html>
               return 'A 模式最少保留 1 条记录，可按需新增或删除 A / AAAA 条目。';
           }
           return '切换到 CNAME 模式后会默认回填 saas.sin.fan，也可直接点击下方推荐优选域名。';
+      },
+
+      getDnsWorkspaceHint() {
+          if (!this.getDnsEditorHostLabel()) return '当前站点未识别，暂时无法把优选结果回填到草稿。';
+          if (normalizeDnsEditorMode(this.dnsEditMode) !== 'a') return '优选工作台会把结果回填到当前站点 A / AAAA 草稿，必要时会自动切换到 A 模式。';
+          return '优选工作台只会回填当前站点 A / AAAA 草稿，仍需点击上方“保存 DNS”后才会真正写入 Cloudflare。';
+      },
+
+      shouldShowDnsWorkspace() {
+          return normalizeDnsEditorMode(this.dnsEditMode) === 'a';
+      },
+
+      normalizeDnsIpPoolItems(items = []) {
+          return (Array.isArray(items) ? items : [])
+            .map((item, index) => normalizeDnsIpPoolItemRecord(item, { updatedAt: new Date().toISOString(), createdAt: new Date().toISOString() }) || normalizeDnsIpPoolItemRecord({ ...item, id: 'dns-ip-' + index }))
+            .filter(Boolean);
+      },
+
+      setDnsIpSharedPoolItems(items = []) {
+          this.dnsIpSharedPoolItems = this.normalizeDnsIpPoolItems(items);
+          uiBrowserBridge.persistDnsIpPoolItems(this.dnsIpSharedPoolItems);
+          return this.dnsIpSharedPoolItems;
+      },
+
+      mergeDnsIpSharedPoolItems(items = []) {
+          const merged = new Map((Array.isArray(this.dnsIpSharedPoolItems) ? this.dnsIpSharedPoolItems : []).map(item => [String(item.ip || '').trim(), item]));
+          for (const item of this.normalizeDnsIpPoolItems(items)) {
+              merged.set(String(item.ip || '').trim(), { ...(merged.get(String(item.ip || '').trim()) || {}), ...item });
+          }
+          return this.setDnsIpSharedPoolItems([...merged.values()]);
+      },
+
+      rebuildDnsIpWorkspaceDerivedState() {
+          const currentHostItems = Array.isArray(this.dnsIpCurrentHostItems) ? this.dnsIpCurrentHostItems : [];
+          const sharedPoolItems = Array.isArray(this.dnsIpSharedPoolItems) ? this.dnsIpSharedPoolItems : [];
+          const counts = new Map();
+          for (const item of [...currentHostItems, ...sharedPoolItems]) {
+              const code = String(item?.countryCode || '').trim().toUpperCase() || 'UNKNOWN';
+              const current = counts.get(code) || {
+                  code,
+                  name: String(item?.countryName || code || '未知').trim() || '未知',
+                  count: 0
+              };
+              current.count += 1;
+              counts.set(code, current);
+          }
+          this.dnsIpWorkspaceAvailableCountries = [...counts.values()].sort((left, right) => String(left.code || '').localeCompare(String(right.code || '')));
+          return this.dnsIpWorkspaceAvailableCountries;
+      },
+
+      getDnsIpWorkspaceTabClass(tab = 'current') {
+          const active = String(this.dnsIpWorkspaceTab || 'current').trim() === String(tab || 'current').trim();
+          return active
+            ? 'border-brand-200 bg-brand-50 text-brand-700 dark:border-brand-500/30 dark:bg-brand-500/10 dark:text-brand-300'
+            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800';
+      },
+
+      setDnsIpWorkspaceTab(tab = 'current') {
+          this.dnsIpWorkspaceTab = String(tab || 'current').trim() === 'pool' ? 'pool' : 'current';
+          this.syncDnsIpFilterSelections();
+      },
+
+      getDnsIpFilterTypeButtonClass(type = 'ALL') {
+          const normalizedType = normalizeUiDnsIpType(type);
+          return normalizeUiDnsIpType(this.dnsIpFilterType) === normalizedType
+            ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
+            : 'text-slate-500 dark:text-slate-400';
+      },
+
+      setDnsIpFilterType(type = 'ALL') {
+          this.dnsIpFilterType = normalizeUiDnsIpType(type);
+          this.syncDnsIpFilterSelections();
+      },
+
+      getDnsIpWorkspaceBaseItemsForActiveTab() {
+          return String(this.dnsIpWorkspaceTab || 'current').trim() === 'pool'
+            ? (Array.isArray(this.dnsIpSharedPoolItems) ? this.dnsIpSharedPoolItems : [])
+            : (Array.isArray(this.dnsIpCurrentHostItems) ? this.dnsIpCurrentHostItems : []);
+      },
+
+      getDnsIpItemSearchText(item = {}) {
+          return [
+            item.ip,
+            item.coloCode,
+            item.cityName,
+            item.countryCode,
+            item.countryName,
+            item.sourceLabel,
+            item.remark
+          ].map(value => String(value || '').trim().toLowerCase()).join(' ');
+      },
+
+      filterDnsIpItems(items = [], options = {}) {
+          const typeFilter = normalizeUiDnsIpType(this.dnsIpFilterType);
+          const keyword = String(this.dnsIpFilterKeyword || '').trim().toLowerCase();
+          const applyCountryFilters = options.applyCountryFilters !== false;
+          const applyColoFilters = options.applyColoFilters !== false;
+          const countryFilters = new Set((Array.isArray(this.dnsIpFilterCountries) ? this.dnsIpFilterCountries : []).map(item => String(item || '').trim().toUpperCase()).filter(Boolean));
+          const coloFilters = new Set((Array.isArray(this.dnsIpFilterColos) ? this.dnsIpFilterColos : []).map(item => String(item || '').trim().toUpperCase()).filter(Boolean));
+          return (Array.isArray(items) ? items : []).filter(item => {
+              const itemType = normalizeUiDnsIpType(item?.ipType || item?.type || '');
+              if (typeFilter !== 'ALL' && itemType !== typeFilter) return false;
+              const itemCountryCode = String(item?.countryCode || '').trim().toUpperCase() || 'UNKNOWN';
+              if (applyCountryFilters && countryFilters.size > 0 && !countryFilters.has(itemCountryCode)) return false;
+              const itemColoCode = String(item?.coloCode || '').trim().toUpperCase();
+              if (applyColoFilters && coloFilters.size > 0 && !coloFilters.has(itemColoCode)) return false;
+              if (keyword && !this.getDnsIpItemSearchText(item).includes(keyword)) return false;
+              return true;
+          });
+      },
+
+      getFilteredDnsCurrentHostItems() {
+          return this.filterDnsIpItems(this.dnsIpCurrentHostItems);
+      },
+
+      getFilteredDnsSharedPoolItems() {
+          return this.filterDnsIpItems(this.dnsIpSharedPoolItems)
+            .slice()
+            .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+      },
+
+      getGroupedDnsCurrentHostItems() {
+          const groups = new Map();
+          for (const item of this.getFilteredDnsCurrentHostItems()) {
+              const code = String(item?.countryCode || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN';
+              if (!groups.has(code)) {
+                  groups.set(code, {
+                      code,
+                      name: String(item?.countryName || '未知'),
+                      items: []
+                  });
+              }
+              groups.get(code).items.push(item);
+          }
+          return [...groups.values()]
+            .map(group => ({
+              ...group,
+              items: group.items.slice().sort((left, right) => String(right.probedAt || '').localeCompare(String(left.probedAt || '')))
+            }))
+            .sort((left, right) => String(left.code || '').localeCompare(String(right.code || '')));
+      },
+
+      getDnsIpProbeStatusText(status = '') {
+          const normalizedStatus = String(status || '').trim().toLowerCase();
+          if (normalizedStatus === 'ok') return '探测成功';
+          if (normalizedStatus === 'timeout') return '探测超时';
+          if (normalizedStatus === 'invalid_ip') return 'IP 无效';
+          return '网络异常';
+      },
+
+      getDnsIpProbeStatusClass(status = '') {
+          const normalizedStatus = String(status || '').trim().toLowerCase();
+          if (normalizedStatus === 'ok') return 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300';
+          if (normalizedStatus === 'timeout') return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300';
+          return 'border-slate-200 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300';
+      },
+
+      formatDnsIpProbedAt(item = {}) {
+          const value = String(item?.probedAt || '').trim();
+          return value ? this.formatLocalDateTime(value) : '-';
+      },
+
+      isDnsIpPoolItemSelected(ip = '') {
+          const normalizedIp = String(ip || '').trim();
+          return normalizedIp && Array.isArray(this.dnsIpPoolSelected) && this.dnsIpPoolSelected.includes(normalizedIp);
+      },
+
+      toggleDnsIpPoolSelection(ip = '') {
+          const normalizedIp = String(ip || '').trim();
+          if (!normalizedIp) return;
+          const next = new Set(Array.isArray(this.dnsIpPoolSelected) ? this.dnsIpPoolSelected : []);
+          if (next.has(normalizedIp)) next.delete(normalizedIp);
+          else next.add(normalizedIp);
+          this.dnsIpPoolSelected = [...next];
+      },
+
+      getSelectedDnsIpPoolItems() {
+          const selected = new Set(Array.isArray(this.dnsIpPoolSelected) ? this.dnsIpPoolSelected : []);
+          return (Array.isArray(this.dnsIpSharedPoolItems) ? this.dnsIpSharedPoolItems : []).filter(item => selected.has(String(item?.ip || '').trim()));
+      },
+
+      getDnsIpPoolSelectedCount() {
+          return this.getSelectedDnsIpPoolItems().length;
+      },
+
+      getDnsIpAvailableCountryOptions() {
+          const counts = new Map();
+          for (const item of this.filterDnsIpItems(this.getDnsIpWorkspaceBaseItemsForActiveTab(), { applyCountryFilters: false, applyColoFilters: false })) {
+              const code = String(item?.countryCode || '').trim().toUpperCase() || 'UNKNOWN';
+              const current = counts.get(code) || {
+                  code,
+                  name: String(item?.countryName || code || '未知').trim() || '未知',
+                  count: 0
+              };
+              current.count += 1;
+              counts.set(code, current);
+          }
+          return [...counts.values()].sort((left, right) => String(left.code || '').localeCompare(String(right.code || '')));
+      },
+
+      syncDnsIpCountryFilters() {
+          const validCountryCodes = new Set(this.getDnsIpAvailableCountryOptions().map(item => String(item.code || '').trim().toUpperCase()).filter(Boolean));
+          this.dnsIpFilterCountries = (Array.isArray(this.dnsIpFilterCountries) ? this.dnsIpFilterCountries : [])
+            .map(item => String(item || '').trim().toUpperCase())
+            .filter(code => validCountryCodes.has(code));
+          return this.dnsIpFilterCountries;
+      },
+
+      isDnsIpCountrySelected(code = '') {
+          const normalizedCode = String(code || '').trim().toUpperCase();
+          return normalizedCode && Array.isArray(this.dnsIpFilterCountries) && this.dnsIpFilterCountries.includes(normalizedCode);
+      },
+
+      getDnsIpCountryChipClass(code = '') {
+          return this.isDnsIpCountrySelected(code)
+            ? 'border-brand-200 bg-brand-50 text-brand-700 dark:border-brand-500/30 dark:bg-brand-500/10 dark:text-brand-300'
+            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800';
+      },
+
+      toggleDnsIpCountryFilter(code = '') {
+          const normalizedCode = String(code || '').trim().toUpperCase();
+          if (!normalizedCode) return;
+          const next = new Set(Array.isArray(this.dnsIpFilterCountries) ? this.dnsIpFilterCountries : []);
+          if (next.has(normalizedCode)) next.delete(normalizedCode);
+          else next.add(normalizedCode);
+          this.dnsIpFilterCountries = [...next];
+          this.syncDnsIpColoFilters();
+      },
+
+      clearDnsIpCountryFilters() {
+          this.dnsIpFilterCountries = [];
+          this.dnsIpFilterColos = [];
+      },
+
+      getDnsIpAvailableColoOptions() {
+          if (!Array.isArray(this.dnsIpFilterCountries) || !this.dnsIpFilterCountries.length) return [];
+          const counts = new Map();
+          for (const item of this.filterDnsIpItems(this.getDnsIpWorkspaceBaseItemsForActiveTab(), { applyCountryFilters: true, applyColoFilters: false })) {
+              const code = String(item?.coloCode || '').trim().toUpperCase();
+              if (!code) continue;
+              const current = counts.get(code) || {
+                  code,
+                  label: String(item?.cityName || item?.countryName || item?.countryCode || code).trim() || code,
+                  count: 0
+              };
+              current.count += 1;
+              counts.set(code, current);
+          }
+          return [...counts.values()].sort((left, right) => String(left.code || '').localeCompare(String(right.code || '')));
+      },
+
+      syncDnsIpColoFilters() {
+          const validColoCodes = new Set(this.getDnsIpAvailableColoOptions().map(item => String(item.code || '').trim().toUpperCase()).filter(Boolean));
+          this.dnsIpFilterColos = (Array.isArray(this.dnsIpFilterColos) ? this.dnsIpFilterColos : [])
+            .map(item => String(item || '').trim().toUpperCase())
+            .filter(code => validColoCodes.has(code));
+          return this.dnsIpFilterColos;
+      },
+
+      syncDnsIpFilterSelections() {
+          this.syncDnsIpCountryFilters();
+          this.syncDnsIpColoFilters();
+      },
+
+      handleDnsIpFilterKeywordInput() {
+          this.syncDnsIpFilterSelections();
+      },
+
+      isDnsIpColoSelected(code = '') {
+          const normalizedCode = String(code || '').trim().toUpperCase();
+          return normalizedCode && Array.isArray(this.dnsIpFilterColos) && this.dnsIpFilterColos.includes(normalizedCode);
+      },
+
+      getDnsIpColoChipClass(code = '') {
+          return this.isDnsIpColoSelected(code)
+            ? 'border-brand-200 bg-brand-50 text-brand-700 dark:border-brand-500/30 dark:bg-brand-500/10 dark:text-brand-300'
+            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800';
+      },
+
+      toggleDnsIpColoFilter(code = '') {
+          const normalizedCode = String(code || '').trim().toUpperCase();
+          if (!normalizedCode) return;
+          const next = new Set(Array.isArray(this.dnsIpFilterColos) ? this.dnsIpFilterColos : []);
+          if (next.has(normalizedCode)) next.delete(normalizedCode);
+          else next.add(normalizedCode);
+          this.dnsIpFilterColos = [...next];
+      },
+
+      clearDnsIpColoFilters() {
+          this.dnsIpFilterColos = [];
+      },
+
+      areAllVisibleDnsIpPoolItemsSelected() {
+          const visibleItems = this.getFilteredDnsSharedPoolItems();
+          if (!visibleItems.length) return false;
+          const selected = new Set(Array.isArray(this.dnsIpPoolSelected) ? this.dnsIpPoolSelected : []);
+          return visibleItems.every(item => selected.has(String(item.ip || '').trim()));
+      },
+
+      toggleDnsIpPoolSelectAll() {
+          const visibleItems = this.getFilteredDnsSharedPoolItems();
+          if (!visibleItems.length) return;
+          const selected = new Set(Array.isArray(this.dnsIpPoolSelected) ? this.dnsIpPoolSelected : []);
+          const shouldSelect = !visibleItems.every(item => selected.has(String(item.ip || '').trim()));
+          for (const item of visibleItems) {
+              const ip = String(item.ip || '').trim();
+              if (!ip) continue;
+              if (shouldSelect) selected.add(ip);
+              else selected.delete(ip);
+          }
+          this.dnsIpPoolSelected = [...selected];
+      },
+
+      getDnsIpPoolEmptyText() {
+          if (this.dnsIpWorkspaceLoading) return '正在加载独立 IP 池...';
+          return '独立 IP 池暂无数据，可通过手动导入或 API 抓取补充。';
+      },
+
+      getDnsIpCurrentHostEmptyText() {
+          if (this.dnsIpWorkspaceLoading) return '正在探测当前站点 IP...';
+          return '当前站点暂无可展示的 A / AAAA 记录。';
+      },
+
+      async refreshDnsIpWorkspace(forceRefresh = true) {
+          const poolItems = uiBrowserBridge.readDnsIpPoolItems();
+          const normalizedPoolItems = this.normalizeDnsIpPoolItems(poolItems);
+          if (!Array.isArray(this.dnsIpSharedPoolItems) || !this.dnsIpSharedPoolItems.length) this.dnsIpSharedPoolItems = normalizedPoolItems;
+          this.dnsIpWorkspaceLoading = true;
+          try {
+              const res = await this.apiCall('listDnsIpWorkspace', {
+                forceRefresh: forceRefresh === true,
+                poolItems: this.dnsIpSharedPoolItems
+              });
+              this.dnsIpCurrentHostItems = this.normalizeDnsIpPoolItems(res?.currentHostItems || []);
+              this.setDnsIpSharedPoolItems(res?.sharedPoolItems || this.dnsIpSharedPoolItems);
+              this.schedulerRemoteSources = (Array.isArray(res?.sourceList) ? res.sourceList : []).map((source, index) => createSchedulerSourceDraft(source, index));
+              this.dnsIpWorkspaceGeneratedAt = String(res?.generatedAt || '').trim() || new Date().toISOString();
+              this.rebuildDnsIpWorkspaceDerivedState();
+              this.syncDnsIpFilterSelections();
+          } catch (error) {
+              this.showMessage('优选工作台加载失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.dnsIpWorkspaceLoading = false;
+          }
+      },
+
+      async copyDnsIpValue(ip = '') {
+          const value = String(ip || '').trim();
+          if (!value) return;
+          await this.copyDnsValue(value, '已复制 IP：' + value, '复制 IP 失败，请手动复制');
+      },
+
+      openDnsIpImportModal() {
+          this.dnsIpImportModalOpen = true;
+      },
+
+      closeDnsIpImportModal() {
+          this.dnsIpImportModalOpen = false;
+          this.dnsIpImportPending = false;
+      },
+
+      async handleDnsIpImportFileChange(event) {
+          const input = event?.target && typeof event.target === 'object' ? event.target : null;
+          const file = input?.files?.[0];
+          if (!file) return;
+          try {
+              this.dnsIpImportText = await file.text();
+              this.dnsIpImportFileName = String(file.name || '').trim();
+              this.dnsIpImportTab = 'file';
+          } catch (error) {
+              this.showMessage('读取导入文件失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              if (input) input.value = '';
+          }
+      },
+
+      async submitDnsIpImport() {
+          if (this.dnsIpImportPending) return;
+          const text = String(this.dnsIpImportText || '').trim();
+          if (!text) {
+              this.showMessage('请先粘贴内容或选择一个文件。', { tone: 'warning' });
+              return;
+          }
+          this.dnsIpImportPending = true;
+          try {
+              const sourceKind = this.dnsIpImportTab === 'file' ? 'file' : 'manual';
+              const sourceLabel = this.dnsIpImportTab === 'file'
+                ? (String(this.dnsIpImportFileName || '').trim() || '文件导入')
+                : '手动导入';
+              const res = await this.apiCall('importDnsIpPoolItems', { text, sourceKind, sourceLabel });
+              this.mergeDnsIpSharedPoolItems(res?.items || []);
+              this.dnsIpWorkspaceGeneratedAt = new Date().toISOString();
+              this.dnsIpImportText = '';
+              this.dnsIpImportFileName = '';
+              this.closeDnsIpImportModal();
+              this.showMessage('独立 IP 池导入成功，本次合并 ' + (Number(res?.importedCount) || 0) + ' 条到当前浏览器本地缓存。', { tone: 'success' });
+          } catch (error) {
+              this.showMessage('导入独立 IP 池失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.dnsIpImportPending = false;
+          }
+      },
+
+      async refreshDnsIpPoolFromSourcesFromUi() {
+          if (this.dnsIpPoolActionPending) return;
+          this.dnsIpPoolActionPending = true;
+          try {
+              const res = await this.apiCall('refreshDnsIpPoolFromSources', { sourceId: this.schedulerSourceFilter });
+              this.applySchedulerSourceConfig(res);
+              this.mergeDnsIpSharedPoolItems(res?.items || []);
+              this.dnsIpWorkspaceGeneratedAt = new Date().toISOString();
+              this.showMessage('抓取完成，本次合并 ' + (Number(res?.importedCount) || 0) + ' 条独立 IP 到当前浏览器本地缓存。', { tone: 'success' });
+          } catch (error) {
+              this.showMessage('抓取独立 IP 池失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.dnsIpPoolActionPending = false;
+          }
+      },
+
+      async deleteSelectedDnsIpPoolItems() {
+          const selectedItems = this.getSelectedDnsIpPoolItems();
+          if (!selectedItems.length) {
+              this.showMessage('请先勾选要删除的独立 IP 池条目。', { tone: 'warning' });
+              return;
+          }
+          const selectedIps = new Set(selectedItems.map(item => String(item?.ip || '').trim()));
+          this.setDnsIpSharedPoolItems((Array.isArray(this.dnsIpSharedPoolItems) ? this.dnsIpSharedPoolItems : []).filter(item => !selectedIps.has(String(item?.ip || '').trim())));
+          this.dnsIpPoolSelected = [];
+          this.dnsIpWorkspaceGeneratedAt = new Date().toISOString();
+          this.showMessage('已从当前浏览器本地 IP 池移除 ' + selectedItems.length + ' 条独立 IP。', { tone: 'success' });
+      },
+
+      async fillDnsDraftFromIpPoolFromUi() {
+          const selectedItems = this.getSelectedDnsIpPoolItems();
+          if (!selectedItems.length) {
+              this.showMessage('请先勾选要回填到 DNS 草稿的 IP。', { tone: 'warning' });
+              return;
+          }
+          try {
+              const res = await this.apiCall('fillDnsDraftFromIpPool', { ips: selectedItems });
+              const hostLabel = this.getDnsEditorHostLabel();
+              const nextRecords = (Array.isArray(res?.records) ? res.records : [])
+                .map(record => this.normalizeDnsRecordForState({
+                  type: String(record?.type || '').trim().toUpperCase(),
+                  name: hostLabel,
+                  content: String(record?.content || '').trim()
+                }, record?.type || 'A'))
+                .filter(record => record && String(record.content || '').trim());
+              if (!nextRecords.length) return;
+              this.dnsEditMode = 'a';
+              this.dnsAddressDrafts = nextRecords;
+              this.ensureDnsAddressDrafts(nextRecords.length);
+              this.updateDnsSaveAllButtonState();
+              this.showMessage('已把独立 IP 池回填到当前站点 A / AAAA 草稿，请继续点击上方“保存 DNS”。', { tone: 'success' });
+          } catch (error) {
+              this.showMessage('回填 DNS 草稿失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          }
       },
 
       updateDnsSaveAllButtonState() {
@@ -13758,9 +14821,17 @@ const UI_HTML = `<!DOCTYPE html>
           this.dnsTotalRecordCount = 0;
 
           try {
-              const res = await this.apiCall('listDnsRecords');
+              const [res, sourceRes] = await Promise.all([
+                this.apiCall('listDnsRecords'),
+                this.apiCall('listRemoteCandidateSources').catch(() => null)
+              ]);
               if (loadSeq !== this.dnsLoadSeq) return;
               this.applyDnsResponse(res);
+              this.applySchedulerDnsContext(res);
+              if (sourceRes) this.applySchedulerSourceConfig(sourceRes);
+              if (normalizeDnsEditorMode(this.dnsEditMode) === 'a') {
+                await this.refreshDnsIpWorkspace(false);
+              }
           } catch (e) {
               if (loadSeq !== this.dnsLoadSeq) return;
               console.error('loadDnsRecords failed', e);
@@ -13782,14 +14853,34 @@ const UI_HTML = `<!DOCTYPE html>
           this.schedulerHintText = '当前站点：' + (this.schedulerCurrentHost || '未识别') + ' · Zone：' + zoneText;
       },
 
+      applySchedulerSourceConfig(payload) {
+          const res = payload && typeof payload === 'object' ? payload : {};
+          this.schedulerRemoteSources = (Array.isArray(res.sourceList) ? res.sourceList : [])
+            .map((source, index) => createSchedulerSourceDraft(source, index));
+      },
+
+      async loadSchedulerSourceConfig() {
+          try {
+              const res = await this.apiCall('listRemoteCandidateSources');
+              this.applySchedulerSourceConfig(res);
+          } catch (error) {
+              this.schedulerRemoteSources = [];
+              this.showMessage('抓取源读取失败: ' + (error?.message || '未知错误'), { tone: 'warning' });
+          }
+      },
+
       async loadSchedulerContext() {
           const loadSeq = ++this.schedulerLoadSeq;
           this.schedulerHintText = '当前站点：加载中...';
           try {
-              const res = await this.apiCall('listDnsRecords');
+              const [dnsRes, sourceRes] = await Promise.all([
+                this.apiCall('listDnsRecords'),
+                this.apiCall('listRemoteCandidateSources').catch(() => null)
+              ]);
               if (loadSeq !== this.schedulerLoadSeq) return;
-              this.applyDnsResponse(res);
-              this.applySchedulerDnsContext(res);
+              this.applyDnsResponse(dnsRes);
+              this.applySchedulerDnsContext(dnsRes);
+              if (sourceRes) this.applySchedulerSourceConfig(sourceRes);
           } catch (e) {
               if (loadSeq !== this.schedulerLoadSeq) return;
               this.schedulerCurrentHost = '';
@@ -13802,6 +14893,75 @@ const UI_HTML = `<!DOCTYPE html>
           if (this.schedulerFetchPending) return '拉取中...';
           if (this.schedulerTestingPending) return '测速中...';
           return '获取节点并测速';
+      },
+
+      getSchedulerSourceCountText() {
+          const sourceList = Array.isArray(this.schedulerRemoteSources) ? this.schedulerRemoteSources : [];
+          const enabledCount = sourceList.filter(source => source && source.enabled !== false && String(source.url || '').trim()).length;
+          return '已启用 ' + enabledCount + ' / ' + sourceList.length + ' 个抓取源';
+      },
+
+      getSchedulerSourceOptions() {
+          const sourceList = (Array.isArray(this.schedulerRemoteSources) ? this.schedulerRemoteSources : [])
+            .filter(source => source && source.enabled !== false && String(source.url || '').trim());
+          return [{ value: 'all', label: '全部抓取源' }].concat(sourceList.map(source => ({
+            value: String(source.id || ''),
+            label: String(source.name || source.url || '未命名抓取源')
+          })));
+      },
+
+      openSchedulerSourceModal() {
+          const seeds = Array.isArray(this.schedulerRemoteSources) && this.schedulerRemoteSources.length
+            ? this.schedulerRemoteSources
+            : [createSchedulerSourceDraft({ parser: 'uouin' }, 0), createSchedulerSourceDraft({ parser: 'github-top10' }, 1)];
+          this.schedulerSourceDrafts = seeds.map((source, index) => createSchedulerSourceDraft(source, index));
+          this.schedulerSourceModalOpen = true;
+      },
+
+      closeSchedulerSourceModal() {
+          this.schedulerSourceModalOpen = false;
+          this.schedulerSourcePending = false;
+      },
+
+      addSchedulerSourceDraft() {
+          const nextIndex = Array.isArray(this.schedulerSourceDrafts) ? this.schedulerSourceDrafts.length : 0;
+          this.schedulerSourceDrafts = [
+            ...(Array.isArray(this.schedulerSourceDrafts) ? this.schedulerSourceDrafts : []),
+            createSchedulerSourceDraft({ parser: 'github-top10' }, nextIndex)
+          ];
+      },
+
+      removeSchedulerSourceDraft(id = '') {
+          const normalizedId = String(id || '').trim();
+          this.schedulerSourceDrafts = (Array.isArray(this.schedulerSourceDrafts) ? this.schedulerSourceDrafts : [])
+            .filter(source => String(source?.id || '').trim() !== normalizedId);
+          if (!this.schedulerSourceDrafts.length) this.schedulerSourceDrafts = [createSchedulerSourceDraft({ parser: 'uouin' }, 0)];
+      },
+
+      getSchedulerSourceStatusText(source = {}) {
+          const status = String(source?.lastFetchStatus || '').trim().toLowerCase();
+          if (status === 'success') return '最近抓取成功';
+          if (status === 'empty') return '最近抓取为空';
+          if (status === 'failed') return '最近抓取失败';
+          return '尚未抓取';
+      },
+
+      async saveSchedulerSourcesFromModal() {
+          if (this.schedulerSourcePending) return;
+          this.schedulerSourcePending = true;
+          try {
+              const drafts = (Array.isArray(this.schedulerSourceDrafts) ? this.schedulerSourceDrafts : [])
+                .map((source, index) => createSchedulerSourceDraft(source, index))
+                .filter(source => String(source.url || '').trim());
+              const res = await this.apiCall('saveRemoteCandidateSources', { sources: drafts });
+              this.applySchedulerSourceConfig(res);
+              this.closeSchedulerSourceModal();
+              this.showMessage('抓取源配置已保存。', { tone: 'success' });
+          } catch (error) {
+              this.showMessage('保存抓取源失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+          } finally {
+              this.schedulerSourcePending = false;
+          }
       },
 
       getSchedulerCandidates() {
@@ -13845,6 +15005,16 @@ const UI_HTML = `<!DOCTYPE html>
           return 'text-slate-500';
       },
 
+      getSchedulerLocationText(candidate = {}) {
+          const cityName = String(candidate?.cityName || '').trim();
+          const countryName = String(candidate?.countryName || '').trim();
+          const countryCode = String(candidate?.countryCode || '').trim().toUpperCase();
+          if (cityName && countryName) return cityName + ' / ' + countryName;
+          if (countryName) return countryName;
+          if (countryCode && countryCode !== 'UNKNOWN') return countryCode;
+          return candidate?.testing === true ? '测速后补全' : '待探测';
+      },
+
       getSchedulerFooterHint() {
           const top = selectTopCandidatesForDns(this.schedulerCandidates);
           if (!this.schedulerCurrentHost) return '当前站点未识别：可以继续拉取和测速，但暂时不能直接保存 DNS。';
@@ -13862,13 +15032,21 @@ const UI_HTML = `<!DOCTYPE html>
 
       async probeSchedulerCandidate(ip) {
           const target = String(ip || '').trim();
-          if (!target) return 9999;
+          if (!target) {
+              return { latencyMs: 9999, coloCode: '', cityName: '', countryCode: 'UNKNOWN', countryName: '未知' };
+          }
           try {
               const res = await this.apiCall('probeRemoteCandidateIp', { ip: target, timeout: 2500 });
               const latencyMs = Number(res?.latencyMs);
-              return Number.isFinite(latencyMs) ? Math.max(1, Math.round(latencyMs)) : 9999;
+              return {
+                  latencyMs: Number.isFinite(latencyMs) ? Math.max(1, Math.round(latencyMs)) : 9999,
+                  coloCode: String(res?.coloCode || '').trim().toUpperCase(),
+                  cityName: String(res?.cityName || '').trim(),
+                  countryCode: String(res?.countryCode || '').trim().toUpperCase() || 'UNKNOWN',
+                  countryName: String(res?.countryName || '').trim() || '未知'
+              };
           } catch {
-              return 9999;
+              return { latencyMs: 9999, coloCode: '', cityName: '', countryCode: 'UNKNOWN', countryName: '未知' };
           }
       },
 
@@ -13895,13 +15073,17 @@ const UI_HTML = `<!DOCTYPE html>
               while (cursor < sourceItems.length) {
                   const currentIndex = cursor;
                   cursor += 1;
-                  const latencyMs = await this.probeSchedulerCandidate(sourceItems[currentIndex].ip);
+                  const probeResult = await this.probeSchedulerCandidate(sourceItems[currentIndex].ip);
                   if (currentProbeSeq !== this.schedulerProbeSeq) return;
                   const nextCandidates = this.schedulerCandidates.slice();
                   nextCandidates[currentIndex] = {
                       ...nextCandidates[currentIndex],
                       testing: false,
-                      latencyMs,
+                      latencyMs: probeResult.latencyMs,
+                      coloCode: probeResult.coloCode,
+                      cityName: probeResult.cityName,
+                      countryCode: probeResult.countryCode,
+                      countryName: probeResult.countryName,
                       testedAt: new Date().toISOString()
                   };
                   this.schedulerCandidates = nextCandidates;
@@ -13931,7 +15113,11 @@ const UI_HTML = `<!DOCTYPE html>
           this.schedulerStatusText = '正在拉取远程候选 IP ...';
           try {
               await this.loadSchedulerContext();
-              const res = await this.apiCall('listRemoteCandidateIps', { type: this.schedulerType });
+              const res = await this.apiCall('listRemoteCandidateIps', {
+                type: this.schedulerType,
+                sourceId: this.schedulerSourceFilter
+              });
+              this.applySchedulerSourceConfig(res);
               this.schedulerCandidates = (Array.isArray(res.candidates) ? res.candidates : []).map(item => ({
                   ...item,
                   latencyMs: null,
@@ -13940,7 +15126,7 @@ const UI_HTML = `<!DOCTYPE html>
               }));
               this.schedulerSourceSummary = Array.isArray(res.sourceSummary) ? res.sourceSummary : [];
               if (!this.schedulerCandidates.length) {
-                  this.schedulerStatusText = '当前线路类型未返回候选 IP，请切换类型或稍后重试。';
+                  this.schedulerStatusText = '当前抓取源或筛选条件未返回候选 IP，请调整后重试。';
                   return;
               }
               this.schedulerStatusText = '已拉取 ' + this.schedulerCandidates.length + ' 个候选，开始 Worker 侧测速。';
@@ -13963,6 +15149,36 @@ const UI_HTML = `<!DOCTYPE html>
                   type: ip.includes(':') ? 'AAAA' : 'A',
                   content: ip.replace(/^\[|\]$/g, '')
               }));
+      },
+
+      applySchedulerCandidatesToDnsDrafts(candidates = [], label = '优选结果') {
+          const hostLabel = this.getDnsEditorHostLabel();
+          if (!hostLabel) {
+              this.showMessage('当前站点未识别，暂时无法回填 DNS 草稿。', { tone: 'warning', modal: true });
+              return;
+          }
+          const records = this.buildSchedulerDnsRecords(candidates);
+          if (!records.length) {
+              this.showMessage('没有可回填的候选记录。', { tone: 'warning' });
+              return;
+          }
+          this.switchDnsEditMode('a');
+          this.dnsAddressDrafts = records.map(record => this.normalizeDnsRecordForState({
+            type: record.type,
+            name: hostLabel,
+            content: record.content
+          }, record.type));
+          this.ensureDnsAddressDrafts(records.length || 1);
+          this.updateDnsSaveAllButtonState();
+          this.showMessage(label + ' 已回填到当前站点 A / AAAA 草稿，请继续点击上方“保存 DNS”。', { tone: 'success' });
+      },
+
+      applySchedulerTopCandidatesToDnsDrafts() {
+          this.applySchedulerCandidatesToDnsDrafts(selectTopCandidatesForDns(this.schedulerCandidates), 'TOP3 优选结果');
+      },
+
+      applySchedulerSingleCandidateToDnsDraft(candidate = null) {
+          this.applySchedulerCandidatesToDnsDrafts(candidate ? [candidate] : [], '单条优选结果');
       },
 
       async saveSchedulerCandidates(candidates = [], label = 'DNS') {
@@ -14574,6 +15790,19 @@ const UI_HTML = `<!DOCTYPE html>
         const normalizedMode = String(mode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
         try {
           localStorage.setItem(UI_STORAGE_KEYS.settingsExperienceMode, normalizedMode);
+        } catch {}
+      },
+      readDnsIpPoolItems() {
+        try {
+          const raw = localStorage.getItem(UI_STORAGE_KEYS.dnsIpPoolItems);
+          return raw ? JSON.parse(raw) : [];
+        } catch {
+          return [];
+        }
+      },
+      persistDnsIpPoolItems(items = []) {
+        try {
+          localStorage.setItem(UI_STORAGE_KEYS.dnsIpPoolItems, JSON.stringify(Array.isArray(items) ? items : []));
         } catch {}
       },
       readLocationOrigin() {
