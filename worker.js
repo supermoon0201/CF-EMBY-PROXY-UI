@@ -98,6 +98,8 @@ const Config = {
     ScheduledLeaseMinMs: 30 * 1000,
     ScheduledLeaseMs: 5 * 60 * 1000,
     ScheduledMaintenanceIntervalMinutes: 60,
+    ScheduledMaintenanceMode: "interval",
+    ScheduledMaintenanceTime: "08:30",
     AutoDnsEnabled: false,
     AutoDnsType: "all",
     AutoDnsIntervalMinutes: 60,
@@ -1444,6 +1446,30 @@ function shouldRunIntervalGate(lastRunAt = "", intervalMinutes = 0, fallback = t
   return (nowMs() - parsed) >= intervalMs;
 }
 
+function resolveScheduledMaintenanceGate(config = {}, previousState = {}) {
+  const mode = normalizeScheduledMaintenanceMode(config.scheduledMaintenanceMode);
+  const intervalMinutes = clampIntegerConfig(config.scheduledMaintenanceIntervalMinutes, Config.Defaults.ScheduledMaintenanceIntervalMinutes, 5, 1440);
+  const dailyTime = normalizeScheduledClockTime(config.scheduledMaintenanceTime, Config.Defaults.ScheduledMaintenanceTime);
+  const lastRunAt = String(previousState.lastFinishedAt || previousState.lastSuccessAt || previousState.lastStartedAt || "").trim();
+  if (mode === "daily") {
+    const dailyGate = shouldRunDailyClockGate(lastRunAt, dailyTime);
+    return {
+      shouldRun: dailyGate.shouldRun,
+      reason: dailyGate.reason,
+      mode,
+      intervalMinutes,
+      dailyTime
+    };
+  }
+  return {
+    shouldRun: shouldRunIntervalGate(lastRunAt, intervalMinutes, true),
+    reason: shouldRunIntervalGate(lastRunAt, intervalMinutes, true) ? "due" : "interval_not_reached",
+    mode,
+    intervalMinutes,
+    dailyTime
+  };
+}
+
 function normalizeAutoDnsHistoryEntry(entry = {}) {
   const item = entry && typeof entry === "object" ? entry : {};
   return {
@@ -1944,11 +1970,53 @@ function normalizeAutoDnsScheduleType(value = "") {
   return Config.Defaults.AutoDnsType;
 }
 
+function normalizeScheduledMaintenanceMode(value = "") {
+  return String(value || "").trim().toLowerCase() === "daily" ? "daily" : Config.Defaults.ScheduledMaintenanceMode;
+}
+
+function normalizeScheduledClockTime(value = "", fallback = Config.Defaults.ScheduledMaintenanceTime) {
+  const text = String(value || "").trim();
+  if (/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(text)) {
+    const [hours, minutes] = text.split(":");
+    return `${String(Number(hours)).padStart(2, "0")}:${minutes}`;
+  }
+  return fallback;
+}
+
+function getShanghaiClockParts(now = new Date()) {
+  const shanghaiMs = now.getTime() + 8 * 60 * 60 * 1000;
+  const d = new Date(shanghaiMs);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth(),
+    date: d.getUTCDate(),
+    dayKey: `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`,
+    nowMs: now.getTime()
+  };
+}
+
+function shouldRunDailyClockGate(lastRunAt = "", dailyTime = Config.Defaults.ScheduledMaintenanceTime) {
+  const normalizedTime = normalizeScheduledClockTime(dailyTime);
+  const [hourText, minuteText] = normalizedTime.split(":");
+  const parts = getShanghaiClockParts(new Date());
+  const targetUtcMs = Date.UTC(parts.year, parts.month, parts.date, Number(hourText) - 8, Number(minuteText), 0, 0);
+  if (parts.nowMs < targetUtcMs) {
+    return { shouldRun: false, reason: "before_daily_time", normalizedTime, targetUtcMs };
+  }
+  const parsedLastRunAt = typeof lastRunAt === "string" ? new Date(lastRunAt).getTime() : NaN;
+  if (!Number.isFinite(parsedLastRunAt) || parsedLastRunAt < targetUtcMs) {
+    return { shouldRun: true, reason: "due", normalizedTime, targetUtcMs };
+  }
+  return { shouldRun: false, reason: "already_ran_today", normalizedTime, targetUtcMs };
+}
+
 function sanitizeRuntimeConfig(input = {}) {
   const sanitized = sanitizeConfigWithRules(input, CONFIG_SANITIZE_RULES, { normalizeNodeNameList });
   sanitized.prewarmDepth = normalizePrewarmDepth(sanitized.prewarmDepth);
   sanitized.settingsExperienceMode = String(sanitized.settingsExperienceMode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
   sanitized.logSearchMode = normalizeLogSearchMode(sanitized.logSearchMode);
+  sanitized.scheduledMaintenanceMode = normalizeScheduledMaintenanceMode(sanitized.scheduledMaintenanceMode);
+  sanitized.scheduledMaintenanceTime = normalizeScheduledClockTime(sanitized.scheduledMaintenanceTime);
   sanitized.autoDnsType = normalizeAutoDnsScheduleType(sanitized.autoDnsType);
   sanitized.autoDnsTargetHost = normalizeHostnameText(sanitized.autoDnsTargetHost || "");
   return sanitized;
@@ -2217,6 +2285,8 @@ const CONFIG_ALLOWED_FIELDS = [
   "logBatchRetryBackoffMs",
   "scheduledLeaseMs",
   "scheduledMaintenanceIntervalMinutes",
+  "scheduledMaintenanceMode",
+  "scheduledMaintenanceTime",
   "autoDnsEnabled",
   "autoDnsType",
   "autoDnsTargetHost",
@@ -2262,7 +2332,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: CONFIG_ALIAS_FIELDS,
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode", "autoDnsType", "autoDnsTargetHost"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "wangpandirect", "prewarmDepth", "logSearchMode", "scheduledMaintenanceMode", "scheduledMaintenanceTime", "autoDnsType", "autoDnsTargetHost"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList"
   },
@@ -7614,6 +7684,21 @@ const UI_HTML = `<!DOCTYPE html>
                         </div>
                       </div>
                       <div class="md:col-span-2">
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务调度模式</label>
+                        <select id="cfg-scheduled-maintenance-mode" v-model="App.settingsForm.scheduledMaintenanceMode" class="w-full p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white">
+                          <option value="interval">按周期执行</option>
+                          <option value="daily">每日定时执行</option>
+                        </select>
+                      </div>
+                      <div class="md:col-span-2" v-if="App.settingsForm.scheduledMaintenanceMode === 'daily'">
+                        <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务执行时间</label>
+                        <div class="relative">
+                          <input type="time" id="cfg-scheduled-maintenance-time" v-model="App.settingsForm.scheduledMaintenanceTime" class="w-full p-2 pr-16 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="08:30">
+                          <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">UTC+8</span>
+                        </div>
+                        <p class="text-xs text-slate-500 mt-2">例如 08:30 表示每天北京时间 08:30 执行一次日志清理、Telegram 日报和异常告警检查。Cloudflare Cron 仍可保持更高频率，真正执行由 Worker 内部按北京时间门控。</p>
+                      </div>
+                      <div class="md:col-span-2" v-else>
                         <label class="block text-sm font-semibold tracking-[0.01em] text-slate-800 dark:text-slate-200 mb-1">日志类任务执行周期</label>
                         <div class="relative">
                           <input type="number" min="5" max="1440" step="5" id="cfg-scheduled-maintenance-interval-minutes" v-model="App.settingsForm.scheduledMaintenanceIntervalMinutes" class="w-full p-2 pr-16 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none dark:text-white" value="60">
@@ -8145,6 +8230,8 @@ const UI_HTML = `<!DOCTYPE html>
       logBatchRetryBackoffMs: 75,
       scheduledLeaseMs: 300000,
       scheduledMaintenanceIntervalMinutes: 60,
+      scheduledMaintenanceMode: 'interval',
+      scheduledMaintenanceTime: '08:30',
       autoDnsEnabled: false,
       autoDnsType: 'all',
       autoDnsTargetHost: '',
@@ -8272,6 +8359,8 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'logBatchRetryCount', id: 'cfg-log-retry-count', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryCount },
         { key: 'logBatchRetryBackoffMs', id: 'cfg-log-retry-backoff', kind: 'int-finite', defaultValue: UI_DEFAULTS.logBatchRetryBackoffMs },
         { key: 'scheduledLeaseMs', id: 'cfg-scheduled-lease-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledLeaseMs },
+        { key: 'scheduledMaintenanceMode', id: 'cfg-scheduled-maintenance-mode', kind: 'or-default', defaultValue: UI_DEFAULTS.scheduledMaintenanceMode },
+        { key: 'scheduledMaintenanceTime', id: 'cfg-scheduled-maintenance-time', kind: 'trim', defaultValue: UI_DEFAULTS.scheduledMaintenanceTime },
         { key: 'scheduledMaintenanceIntervalMinutes', id: 'cfg-scheduled-maintenance-interval-minutes', kind: 'int-finite', defaultValue: UI_DEFAULTS.scheduledMaintenanceIntervalMinutes },
         { key: 'tgBotToken', id: 'cfg-tg-token', kind: 'trim', defaultValue: '' },
         { key: 'tgChatId', id: 'cfg-tg-chatid', kind: 'trim', defaultValue: '' },
@@ -8311,7 +8400,7 @@ const UI_HTML = `<!DOCTYPE html>
       proxy: CONFIG_SECTION_FIELDS.proxy,
       cache: ['cacheTtlImages', 'corsOrigins'],
       security: ['geoAllowlist', 'geoBlocklist', 'ipBlacklist', 'rateLimitRpm'],
-      logs: ['logSearchMode', 'logRetentionDays', 'logWriteDelayMinutes', 'logFlushCountThreshold', 'logBatchChunkSize', 'logBatchRetryCount', 'logBatchRetryBackoffMs', 'scheduledLeaseMs', 'scheduledMaintenanceIntervalMinutes'],
+      logs: ['logSearchMode', 'logRetentionDays', 'logWriteDelayMinutes', 'logFlushCountThreshold', 'logBatchChunkSize', 'logBatchRetryCount', 'logBatchRetryBackoffMs', 'scheduledLeaseMs', 'scheduledMaintenanceMode', 'scheduledMaintenanceTime', 'scheduledMaintenanceIntervalMinutes'],
       monitoring: ['tgBotToken', 'tgChatId', 'tgAlertDroppedBatchThreshold', 'tgAlertFlushRetryThreshold', 'tgAlertOnScheduledFailure', 'tgAlertCooldownMinutes'],
       dnsOps: CONFIG_SECTION_FIELDS.dnsOps,
       account: CONFIG_SECTION_FIELDS.account,
@@ -8353,6 +8442,8 @@ const UI_HTML = `<!DOCTYPE html>
       logBatchRetryCount: 'D1 重试次数',
       logBatchRetryBackoffMs: 'D1 退避毫秒',
       scheduledLeaseMs: '定时任务租约时长',
+      scheduledMaintenanceMode: '日志类任务调度模式',
+      scheduledMaintenanceTime: '日志类任务执行时间',
       scheduledMaintenanceIntervalMinutes: '日志类任务执行周期',
       autoDnsEnabled: '定时自动优选 DNS',
       autoDnsType: '自动优选候选源',
@@ -8409,6 +8500,8 @@ const UI_HTML = `<!DOCTYPE html>
         logBatchRetryCount: 2,
         logBatchRetryBackoffMs: 75,
         scheduledLeaseMs: 300000,
+        scheduledMaintenanceMode: 'interval',
+        scheduledMaintenanceTime: '08:30',
         scheduledMaintenanceIntervalMinutes: 60,
         autoDnsEnabled: false,
         autoDnsType: 'all',
@@ -9373,6 +9466,9 @@ const UI_HTML = `<!DOCTYPE html>
           }
           if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledLeaseMs) > 0 && Number(nextConfig.scheduledLeaseMs) < 60000) {
             hints.push('定时任务租约低于 60 秒，慢清理或网络抖动时更容易出现并发重入。');
+          }
+          if ((section === 'logs' || section === 'all') && String(nextConfig.scheduledMaintenanceMode || 'interval') === 'daily' && !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(String(nextConfig.scheduledMaintenanceTime || '').trim())) {
+            hints.push('日志类任务选择了每日定时执行，但时间格式无效；应使用 HH:mm，例如 08:30。');
           }
           if ((section === 'logs' || section === 'all') && Number(nextConfig.scheduledMaintenanceIntervalMinutes) > 0 && Number(nextConfig.scheduledMaintenanceIntervalMinutes) < 15) {
             hints.push('日志类任务执行周期低于 15 分钟时，清理、日报与告警会更频繁触发。');
@@ -13631,7 +13727,7 @@ export default {
         alerts: {}
       };
 
-      try {
+      await (async () => {
         const config = runtimeConfig || {};
         const previousScheduledStatus = await Database.getOpsStatusSection(env, "scheduled").catch(() => ({}));
         const previousMaintenanceState = previousScheduledStatus?.maintenance && typeof previousScheduledStatus.maintenance === "object"
@@ -13640,20 +13736,22 @@ export default {
         const previousAutoDnsState = previousScheduledStatus?.autoDns && typeof previousScheduledStatus.autoDns === "object"
           ? previousScheduledStatus.autoDns
           : {};
-        const maintenanceIntervalMinutes = clampIntegerConfig(config.scheduledMaintenanceIntervalMinutes, Config.Defaults.ScheduledMaintenanceIntervalMinutes, 5, 1440);
+        const maintenanceGate = resolveScheduledMaintenanceGate(config, previousMaintenanceState);
+        const maintenanceIntervalMinutes = maintenanceGate.intervalMinutes;
+        const maintenanceMode = maintenanceGate.mode;
+        const maintenanceTime = maintenanceGate.dailyTime;
         const autoDnsIntervalMinutes = clampIntegerConfig(config.autoDnsIntervalMinutes, Config.Defaults.AutoDnsIntervalMinutes, 5, 1440);
-        const maintenanceLastRunAt = String(previousMaintenanceState.lastFinishedAt || previousMaintenanceState.lastSuccessAt || previousMaintenanceState.lastStartedAt || "").trim();
         const autoDnsLastRunAt = String(previousAutoDnsState.lastFinishedAt || previousAutoDnsState.lastSuccessAt || previousAutoDnsState.lastStartedAt || "").trim();
-        const shouldRunMaintenance = shouldRunIntervalGate(maintenanceLastRunAt, maintenanceIntervalMinutes, true);
+        const shouldRunMaintenance = maintenanceGate.shouldRun;
         const shouldRunAutoDns = config.autoDnsEnabled === true && shouldRunIntervalGate(autoDnsLastRunAt, autoDnsIntervalMinutes, true);
         const nowIso = new Date().toISOString();
 
         if (shouldRunMaintenance) {
-	        if (db) {
-	          try {
-	            await ensureLeaseActive();
-	            await Database.ensureLogsBaseSchema(db);
-	            const rawRetentionDays = Number(config.logRetentionDays);
+          if (db) {
+            try {
+              await ensureLeaseActive();
+              await Database.ensureLogsBaseSchema(db);
+              const rawRetentionDays = Number(config.logRetentionDays);
             const retentionDays = Number.isFinite(rawRetentionDays)
               ? Math.min(Config.Defaults.LogRetentionDaysMax, Math.max(1, Math.floor(rawRetentionDays)))
               : Config.Defaults.LogRetentionDays;
@@ -13734,22 +13832,23 @@ export default {
               lastOptimizeAt,
               optimizeError
             };
-            await ensureLeaseActive();
-          } catch (dbErr) {
-            scheduledState.status = "partial_failure";
+              await ensureLeaseActive();
+            } catch (dbErr) {
+              scheduledState.status = "partial_failure";
+              scheduledState.cleanup = {
+                status: "failed",
+                lastErrorAt: new Date().toISOString(),
+                lastError: dbErr?.message || String(dbErr)
+              };
+              console.error("Scheduled DB Cleanup Error: ", dbErr);
+            }
+          } else {
             scheduledState.cleanup = {
-              status: "failed",
-              lastErrorAt: new Date().toISOString(),
-              lastError: dbErr?.message || String(dbErr)
+              status: "skipped",
+              lastSkippedAt: new Date().toISOString(),
+              reason: "db_not_configured"
             };
-            console.error("Scheduled DB Cleanup Error: ", dbErr);
           }
-        } else {
-          scheduledState.cleanup = {
-            status: "skipped",
-            lastSkippedAt: new Date().toISOString(),
-            reason: "db_not_configured"
-          };
         }
 
         const previousKvTidyState = previousScheduledStatus?.kvTidy && typeof previousScheduledStatus.kvTidy === "object"
@@ -13760,15 +13859,6 @@ export default {
           mode: "manual_only",
           lastAutoSkipAt: new Date().toISOString(),
           autoSkipReason: "manual_only"
-        };
-
-        scheduledState.maintenance = {
-          status: scheduledState.status === "success" ? "success" : "partial_failure",
-          lastStartedAt: startedAt,
-          lastFinishedAt: new Date().toISOString(),
-          lastSuccessAt: scheduledState.status === "success" ? new Date().toISOString() : "",
-          intervalMinutes: maintenanceIntervalMinutes,
-          trigger: "scheduled"
         };
 
         if (config.autoDnsEnabled === true) {
@@ -13851,89 +13941,129 @@ export default {
           };
         }
 
-        const { tgBotToken, tgChatId } = config;
-        if (tgBotToken && tgChatId) {
-            try {
-              await ensureLeaseActive();
-              await Database.sendDailyTelegramReport(env);
-              scheduledState.report = {
-                status: "success",
-                lastSuccessAt: new Date().toISOString()
-              };
-            } catch (reportErr) {
-              scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
-              scheduledState.report = {
-                status: "failed",
-                lastErrorAt: new Date().toISOString(),
-                lastError: reportErr?.message || String(reportErr)
-              };
-              console.error("Scheduled Daily Report Error: ", reportErr);
-            }
-        } else {
-          scheduledState.report = {
-            status: "skipped",
-            lastSkippedAt: new Date().toISOString(),
-            reason: "telegram_not_configured"
+        if (shouldRunMaintenance) {
+          const maintenanceFinishedAt = new Date().toISOString();
+          scheduledState.maintenance = {
+            status: scheduledState.status === "success" ? "success" : "partial_failure",
+            lastStartedAt: startedAt,
+            lastFinishedAt: maintenanceFinishedAt,
+            lastSuccessAt: scheduledState.status === "success" ? maintenanceFinishedAt : "",
+            intervalMinutes: maintenanceIntervalMinutes,
+            mode: maintenanceMode,
+            time: maintenanceTime,
+            trigger: "scheduled",
+            lastAutoSkipAt: "",
+            autoSkipReason: ""
           };
-        }
 
-        try {
-          await ensureLeaseActive();
-          const alertResult = await Database.maybeSendRuntimeAlerts(env, scheduledState);
-          scheduledState.alerts = alertResult.sent
-            ? {
-                status: "success",
-                lastSuccessAt: new Date().toISOString(),
-                issueCount: Number(alertResult.issueCount) || 0
+          const { tgBotToken, tgChatId } = config;
+          if (tgBotToken && tgChatId) {
+              try {
+                await ensureLeaseActive();
+                await Database.sendDailyTelegramReport(env);
+                scheduledState.report = {
+                  status: "success",
+                  lastSuccessAt: new Date().toISOString()
+                };
+              } catch (reportErr) {
+                scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
+                scheduledState.report = {
+                  status: "failed",
+                  lastErrorAt: new Date().toISOString(),
+                  lastError: reportErr?.message || String(reportErr)
+                };
+                console.error("Scheduled Daily Report Error: ", reportErr);
               }
-            : {
-                status: "skipped",
-                lastSkippedAt: new Date().toISOString(),
-                reason: alertResult.reason || "no_alerts"
-              };
-        } catch (alertErr) {
-          scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
-          scheduledState.alerts = {
-            status: "failed",
-            lastErrorAt: new Date().toISOString(),
-            lastError: alertErr?.message || String(alertErr)
-          };
-          console.error("Scheduled Alert Error: ", alertErr);
-        }
+          } else {
+            scheduledState.report = {
+              status: "skipped",
+              lastSkippedAt: new Date().toISOString(),
+              reason: "telegram_not_configured"
+            };
+          }
+
+          try {
+            await ensureLeaseActive();
+            const alertResult = await Database.maybeSendRuntimeAlerts(env, scheduledState);
+            scheduledState.alerts = alertResult.sent
+              ? {
+                  status: "success",
+                  lastSuccessAt: new Date().toISOString(),
+                  issueCount: Number(alertResult.issueCount) || 0
+                }
+              : {
+                  status: "skipped",
+                  lastSkippedAt: new Date().toISOString(),
+                  reason: alertResult.reason || "no_alerts"
+                };
+          } catch (alertErr) {
+            scheduledState.status = scheduledState.status === "success" ? "partial_failure" : scheduledState.status;
+            scheduledState.alerts = {
+              status: "failed",
+              lastErrorAt: new Date().toISOString(),
+              lastError: alertErr?.message || String(alertErr)
+            };
+            console.error("Scheduled Alert Error: ", alertErr);
+          }
         } else {
+          const skipReasonMap = {
+            interval_not_reached: "interval_not_reached",
+            before_daily_time: "before_daily_time",
+            already_ran_today: "already_ran_today"
+          };
           scheduledState.maintenance = {
             ...previousMaintenanceState,
             status: "skipped",
             lastSkippedAt: nowIso,
-            reason: "interval_not_reached",
+            reason: skipReasonMap[maintenanceGate.reason] || "interval_not_reached",
             intervalMinutes: maintenanceIntervalMinutes,
+            mode: maintenanceMode,
+            time: maintenanceTime,
             trigger: "scheduled"
           };
+          scheduledState.cleanup = {
+            ...(previousScheduledStatus?.cleanup && typeof previousScheduledStatus.cleanup === "object" ? previousScheduledStatus.cleanup : {}),
+            status: "skipped",
+            lastSkippedAt: nowIso,
+            reason: scheduledState.maintenance.reason
+          };
+          scheduledState.report = {
+            ...(previousScheduledStatus?.report && typeof previousScheduledStatus.report === "object" ? previousScheduledStatus.report : {}),
+            status: "skipped",
+            lastSkippedAt: nowIso,
+            reason: scheduledState.maintenance.reason
+          };
+          scheduledState.alerts = {
+            ...(previousScheduledStatus?.alerts && typeof previousScheduledStatus.alerts === "object" ? previousScheduledStatus.alerts : {}),
+            status: "skipped",
+            lastSkippedAt: nowIso,
+            reason: scheduledState.maintenance.reason
+          };
         }
-      } catch (err) {
-          scheduledState.status = "failed";
-          scheduledState.lastErrorAt = new Date().toISOString();
-          scheduledState.lastError = err?.message || String(err);
-          console.error("Scheduled Task Error: ", err);
-      } finally {
-          leaseState.active = false;
-          await leaseKeepalive.catch(() => {});
-          const finishedAt = new Date().toISOString();
-          scheduledState.lastFinishedAt = finishedAt;
-          if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
-          const released = leaseState.lostReason ? false : await Database.releaseScheduledLease(kv, leaseToken).catch(() => false);
-          scheduledState.lock = leaseState.lostReason
-            ? {
-                status: "lost",
-                reason: leaseState.lostReason,
-                lastCheckedAt: finishedAt
-              }
-            : {
-                status: released ? "released" : "release_skipped",
-                releasedAt: finishedAt
-              };
-          await Database.patchOpsStatus(env, { scheduled: scheduledState }).catch(() => {});
-      }
+      })().catch((err) => {
+        scheduledState.status = "failed";
+        scheduledState.lastErrorAt = new Date().toISOString();
+        scheduledState.lastError = err?.message || String(err);
+        console.error("Scheduled Task Error: ", err);
+      });
+
+      leaseState.active = false;
+      await leaseKeepalive.catch(() => {});
+      const finishedAt = new Date().toISOString();
+      scheduledState.lastFinishedAt = finishedAt;
+      if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
+      const released = leaseState.lostReason ? false : await Database.releaseScheduledLease(kv, leaseToken).catch(() => false);
+      scheduledState.lock = leaseState.lostReason
+        ? {
+            status: "lost",
+            reason: leaseState.lostReason,
+            lastCheckedAt: finishedAt
+          }
+        : {
+            status: released ? "released" : "release_skipped",
+            releasedAt: finishedAt
+          };
+      await Database.patchOpsStatus(env, { scheduled: scheduledState }).catch(() => {});
     })());
   }
 };
